@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>MSRMeetingRecorder</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.msr.meeting-recorder</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>MSR Meeting Recorder</string>
+    <key>CFBundleDisplayName</key>
+    <string>MSR Meeting Recorder</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>MSR records microphone audio when you choose Mic or Mic + System.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>MSR uses native screen/system audio capture when you choose System or Mic + System.</string>
+</dict>
+</plist>
