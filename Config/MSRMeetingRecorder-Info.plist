@@ -12,6 +12,8 @@
     <string>MSR Meeting Recorder</string>
     <key>CFBundleDisplayName</key>
     <string>MSR Meeting Recorder</string>
+    <key>CFBundleIconFile</key>
+    <string>MSRMeetingRecorder</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

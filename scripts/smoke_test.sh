@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_PATH="$ROOT_DIR/dist/MSR Meeting Recorder.app"
-DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.1.5.dmg"
+DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.1.6.dmg"
 
 cd "$ROOT_DIR"
 
