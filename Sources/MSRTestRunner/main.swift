@@ -11,6 +11,7 @@ struct MSRTestRunner {
             try testRenamesSidecarsTogether()
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
+            try await testElevenLabsTranscriptionUsesLongRequestTimeout()
             try await testSummarizeEndpointDelegates()
             try await testHealthEndpoint()
             try await testLocalHTTPServerHealthEndpoint()
@@ -104,6 +105,29 @@ private func testTranscribeEndpointDelegates() async throws {
     let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: response.body)
     try expect(decoded.text == "Transcript for /tmp/demo.m4a via elevenlabs", "transcribe body should include fake transcript")
     try expect(service.transcribeCalls == 1, "AI service should be called once")
+}
+
+private func testElevenLabsTranscriptionUsesLongRequestTimeout() async throws {
+    let folder = try TemporaryFolder()
+    let audioURL = folder.url.appendingPathComponent("long-meeting.m4a")
+    try Data("audio".utf8).write(to: audioURL)
+
+    CapturingURLProtocol.reset(
+        statusCode: 200,
+        body: Data(#"{"text":"done","language_code":"en"}"#.utf8)
+    )
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CapturingURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let client = ElevenLabsTranscriptionClient(
+        endpoint: URL(string: "https://example.test/speech-to-text")!,
+        urlSession: session
+    )
+
+    _ = try await client.transcribe(audioURL: audioURL, apiKey: "test-key")
+
+    let timeout = CapturingURLProtocol.capturedTimeoutInterval
+    try expect((timeout ?? 0) >= 600, "long transcription request timeout should be at least ten minutes")
 }
 
 private func testSummarizeEndpointDelegates() async throws {
@@ -485,4 +509,53 @@ private final class FakeAIService: AIService, @unchecked Sendable {
             """
         )
     }
+}
+
+private final class CapturingURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var timeoutInterval: TimeInterval?
+    nonisolated(unsafe) private static var statusCode = 200
+    nonisolated(unsafe) private static var responseBody = Data()
+
+    static var capturedTimeoutInterval: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return timeoutInterval
+    }
+
+    static func reset(statusCode: Int, body: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.timeoutInterval = nil
+        self.statusCode = statusCode
+        self.responseBody = body
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.lock.lock()
+        Self.timeoutInterval = request.timeoutInterval
+        let statusCode = Self.statusCode
+        let responseBody = Self.responseBody
+        Self.lock.unlock()
+
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: statusCode,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: responseBody)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

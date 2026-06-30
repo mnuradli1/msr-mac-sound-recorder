@@ -2,6 +2,8 @@ import Foundation
 import MSRCore
 
 public final class OpenAIClient {
+    private static let transcriptionTimeout: TimeInterval = 30 * 60
+
     private let transcriptionEndpoint: URL
     private let responsesEndpoint: URL
     private let urlSession: URLSession
@@ -29,6 +31,7 @@ public final class OpenAIClient {
 
         var request = URLRequest(url: transcriptionEndpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.transcriptionTimeout
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = multipart.finalize()

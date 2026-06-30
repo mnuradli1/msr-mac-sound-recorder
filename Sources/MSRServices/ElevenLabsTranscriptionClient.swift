@@ -2,6 +2,8 @@ import Foundation
 import MSRCore
 
 public final class ElevenLabsTranscriptionClient {
+    private static let transcriptionTimeout: TimeInterval = 30 * 60
+
     private let endpoint: URL
     private let urlSession: URLSession
 
@@ -26,6 +28,7 @@ public final class ElevenLabsTranscriptionClient {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.transcriptionTimeout
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
         request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = multipart.finalize()
