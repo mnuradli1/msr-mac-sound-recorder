@@ -12,6 +12,7 @@ struct MSRTestRunner {
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
+            try testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime()
             try await testSummarizeEndpointDelegates()
             try await testHealthEndpoint()
             try await testLocalHTTPServerHealthEndpoint()
@@ -128,6 +129,25 @@ private func testElevenLabsTranscriptionUsesLongRequestTimeout() async throws {
 
     let timeout = CapturingURLProtocol.capturedTimeoutInterval
     try expect((timeout ?? 0) >= 600, "long transcription request timeout should be at least ten minutes")
+}
+
+private func testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime() throws {
+    try expect(
+        TranscriptionProgressDisplay.message(provider: .elevenLabs, tick: 0) == "Transcribing with ElevenLabs",
+        "first transcription message frame should not include dots"
+    )
+    try expect(
+        TranscriptionProgressDisplay.message(provider: .elevenLabs, tick: 3) == "Transcribing with ElevenLabs...",
+        "transcription message should animate dots"
+    )
+    try expect(
+        TranscriptionProgressDisplay.elapsedText(seconds: 65) == "01:05",
+        "short transcription elapsed text should use MM:SS"
+    )
+    try expect(
+        TranscriptionProgressDisplay.elapsedText(seconds: 3_665) == "01:01:05",
+        "long transcription elapsed text should use HH:MM:SS"
+    )
 }
 
 private func testSummarizeEndpointDelegates() async throws {

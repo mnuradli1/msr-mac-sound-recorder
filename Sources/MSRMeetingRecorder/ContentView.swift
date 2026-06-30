@@ -424,6 +424,11 @@ struct ContentView: View {
             Text("Transcript")
                 .font(.system(size: 20, weight: .bold))
                 .foregroundStyle(Color(hex: 0x111827))
+
+            if let errorMessage = viewModel.workflowErrorMessage {
+                TranscriptErrorBanner(message: errorMessage)
+            }
+
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $viewModel.transcriptText)
                     .font(.system(size: 17, design: .monospaced))
@@ -455,8 +460,10 @@ struct ContentView: View {
                             Label("Save as .md", systemImage: "doc.richtext")
                         }
                     }
+                    .disabled(viewModel.workflowState.isTranscribing)
 
-                if viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !viewModel.workflowState.isTranscribing {
                     VStack(alignment: .leading, spacing: 16) {
                         Text("Transcript text appears here after ElevenLabs finishes.")
                         Text("Keep this area editable and easy to copy.")
@@ -465,6 +472,15 @@ struct ContentView: View {
                     .font(.system(size: 17))
                     .foregroundStyle(Color(hex: 0x475467))
                     .padding(24)
+                    .allowsHitTesting(false)
+                }
+
+                if viewModel.workflowState.isTranscribing {
+                    TranscriptionProgressOverlay(
+                        provider: viewModel.settings.provider,
+                        startedAt: viewModel.transcriptionStartedAt ?? Date()
+                    )
+                    .transition(.opacity)
                     .allowsHitTesting(false)
                 }
             }
@@ -599,6 +615,109 @@ struct ContentView: View {
             return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
         }
         return String(format: "%02d:%02d", minutes, seconds)
+    }
+}
+
+private struct TranscriptErrorBanner: View {
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color(hex: 0xB91C1C))
+                .padding(.top, 2)
+            Text(message)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color(hex: 0x7F1D1D))
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color(hex: 0xFEF2F2), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(hex: 0xFECACA), lineWidth: 1)
+        }
+    }
+}
+
+private struct TranscriptionProgressOverlay: View {
+    let provider: AIProvider
+    let startedAt: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            let elapsed = max(0, context.date.timeIntervalSince(startedAt))
+            let tick = Int(elapsed.rounded(.down))
+
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.regular)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(TranscriptionProgressDisplay.message(provider: provider, tick: tick))
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(Color(hex: 0x111827))
+                            .contentTransition(.numericText())
+                        Text("Elapsed \(TranscriptionProgressDisplay.elapsedText(seconds: elapsed))")
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color(hex: 0x475467))
+                    }
+                    Spacer()
+                }
+
+                TranscriptionShimmerBar(date: context.date)
+
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Uploading audio. Waiting for transcript.")
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(Color(hex: 0x475467))
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            .background(Color.white.opacity(0.95))
+        }
+    }
+}
+
+private struct TranscriptionShimmerBar: View {
+    let date: Date
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(1, proxy.size.width)
+            let highlightWidth = max(90, width * 0.28)
+            let cycle = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.6) / 1.6
+            let offset = -highlightWidth + CGFloat(cycle) * (width + highlightWidth)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color(hex: 0xE0E7FF))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: 0x93C5FD).opacity(0.1),
+                                Color(hex: 0x2563EB),
+                                Color(hex: 0x22C55E).opacity(0.85),
+                                Color(hex: 0x93C5FD).opacity(0.1)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: highlightWidth)
+                    .offset(x: offset)
+            }
+            .clipShape(Capsule())
+        }
+        .frame(height: 8)
     }
 }
 

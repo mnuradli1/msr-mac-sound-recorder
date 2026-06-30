@@ -27,6 +27,7 @@ final class AppViewModel: ObservableObject {
     @Published var playbackPosition: TimeInterval = 0
     @Published var playbackDuration: TimeInterval = 0
     @Published var recordingElapsed: TimeInterval = 0
+    @Published var transcriptionStartedAt: Date?
     @Published var credentialStatusMessage = ""
     @Published var isTestingCredential = false
     @Published var localAPIStatusMessage = ""
@@ -165,6 +166,13 @@ final class AppViewModel: ObservableObject {
 
     var hasTranscript: Bool {
         !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var workflowErrorMessage: String? {
+        if case let .failed(message) = workflowState {
+            return message
+        }
+        return nil
     }
 
     var recordingsFolderURL: URL {
@@ -554,6 +562,7 @@ final class AppViewModel: ObservableObject {
 
     func transcribeSelected(replacingExistingTranscript: Bool = false) async {
         guard let selectedRecording, !workflowState.isBusy, !isRecording else { return }
+        transcriptionStartedAt = Date()
         workflowState = .transcribing
         statusMessage = replacingExistingTranscript
             ? "Re-transcribing with \(settings.provider.displayName)"
@@ -575,9 +584,11 @@ final class AppViewModel: ObservableObject {
                 try library().clearSummary(for: selectedRecording)
                 summaryText = ""
             }
+            transcriptionStartedAt = nil
             workflowState = .saved
             statusMessage = replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
         } catch {
+            transcriptionStartedAt = nil
             workflowState = .failed(error.localizedDescription)
             statusMessage = error.localizedDescription
         }
