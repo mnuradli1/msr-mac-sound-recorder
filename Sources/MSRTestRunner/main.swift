@@ -12,6 +12,7 @@ struct MSRTestRunner {
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
+            try await testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns()
             try testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime()
             try await testSummarizeEndpointDelegates()
             try await testHealthEndpoint()
@@ -129,6 +130,52 @@ private func testElevenLabsTranscriptionUsesLongRequestTimeout() async throws {
 
     let timeout = CapturingURLProtocol.capturedTimeoutInterval
     try expect((timeout ?? 0) >= 600, "long transcription request timeout should be at least ten minutes")
+}
+
+private func testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns() async throws {
+    let folder = try TemporaryFolder()
+    let audioURL = folder.url.appendingPathComponent("meeting.m4a")
+    try Data("audio".utf8).write(to: audioURL)
+
+    CapturingURLProtocol.reset(
+        statusCode: 200,
+        body: Data("""
+        {
+          "text": "Hello there Hi Adli",
+          "language_code": "en",
+          "words": [
+            {"text": "Hello", "type": "word", "speaker_id": "speaker_0"},
+            {"text": " ", "type": "spacing", "speaker_id": "speaker_0"},
+            {"text": "there", "type": "word", "speaker_id": "speaker_0"},
+            {"text": "Hi", "type": "word", "speaker_id": "speaker_1"},
+            {"text": " ", "type": "spacing", "speaker_id": "speaker_1"},
+            {"text": "Adli", "type": "word", "speaker_id": "speaker_1"}
+          ]
+        }
+        """.utf8)
+    )
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CapturingURLProtocol.self]
+    let client = ElevenLabsTranscriptionClient(
+        endpoint: URL(string: "https://example.test/speech-to-text")!,
+        urlSession: URLSession(configuration: configuration)
+    )
+
+    let response = try await client.transcribe(audioURL: audioURL, apiKey: "test-key")
+    let requestBody = CapturingURLProtocol.capturedRequestBody
+
+    try expect(requestBody?.contains("name=\"diarize\"") == true, "ElevenLabs request should include diarize field")
+    try expect(requestBody?.contains("\r\n\r\ntrue\r\n") == true, "ElevenLabs diarize field should be true")
+    try expect(
+        response.text == """
+        Speaker 1:
+        Hello there
+
+        Speaker 2:
+        Hi Adli
+        """,
+        "ElevenLabs diarized words should be formatted as speaker turns"
+    )
 }
 
 private func testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime() throws {
@@ -534,6 +581,7 @@ private final class FakeAIService: AIService, @unchecked Sendable {
 private final class CapturingURLProtocol: URLProtocol {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var timeoutInterval: TimeInterval?
+    nonisolated(unsafe) private static var requestBody: String?
     nonisolated(unsafe) private static var statusCode = 200
     nonisolated(unsafe) private static var responseBody = Data()
 
@@ -543,10 +591,17 @@ private final class CapturingURLProtocol: URLProtocol {
         return timeoutInterval
     }
 
+    static var capturedRequestBody: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestBody
+    }
+
     static func reset(statusCode: Int, body: Data) {
         lock.lock()
         defer { lock.unlock() }
         self.timeoutInterval = nil
+        self.requestBody = nil
         self.statusCode = statusCode
         self.responseBody = body
     }
@@ -562,6 +617,7 @@ private final class CapturingURLProtocol: URLProtocol {
     override func startLoading() {
         Self.lock.lock()
         Self.timeoutInterval = request.timeoutInterval
+        Self.requestBody = Self.bodyString(for: request)
         let statusCode = Self.statusCode
         let responseBody = Self.responseBody
         Self.lock.unlock()
@@ -578,4 +634,31 @@ private final class CapturingURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
+    private static func bodyString(for request: URLRequest) -> String? {
+        if let httpBody = request.httpBody {
+            return String(data: httpBody, encoding: .utf8)
+        }
+        guard let stream = request.httpBodyStream else {
+            return nil
+        }
+
+        stream.open()
+        defer { stream.close() }
+
+        var data = Data()
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4_096)
+        defer { buffer.deallocate() }
+
+        while stream.hasBytesAvailable {
+            let readCount = stream.read(buffer, maxLength: 4_096)
+            if readCount > 0 {
+                data.append(buffer, count: readCount)
+            } else {
+                break
+            }
+        }
+
+        return String(data: data, encoding: .utf8)
+    }
 }

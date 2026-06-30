@@ -19,6 +19,7 @@ public final class ElevenLabsTranscriptionClient {
         let audioData = try Data(contentsOf: audioURL)
         var multipart = MultipartFormData()
         multipart.appendField(name: "model_id", value: "scribe_v2")
+        multipart.appendField(name: "diarize", value: "true")
         multipart.appendFile(
             name: "file",
             fileName: audioURL.lastPathComponent,
@@ -37,7 +38,7 @@ public final class ElevenLabsTranscriptionClient {
         try Self.validate(response: response, data: data)
         let decoded = try JSONDecoder().decode(ElevenLabsTranscriptionResponse.self, from: data)
         return TranscribeResponse(
-            text: decoded.text,
+            text: decoded.diarizedText ?? decoded.text,
             provider: .elevenLabs,
             languageCode: decoded.languageCode
         )
@@ -57,9 +58,65 @@ public final class ElevenLabsTranscriptionClient {
 private struct ElevenLabsTranscriptionResponse: Decodable {
     let text: String
     let languageCode: String?
+    let words: [ElevenLabsWord]?
 
     enum CodingKeys: String, CodingKey {
         case text
         case languageCode = "language_code"
+        case words
     }
+
+    var diarizedText: String? {
+        guard let words else {
+            return nil
+        }
+        return Self.formatSpeakerTurns(from: words)
+    }
+
+    private static func formatSpeakerTurns(from words: [ElevenLabsWord]) -> String? {
+        var speakerLabels: [String: String] = [:]
+        var turns: [SpeakerTurn] = []
+
+        for word in words {
+            guard let speakerID = word.speakerID, !word.text.isEmpty else {
+                continue
+            }
+            let label = speakerLabels[speakerID] ?? {
+                let newLabel = "Speaker \(speakerLabels.count + 1)"
+                speakerLabels[speakerID] = newLabel
+                return newLabel
+            }()
+
+            if let lastIndex = turns.indices.last, turns[lastIndex].label == label {
+                turns[lastIndex].text += word.text
+            } else {
+                turns.append(SpeakerTurn(label: label, text: word.text))
+            }
+        }
+
+        let rendered = turns.compactMap { turn -> String? in
+            let text = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                return nil
+            }
+            return "\(turn.label):\n\(text)"
+        }.joined(separator: "\n\n")
+
+        return rendered.isEmpty ? nil : rendered
+    }
+}
+
+private struct ElevenLabsWord: Decodable {
+    let text: String
+    let speakerID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case speakerID = "speaker_id"
+    }
+}
+
+private struct SpeakerTurn {
+    let label: String
+    var text: String
 }
