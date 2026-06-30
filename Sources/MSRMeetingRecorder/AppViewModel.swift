@@ -336,7 +336,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func startNewRecordingSession() async {
-        guard canToggleRecording, !isRecording, !workflowState.isPaused else { return }
+        guard !isRecording, !workflowState.isPaused, !workflowState.isBusy else { return }
         let source = selectedSource
         workflowState = .starting(source: source)
         statusMessage = "Starting \(source.displayName)"
