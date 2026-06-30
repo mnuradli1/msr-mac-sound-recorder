@@ -9,6 +9,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             mockTitleBar
             topRecordingBar
+            recoveryBanner
             mainArea
         }
         .frame(minWidth: 1280, minHeight: 780)
@@ -33,7 +34,7 @@ struct ContentView: View {
     }
 
     private var topRecordingBar: some View {
-        ZStack(alignment: .topLeading) {
+        HStack(spacing: 26) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Source")
                     .font(.system(size: 15))
@@ -41,26 +42,46 @@ struct ContentView: View {
                 SourceSegmentedControl(selection: $viewModel.selectedSource, disabled: viewModel.sourcePickerDisabled)
                     .frame(width: 258, height: 38)
             }
-            .frame(width: 258, alignment: .leading)
-            .offset(x: 32, y: 23)
 
             SignalMeterView(title: "Mic", level: viewModel.microphoneLevel, isActive: viewModel.isRecording)
                 .frame(width: 190)
-                .offset(x: 344, y: 23)
 
             SignalMeterView(title: "System", level: viewModel.systemLevel, isActive: viewModel.isRecording)
                 .frame(width: 190)
-                .offset(x: 582, y: 23)
 
-            Text(formatDuration(viewModel.recordingElapsed))
-                .font(.system(size: 30, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(hex: 0x111827))
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-                .frame(width: 110, height: 54, alignment: .trailing)
-                .fixedSize(horizontal: true, vertical: false)
-                .accessibilityLabel("Recording timer \(formatDuration(viewModel.recordingElapsed))")
-                .offset(x: 845, y: 24)
+            Spacer(minLength: 16)
+
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(statusChipText)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(statusChipForeground)
+                    .lineLimit(1)
+                    .padding(.horizontal, 12)
+                    .frame(height: 28)
+                    .background(statusChipBackground, in: Capsule())
+
+                Text(formatDuration(viewModel.recordingElapsed))
+                    .font(.system(size: 30, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color(hex: 0x111827))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .frame(minWidth: 110, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityLabel("Recording timer \(formatDuration(viewModel.recordingElapsed))")
+            }
+
+            if let secondaryTitle = viewModel.secondaryRecordingButtonTitle {
+                Button {
+                    Task { await viewModel.useSecondaryRecordingAction() }
+                } label: {
+                    Label(secondaryTitle, systemImage: viewModel.secondaryRecordingButtonSystemImage)
+                        .font(.system(size: 16, weight: .bold))
+                        .frame(width: 112, height: 48)
+                }
+                .buttonStyle(OutlineButtonStyle(cornerRadius: 14))
+                .disabled(!viewModel.canUseSecondaryRecordingAction)
+                .help(secondaryTitle)
+            }
 
             Button {
                 Task { await viewModel.toggleRecording() }
@@ -75,7 +96,6 @@ struct ContentView: View {
             ))
             .disabled(!viewModel.canToggleRecording)
             .help(viewModel.recordingButtonTitle)
-            .offset(x: 968, y: 24)
 
             Button {
                 viewModel.openSettingsWindow()
@@ -87,14 +107,95 @@ struct ContentView: View {
             .buttonStyle(CircleIconButtonStyle())
             .help("Settings")
             .accessibilityLabel("Settings")
-            .offset(x: 1230, y: 27)
         }
-        .frame(maxWidth: .infinity, minHeight: 102, maxHeight: 102, alignment: .topLeading)
+        .padding(.horizontal, 32)
+        .frame(maxWidth: .infinity, minHeight: 102, maxHeight: 102)
         .background(Color.white)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(Color(hex: 0xD8DEE8))
                 .frame(height: 1)
+        }
+    }
+
+    private var recoveryBanner: some View {
+        Group {
+            if !viewModel.recoveryMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform.badge.checkmark")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(viewModel.recoveryMessage)
+                        .font(.system(size: 14, weight: .medium))
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .foregroundStyle(Color(hex: 0x075985))
+                .padding(.horizontal, 32)
+                .frame(minHeight: 38)
+                .background(Color(hex: 0xE0F2FE))
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(Color(hex: 0xBAE6FD))
+                        .frame(height: 1)
+                }
+            }
+        }
+    }
+
+    private var statusChipText: String {
+        switch viewModel.workflowState {
+        case .ready:
+            return "Ready"
+        case .starting:
+            return "Starting"
+        case .recording:
+            return "Recording"
+        case .suspending:
+            return "Pausing"
+        case let .paused(_, reason):
+            return reason.displayName
+        case .finalizing:
+            return "Saving"
+        case .saved:
+            return "Saved"
+        case .recovering:
+            return "Recovering"
+        case .transcribing:
+            return "Transcribing"
+        case .summarizing:
+            return "Summarizing"
+        case .failed:
+            return "Needs attention"
+        }
+    }
+
+    private var statusChipForeground: Color {
+        switch viewModel.workflowState {
+        case .recording:
+            return Color(hex: 0x991B1B)
+        case .paused, .suspending:
+            return Color(hex: 0x92400E)
+        case .recovering, .finalizing, .transcribing, .summarizing:
+            return Color(hex: 0x1D4ED8)
+        case .failed:
+            return Color(hex: 0xB91C1C)
+        case .ready, .starting, .saved:
+            return Color(hex: 0x166534)
+        }
+    }
+
+    private var statusChipBackground: Color {
+        switch viewModel.workflowState {
+        case .recording:
+            return Color(hex: 0xFEE2E2)
+        case .paused, .suspending:
+            return Color(hex: 0xFEF3C7)
+        case .recovering, .finalizing, .transcribing, .summarizing:
+            return Color(hex: 0xDBEAFE)
+        case .failed:
+            return Color(hex: 0xFEE2E2)
+        case .ready, .starting, .saved:
+            return Color(hex: 0xDCFCE7)
         }
     }
 
@@ -491,7 +592,13 @@ struct ContentView: View {
 
     private func formatDuration(_ seconds: TimeInterval) -> String {
         let total = Int(seconds.rounded())
-        return String(format: "%02d:%02d", total / 60, total % 60)
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 
@@ -621,7 +728,13 @@ private struct RecordingRow: View {
 
     private func formatDuration(_ seconds: TimeInterval) -> String {
         let total = Int(seconds.rounded())
-        return String(format: "%02d:%02d", total / 60, total % 60)
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 

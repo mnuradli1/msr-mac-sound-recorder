@@ -12,7 +12,7 @@ struct MSRMeetingRecorderApp: App {
                 .frame(width: 1280, height: 780)
                 .task {
                     viewModel.startLocalAPI()
-                    viewModel.loadRecordings()
+                    await viewModel.bootstrap()
                 }
         }
         .defaultSize(width: 1280, height: 780)

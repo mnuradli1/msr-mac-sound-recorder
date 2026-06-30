@@ -23,6 +23,11 @@ struct MSRTestRunner {
             try testTranscriptExporterBuildsTextAndMarkdown()
             try testAudioSampleLevelMeterNormalizesPCM()
             try testRecordingWorkflowStateLocksSourceAndChoosesPrimaryAction()
+            try testRecordingWorkflowStateSupportsSleepPauseRecovery()
+            try testRecordingSessionClockExcludesPausedSleepTime()
+            try testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride()
+            try await testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem()
+            try await testAudioTrackMixerConcatenatesSegmentsSequentially()
             try await testAudioTrackMixerExportsSingleTrack()
             print("MSRTestRunner: all tests passed")
         } catch {
@@ -269,6 +274,102 @@ private func testRecordingWorkflowStateLocksSourceAndChoosesPrimaryAction() thro
     try expect(RecordingPrimaryAction.next(transcript: "hello", summary: "summary") == .copySummary, "summary should choose copy summary")
 }
 
+private func testRecordingWorkflowStateSupportsSleepPauseRecovery() throws {
+    let paused = RecordingWorkflowState.paused(source: .micAndSystem, reason: .systemSleep)
+    try expect(paused.lockedSource == .micAndSystem, "sleep-paused state should keep the original source locked")
+    try expect(paused.isPaused, "sleep-paused state should report paused")
+    try expect(!paused.isRecording, "sleep-paused state should not report active capture")
+
+    let suspending = RecordingWorkflowState.suspending(source: .system)
+    try expect(suspending.lockedSource == .system, "suspending should keep the original source locked")
+    try expect(suspending.isBusy, "suspending should block duplicate recording actions")
+
+    try expect(RecordingWorkflowState.recovering.isBusy, "recovery should block duplicate recording actions")
+    try expect(RecordingWorkflowState.recovering.isRecovering, "recovering state should report recovery")
+}
+
+private func testRecordingSessionClockExcludesPausedSleepTime() throws {
+    var clock = RecordingSessionClock(startedAt: Date(timeIntervalSince1970: 100))
+    try expect(clock.activeDuration(at: Date(timeIntervalSince1970: 220)) == 120, "active duration should start from first segment")
+
+    clock.pause(at: Date(timeIntervalSince1970: 220), reason: .systemSleep)
+    try expect(clock.activeDuration(at: Date(timeIntervalSince1970: 520)) == 120, "active duration should exclude paused sleep time")
+    try expect(clock.pauseReason == .systemSleep, "clock should remember sleep pause reason")
+
+    clock.resume(at: Date(timeIntervalSince1970: 600))
+    try expect(clock.activeDuration(at: Date(timeIntervalSince1970: 660)) == 180, "active duration should include resumed segment only")
+    try expect(clock.pauseReason == nil, "resumed clock should clear pause reason")
+}
+
+private func testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride() throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let audioURL = folder.url.appendingPathComponent("Recovered Temp.m4a")
+    FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8))
+    let recoveredAt = Date(timeIntervalSince1970: 300)
+
+    let recording = try library.finishRecording(
+        temporaryAudioURL: audioURL,
+        requestedName: "Recovered Meeting",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 1_000),
+        durationSecondsOverride: 125,
+        recoveredAt: recoveredAt,
+        recoveryNote: "Recovered microphone only after system track failed.",
+        segmentCount: 2
+    )
+
+    let reloaded = try RecordingLibrary(folderURL: folder.url).loadRecordings().first
+    try expect(reloaded?.durationSeconds == 125, "duration override should be persisted")
+    try expect(reloaded?.metadata.recoveredAt == recoveredAt, "recovered timestamp should be persisted")
+    try expect(reloaded?.metadata.recoveryNote == "Recovered microphone only after system track failed.", "recovery note should be persisted")
+    try expect(reloaded?.metadata.segmentCount == 2, "segment count should be persisted")
+    try expect(recording.audioURL.lastPathComponent == "Recovered Meeting.m4a", "recovered audio should use requested display name")
+}
+
+private func testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem() async throws {
+    let folder = try TemporaryFolder()
+    let sessionID = "ABC123"
+    let micWAV = folder.url.appendingPathComponent("mic.wav")
+    let micURL = folder.url.appendingPathComponent("..in-progress-\(sessionID)-mic-111.m4a")
+    let systemURL = folder.url.appendingPathComponent("..in-progress-\(sessionID)-system-222.m4a")
+    try writeToneWAV(to: micWAV, frequency: 440, duration: 0.45)
+    try await AudioTrackMixer.mixToSingleM4A(inputs: [micWAV], outputURL: micURL)
+    try Data("not audio".utf8).write(to: systemURL)
+
+    let service = RecordingRecoveryService(folderURL: folder.url)
+    let results = try await service.recoverInterruptedRecordings(now: Date(timeIntervalSince1970: 1_000))
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+
+    try expect(results.count == 1, "one interrupted session should produce one recovery result")
+    try expect(results.first?.status == .recoveredSingleSource(.microphone), "valid microphone side should be imported when system side is corrupt")
+    try expect(recordings.count == 1, "recovered recording should be visible in the library")
+    try expect(recordings.first?.source == .microphone, "metadata should reflect the actual recovered source")
+    try expect(recordings.first?.metadata.recoveredAt != nil, "recovered recording should include recovered timestamp")
+    try expect(recordings.first?.metadata.recoveryNote?.contains("system") == true, "recovery note should mention the missing system side")
+    try expect(!FileManager.default.fileExists(atPath: micURL.path), "valid temp side should be consumed")
+    try expect(!FileManager.default.fileExists(atPath: systemURL.path), "corrupt temp side should be moved out of the active folder")
+    try expect(FileManager.default.fileExists(atPath: folder.url.appendingPathComponent("recovery-failed").path), "failed recovery folder should exist for corrupt leftovers")
+}
+
+private func testAudioTrackMixerConcatenatesSegmentsSequentially() async throws {
+    let folder = try TemporaryFolder()
+    let first = folder.url.appendingPathComponent("first.wav")
+    let second = folder.url.appendingPathComponent("second.wav")
+    let output = folder.url.appendingPathComponent("joined.m4a")
+    try writeToneWAV(to: first, frequency: 440, duration: 0.30)
+    try writeToneWAV(to: second, frequency: 660, duration: 0.40)
+
+    try await AudioTrackMixer.concatenateToSingleM4A(inputs: [first, second], outputURL: output)
+
+    let asset = AVURLAsset(url: output)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    let duration = try await asset.load(.duration)
+    try expect(tracks.count == 1, "concatenated output should contain one audio track")
+    try expect(duration.seconds > 0.60, "concatenated duration should add both segment durations")
+}
+
 private func testAudioTrackMixerExportsSingleTrack() async throws {
     let folder = try TemporaryFolder()
     let first = folder.url.appendingPathComponent("first.wav")
@@ -287,9 +388,8 @@ private func testAudioTrackMixerExportsSingleTrack() async throws {
     try expect(duration.seconds > 0.2, "mixed output should keep audio duration")
 }
 
-private func writeToneWAV(to url: URL, frequency: Double) throws {
+private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.35) throws {
     let sampleRate = 16_000
-    let duration = 0.35
     let sampleCount = Int(Double(sampleRate) * duration)
     var data = Data()
     data.appendASCII("RIFF")

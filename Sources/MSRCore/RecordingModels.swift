@@ -29,6 +29,9 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
     public var durationSeconds: TimeInterval
     public var createdAt: Date
     public var updatedAt: Date
+    public var recoveredAt: Date?
+    public var recoveryNote: String?
+    public var segmentCount: Int?
 
     public init(
         id: UUID,
@@ -39,7 +42,10 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         endedAt: Date,
         durationSeconds: TimeInterval,
         createdAt: Date,
-        updatedAt: Date
+        updatedAt: Date,
+        recoveredAt: Date? = nil,
+        recoveryNote: String? = nil,
+        segmentCount: Int? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -50,6 +56,9 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         self.durationSeconds = durationSeconds
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.recoveredAt = recoveredAt
+        self.recoveryNote = recoveryNote
+        self.segmentCount = segmentCount
     }
 }
 

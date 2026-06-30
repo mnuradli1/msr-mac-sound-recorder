@@ -4,26 +4,33 @@ public enum RecordingWorkflowState: Equatable, Sendable {
     case ready
     case starting(source: AudioSource)
     case recording(source: AudioSource)
+    case suspending(source: AudioSource)
+    case paused(source: AudioSource, reason: RecordingPauseReason)
     case finalizing(source: AudioSource)
     case saved
+    case recovering
     case transcribing
     case summarizing
     case failed(String)
 
     public var lockedSource: AudioSource? {
         switch self {
-        case let .starting(source), let .recording(source), let .finalizing(source):
+        case let .starting(source),
+             let .recording(source),
+             let .suspending(source),
+             let .paused(source, _),
+             let .finalizing(source):
             return source
-        case .ready, .saved, .transcribing, .summarizing, .failed:
+        case .ready, .saved, .recovering, .transcribing, .summarizing, .failed:
             return nil
         }
     }
 
     public var isBusy: Bool {
         switch self {
-        case .starting, .finalizing, .transcribing, .summarizing:
+        case .starting, .suspending, .finalizing, .recovering, .transcribing, .summarizing:
             return true
-        case .ready, .recording, .saved, .failed:
+        case .ready, .recording, .paused, .saved, .failed:
             return false
         }
     }
@@ -35,8 +42,22 @@ public enum RecordingWorkflowState: Equatable, Sendable {
         return false
     }
 
+    public var isPaused: Bool {
+        if case .paused = self {
+            return true
+        }
+        return false
+    }
+
     public var isFinalizing: Bool {
         if case .finalizing = self {
+            return true
+        }
+        return false
+    }
+
+    public var isRecovering: Bool {
+        if case .recovering = self {
             return true
         }
         return false

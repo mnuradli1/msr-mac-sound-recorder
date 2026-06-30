@@ -35,7 +35,11 @@ public final class RecordingLibrary {
         requestedName: String,
         source: AudioSource,
         startedAt: Date,
-        endedAt: Date
+        endedAt: Date,
+        durationSecondsOverride: TimeInterval? = nil,
+        recoveredAt: Date? = nil,
+        recoveryNote: String? = nil,
+        segmentCount: Int? = nil
     ) throws -> RecordingItem {
         try ensureFolderExists()
         let baseName = try uniqueBaseName(FileNameSanitizer.sanitizedBaseName(requestedName))
@@ -54,9 +58,12 @@ public final class RecordingLibrary {
             audioFileName: destinationAudioURL.lastPathComponent,
             startedAt: startedAt,
             endedAt: endedAt,
-            durationSeconds: max(0, endedAt.timeIntervalSince(startedAt)),
+            durationSeconds: max(0, durationSecondsOverride ?? endedAt.timeIntervalSince(startedAt)),
             createdAt: now,
-            updatedAt: now
+            updatedAt: now,
+            recoveredAt: recoveredAt,
+            recoveryNote: recoveryNote,
+            segmentCount: segmentCount
         )
         let recording = RecordingItem(metadata: metadata, folderURL: folderURL)
         try write(metadata: metadata, to: recording.metadataURL)

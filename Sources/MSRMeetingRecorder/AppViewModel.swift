@@ -30,6 +30,7 @@ final class AppViewModel: ObservableObject {
     @Published var credentialStatusMessage = ""
     @Published var isTestingCredential = false
     @Published var localAPIStatusMessage = ""
+    @Published var recoveryMessage = ""
 
     private let settingsStore = UserDefaultsSettingsStore()
     private let keyStore = APIKeyStore()
@@ -38,11 +39,17 @@ final class AppViewModel: ObservableObject {
     private let aiService: ProviderAIService
     private let proxy: LocalAPIProxy
     private var localServer: LocalHTTPServer?
-    private var recordingStartedAt: Date?
+    private var recordingSessionClock: RecordingSessionClock?
     private var temporaryAudioURL: URL?
+    private var completedSegmentURLs: [URL] = []
+    private var currentSessionSource: AudioSource?
+    private var currentSessionName: String?
     private var audioPlayer: AVAudioPlayer?
     private var playbackTimer: Timer?
     private var recordingTimer: Timer?
+    private var recordingActionInFlight = false
+    private var powerObserverTokens: [NSObjectProtocol] = []
+    private var sleepPreventionActivity: NSObjectProtocol?
 
     init(recorder: AudioRecording = MeetingAudioRecorder()) {
         settings = settingsStore.load()
@@ -74,10 +81,21 @@ final class AppViewModel: ObservableObject {
     }
 
     var canToggleRecording: Bool {
-        if isRecording {
+        if recordingActionInFlight {
+            return false
+        }
+        if isRecording || workflowState.isPaused {
             return true
         }
         return !workflowState.isBusy
+    }
+
+    var canPauseRecording: Bool {
+        isRecording && !recordingActionInFlight
+    }
+
+    var canSavePausedRecording: Bool {
+        workflowState.isPaused && !recordingActionInFlight && !completedSegmentURLs.isEmpty
     }
 
     var recordingButtonTitle: String {
@@ -86,15 +104,48 @@ final class AppViewModel: ObservableObject {
             return "Starting..."
         case .recording:
             return "Stop Recording"
+        case .suspending:
+            return "Pausing..."
+        case let .paused(_, reason):
+            return reason == .systemSleep ? "Resume Recording" : "Resume"
         case .finalizing:
             return "Finalizing..."
+        case .recovering:
+            return "Recovering..."
         case .ready, .saved, .failed, .transcribing, .summarizing:
             return "Record"
         }
     }
 
     var recordingButtonSystemImage: String {
-        isRecording ? "stop.circle.fill" : "record.circle"
+        if workflowState.isPaused {
+            return "play.circle.fill"
+        }
+        return isRecording ? "stop.circle.fill" : "record.circle"
+    }
+
+    var secondaryRecordingButtonTitle: String? {
+        if isRecording {
+            return "Pause"
+        }
+        if workflowState.isPaused {
+            return "Save"
+        }
+        return nil
+    }
+
+    var secondaryRecordingButtonSystemImage: String {
+        workflowState.isPaused ? "checkmark.circle" : "pause.circle"
+    }
+
+    var canUseSecondaryRecordingAction: Bool {
+        if isRecording {
+            return canPauseRecording
+        }
+        if workflowState.isPaused {
+            return canSavePausedRecording
+        }
+        return false
     }
 
     var primaryAction: RecordingPrimaryAction {
@@ -143,6 +194,12 @@ final class AppViewModel: ObservableObject {
             localAPIStatusMessage = "Local API could not start: \(error.localizedDescription)"
             statusMessage = localAPIStatusMessage
         }
+    }
+
+    func bootstrap() async {
+        installPowerObservers()
+        loadRecordings()
+        await recoverInterruptedRecordings()
     }
 
     func loadRecordings() {
@@ -196,75 +253,242 @@ final class AppViewModel: ObservableObject {
     }
 
     func toggleRecording() async {
-        if isRecording {
-            await stopRecording()
-        } else {
-            await startRecording()
+        await performRecordingAction {
+            if self.isRecording {
+                await self.finalizeRecordingSession()
+            } else if self.workflowState.isPaused {
+                await self.resumeRecordingSession()
+            } else {
+                await self.startNewRecordingSession()
+            }
         }
     }
 
     func startRecording() async {
-        guard canToggleRecording, !isRecording else { return }
+        await performRecordingAction {
+            await self.startNewRecordingSession()
+        }
+    }
+
+    func stopRecording() async {
+        await performRecordingAction {
+            await self.finalizeRecordingSession()
+        }
+    }
+
+    func pauseRecording(reason: RecordingPauseReason = .manual) async {
+        await performRecordingAction {
+            await self.pauseCurrentRecording(reason: reason)
+        }
+    }
+
+    func useSecondaryRecordingAction() async {
+        await performRecordingAction {
+            if self.isRecording {
+                await self.pauseCurrentRecording(reason: .manual)
+            } else if self.workflowState.isPaused {
+                await self.finalizeRecordingSession()
+            }
+        }
+    }
+
+    func recoverInterruptedRecordings() async {
+        guard !recordingActionInFlight, !isRecording, !workflowState.isBusy else { return }
+        let previousState = workflowState
+        workflowState = .recovering
+        statusMessage = "Checking interrupted recordings"
+        do {
+            let results = try await RecordingRecoveryService(folderURL: recordingsFolderURL).recoverInterruptedRecordings()
+            loadRecordings()
+            let recovered = results.compactMap(\.recording)
+            if let firstRecovered = recovered.first {
+                selectedRecording = recordings.first(where: { $0.id == firstRecovered.id }) ?? firstRecovered
+                loadSelectedSidecars()
+                recoveryMessage = "\(recovered.count) interrupted recording\(recovered.count == 1 ? "" : "s") recovered."
+                statusMessage = recoveryMessage
+                workflowState = .saved
+            } else if results.contains(where: {
+                if case .failed = $0.status { return true }
+                return false
+            }) {
+                recoveryMessage = "Some interrupted recording files could not be recovered."
+                statusMessage = recoveryMessage
+                workflowState = selectedRecording == nil ? .ready : .saved
+            } else {
+                recoveryMessage = ""
+                workflowState = previousState == .recovering ? (selectedRecording == nil ? .ready : .saved) : previousState
+                if statusMessage == "Checking interrupted recordings" {
+                    statusMessage = selectedRecording == nil ? "Ready" : "Recording selected"
+                }
+            }
+        } catch {
+            workflowState = .failed(error.localizedDescription)
+            recoveryMessage = "Recovery failed: \(error.localizedDescription)"
+            statusMessage = recoveryMessage
+        }
+    }
+
+    func suspendForSystemSleep() async {
+        await performRecordingAction {
+            guard self.isRecording else { return }
+            await self.pauseCurrentRecording(reason: .systemSleep)
+        }
+    }
+
+    private func startNewRecordingSession() async {
+        guard canToggleRecording, !isRecording, !workflowState.isPaused else { return }
         let source = selectedSource
         workflowState = .starting(source: source)
         statusMessage = "Starting \(source.displayName)"
+        recoveryMessage = ""
         resetSignalLevels()
         stopPlayback()
 
         do {
-            let folder = recordingsFolderURL
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let temporaryURL = folder.appendingPathComponent(".in-progress-\(UUID().uuidString).m4a")
+            let startedAt = Date()
+            let temporaryURL = try makeTemporaryAudioURL()
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
-            recordingStartedAt = Date()
+            recordingSessionClock = RecordingSessionClock(startedAt: startedAt)
+            completedSegmentURLs = []
+            currentSessionSource = source
+            currentSessionName = defaultMeetingName(for: startedAt)
             workflowState = .recording(source: source)
             recordingElapsed = 0
             startRecordingTimer()
+            beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
         } catch {
             workflowState = .failed(error.localizedDescription)
-            recordingStartedAt = nil
+            temporaryAudioURL = nil
+            recordingSessionClock = nil
+            completedSegmentURLs = []
+            currentSessionSource = nil
+            currentSessionName = nil
+            resetSignalLevels()
+            endSleepPrevention()
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func resumeRecordingSession() async {
+        guard workflowState.isPaused,
+              let source = workflowState.lockedSource,
+              var clock = recordingSessionClock else { return }
+
+        workflowState = .starting(source: source)
+        statusMessage = "Resuming \(source.displayName)"
+        resetSignalLevels()
+
+        do {
+            let temporaryURL = try makeTemporaryAudioURL()
+            temporaryAudioURL = temporaryURL
+            try await recorder.start(source: source, outputURL: temporaryURL)
+            let resumedAt = Date()
+            clock.resume(at: resumedAt)
+            recordingSessionClock = clock
+            workflowState = .recording(source: source)
+            startRecordingTimer()
+            beginSleepPrevention()
+            statusMessage = "Recording \(source.displayName)"
+        } catch {
+            workflowState = .paused(source: source, reason: clock.pauseReason ?? .manual)
             temporaryAudioURL = nil
             resetSignalLevels()
             statusMessage = error.localizedDescription
         }
     }
 
-    func stopRecording() async {
+    private func pauseCurrentRecording(reason: RecordingPauseReason) async {
         guard isRecording,
-              let startedAt = recordingStartedAt,
+              let source = workflowState.lockedSource,
               let temporaryAudioURL,
-              let source = workflowState.lockedSource else {
-            return
-        }
+              var clock = recordingSessionClock else { return }
 
+        workflowState = .suspending(source: source)
+        statusMessage = reason.displayName
+        stopRecordingTimer()
+
+        do {
+            try await recorder.stop()
+            endSleepPrevention()
+            completedSegmentURLs.append(temporaryAudioURL)
+            self.temporaryAudioURL = nil
+            let pausedAt = Date()
+            clock.pause(at: pausedAt, reason: reason)
+            recordingSessionClock = clock
+            recordingElapsed = clock.activeDuration(at: pausedAt)
+            resetSignalLevels()
+            workflowState = .paused(source: source, reason: reason)
+            statusMessage = reason == .systemSleep
+                ? "Recording paused before sleep. Resume after wake."
+                : "Recording paused"
+        } catch {
+            endSleepPrevention()
+            workflowState = .failed(error.localizedDescription)
+            recoveryMessage = "Could not pause cleanly. Recovery will retry on next launch."
+            statusMessage = error.localizedDescription
+            resetSignalLevels()
+        }
+    }
+
+    private func finalizeRecordingSession() async {
+        guard let source = workflowState.lockedSource ?? currentSessionSource,
+              let clock = recordingSessionClock else { return }
+
+        let wasRecording = isRecording
+        let activeTemporaryAudioURL = temporaryAudioURL
         workflowState = .finalizing(source: source)
         statusMessage = "Finalizing recording"
         stopRecordingTimer()
 
         do {
-            try await recorder.stop()
+            var finalizedClock = clock
+            if wasRecording, let temporaryAudioURL = activeTemporaryAudioURL {
+                try await recorder.stop()
+                completedSegmentURLs.append(temporaryAudioURL)
+                self.temporaryAudioURL = nil
+                finalizedClock.pause(at: Date(), reason: .manual)
+            }
+            endSleepPrevention()
+            let segmentURLs = completedSegmentURLs
+            guard !segmentURLs.isEmpty else {
+                throw RecordingSessionError.noCapturedSegments
+            }
+            let endedAt = Date()
+            let finalTemporaryURL: URL
+            if segmentURLs.count == 1, let onlySegment = segmentURLs.first {
+                finalTemporaryURL = onlySegment
+            } else {
+                finalTemporaryURL = try makeFinalTemporaryAudioURL()
+                try await AudioTrackMixer.concatenateToSingleM4A(inputs: segmentURLs, outputURL: finalTemporaryURL)
+            }
             let recording = try library().finishRecording(
-                temporaryAudioURL: temporaryAudioURL,
-                requestedName: defaultMeetingName(for: startedAt),
+                temporaryAudioURL: finalTemporaryURL,
+                requestedName: currentSessionName ?? defaultMeetingName(for: finalizedClock.startedAt),
                 source: source,
-                startedAt: startedAt,
-                endedAt: Date()
+                startedAt: finalizedClock.startedAt,
+                endedAt: endedAt,
+                durationSecondsOverride: finalizedClock.activeDuration(at: endedAt),
+                segmentCount: max(1, segmentURLs.count)
             )
-            recordingStartedAt = nil
-            self.temporaryAudioURL = nil
+            if segmentURLs.count > 1 {
+                for url in segmentURLs {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+            clearRecordingSession()
             resetSignalLevels()
             loadRecordings()
-            selectedRecording = recording
+            selectedRecording = recordings.first(where: { $0.id == recording.id }) ?? recording
             loadSelectedSidecars()
             preparePlayback(for: recording)
             workflowState = .saved
-            statusMessage = "Recording saved"
+            statusMessage = segmentURLs.count > 1 ? "Recording saved from \(segmentURLs.count) segments" : "Recording saved"
         } catch {
+            endSleepPrevention()
             workflowState = .failed(error.localizedDescription)
-            recordingStartedAt = nil
-            self.temporaryAudioURL = nil
+            recoveryMessage = "Could not finalize cleanly. Recovery will retry on next launch."
             resetSignalLevels()
             statusMessage = error.localizedDescription
         }
@@ -503,6 +727,25 @@ final class AppViewModel: ObservableObject {
         statusMessage = result.message
     }
 
+    private func performRecordingAction(_ operation: () async -> Void) async {
+        guard !recordingActionInFlight else { return }
+        recordingActionInFlight = true
+        defer { recordingActionInFlight = false }
+        await operation()
+    }
+
+    private func makeTemporaryAudioURL() throws -> URL {
+        let folder = recordingsFolderURL
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appendingPathComponent(".in-progress-\(UUID().uuidString).m4a")
+    }
+
+    private func makeFinalTemporaryAudioURL() throws -> URL {
+        let folder = recordingsFolderURL
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appendingPathComponent(".final-\(UUID().uuidString).m4a")
+    }
+
     private func library() -> RecordingLibrary {
         RecordingLibrary(folderURL: recordingsFolderURL)
     }
@@ -566,8 +809,8 @@ final class AppViewModel: ObservableObject {
         recordingTimer?.invalidate()
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let recordingStartedAt = self.recordingStartedAt else { return }
-                self.recordingElapsed = Date().timeIntervalSince(recordingStartedAt)
+                guard let self, let recordingSessionClock = self.recordingSessionClock else { return }
+                self.recordingElapsed = recordingSessionClock.activeDuration(at: Date())
             }
         }
     }
@@ -600,6 +843,65 @@ final class AppViewModel: ObservableObject {
         systemLevel = 0
         inputLevel = 0
         waveform.reset()
+    }
+
+    private func clearRecordingSession() {
+        recordingSessionClock = nil
+        temporaryAudioURL = nil
+        completedSegmentURLs = []
+        currentSessionSource = nil
+        currentSessionName = nil
+        recordingElapsed = 0
+        endSleepPrevention()
+    }
+
+    private func installPowerObservers() {
+        guard powerObserverTokens.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        let willSleep = center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.suspendForSystemSleep()
+            }
+        }
+        let didWake = center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.recoverInterruptedRecordings()
+            }
+        }
+        powerObserverTokens = [willSleep, didWake]
+    }
+
+    private func beginSleepPrevention() {
+        guard sleepPreventionActivity == nil else { return }
+        sleepPreventionActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .suddenTerminationDisabled],
+            reason: "MSR is recording meeting audio"
+        )
+    }
+
+    private func endSleepPrevention() {
+        guard let sleepPreventionActivity else { return }
+        ProcessInfo.processInfo.endActivity(sleepPreventionActivity)
+        self.sleepPreventionActivity = nil
+    }
+}
+
+private enum RecordingSessionError: LocalizedError {
+    case noCapturedSegments
+
+    var errorDescription: String? {
+        switch self {
+        case .noCapturedSegments:
+            return "No captured audio segments were available to save."
+        }
     }
 }
 

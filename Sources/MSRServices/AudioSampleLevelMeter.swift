@@ -1,7 +1,7 @@
 import CoreMedia
 import Foundation
 
-public enum AudioSignalChannel: Sendable {
+public enum AudioSignalChannel: Equatable, Sendable {
     case microphone
     case system
 }
