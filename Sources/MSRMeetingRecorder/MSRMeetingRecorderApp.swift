@@ -26,6 +26,19 @@ struct MSRMeetingRecorderApp: App {
             }
 
             CommandMenu("Recording") {
+                Button("Search Recordings") {
+                    NotificationCenter.default.post(name: .focusRecordingSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command])
+
+                Button("Clear Search") {
+                    NotificationCenter.default.post(name: .clearRecordingSearch, object: nil)
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(!viewModel.isSearchingRecordings)
+
+                Divider()
+
                 Button(viewModel.isPlaying ? "Pause" : "Play") {
                     viewModel.togglePlayback()
                 }

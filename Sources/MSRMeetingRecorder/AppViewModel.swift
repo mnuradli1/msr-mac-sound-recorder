@@ -22,6 +22,7 @@ final class AppViewModel: ObservableObject {
     @Published var statusMessage = "Ready"
     @Published var transcriptText = ""
     @Published var summaryText = ""
+    @Published var recordingSearchQuery = ""
     @Published var renameDraft = ""
     @Published var showingRename = false
     @Published var elevenLabsKeyDraft = ""
@@ -42,6 +43,7 @@ final class AppViewModel: ObservableObject {
     @Published var localAPIStatusMessage = ""
     @Published var recoveryMessage = ""
     @Published var recoveryNoticeSeverity: AppNoticeSeverity = .info
+    @Published private var recordingSearchDocuments: [RecordingSearchDocument] = []
 
     private let settingsStore = UserDefaultsSettingsStore()
     private let keyStore = APIKeyStore()
@@ -198,6 +200,18 @@ final class AppViewModel: ObservableObject {
         selectedRecording != nil && canSelectHistory
     }
 
+    var isSearchingRecordings: Bool {
+        !recordingSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var filteredRecordings: [RecordingItem] {
+        RecordingSearch.filter(recordingSearchDocuments, query: recordingSearchQuery).map(\.recording)
+    }
+
+    var recordingSearchResultCount: Int {
+        filteredRecordings.count
+    }
+
     var workflowErrorMessage: String? {
         if case let .failed(message) = workflowState {
             return message
@@ -243,6 +257,7 @@ final class AppViewModel: ObservableObject {
     func loadRecordings() {
         do {
             recordings = try library().loadRecordings()
+            recordingSearchDocuments = makeSearchDocuments(for: recordings)
             if let selectedRecording,
                let refreshed = recordings.first(where: { $0.id == selectedRecording.id }) {
                 self.selectedRecording = refreshed
@@ -254,6 +269,10 @@ final class AppViewModel: ObservableObject {
             statusMessage = error.localizedDescription
             workflowState = .failed(error.localizedDescription)
         }
+    }
+
+    func clearRecordingSearch() {
+        recordingSearchQuery = ""
     }
 
     func select(_ recording: RecordingItem) {
@@ -699,6 +718,7 @@ final class AppViewModel: ObservableObject {
             if replacingExistingTranscript {
                 try library().clearSummary(for: selectedRecording)
             }
+            refreshSearchDocument(for: selectedRecording)
             job.markCompleted(transcriptFileName: selectedRecording.transcriptURL.lastPathComponent)
             try? jobStore.save(job)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
@@ -778,6 +798,7 @@ final class AppViewModel: ObservableObject {
             )
             let decoded = try JSONDecoder().decode(SummarizeResponse.self, from: response.body)
             try library().writeSummary(decoded.markdown, for: selectedRecording)
+            refreshSearchDocument(for: selectedRecording)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 summaryText = decoded.markdown
             }
@@ -959,6 +980,31 @@ final class AppViewModel: ObservableObject {
         summaryText = (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
         selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
         preparePlayback(for: selectedRecording)
+    }
+
+    private func makeSearchDocuments(for recordings: [RecordingItem]) -> [RecordingSearchDocument] {
+        recordings.map(makeSearchDocument)
+    }
+
+    private func makeSearchDocument(for recording: RecordingItem) -> RecordingSearchDocument {
+        RecordingSearchDocument(
+            recording: recording,
+            transcriptText: readTextIfExists(at: recording.transcriptURL),
+            summaryText: readTextIfExists(at: recording.summaryURL)
+        )
+    }
+
+    private func refreshSearchDocument(for recording: RecordingItem) {
+        let document = makeSearchDocument(for: recording)
+        if let index = recordingSearchDocuments.firstIndex(where: { $0.recording.id == recording.id }) {
+            recordingSearchDocuments[index] = document
+        } else {
+            recordingSearchDocuments.insert(document, at: 0)
+        }
+    }
+
+    private func readTextIfExists(at url: URL) -> String {
+        (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
     private func loadTranscriptionJobForSelection(_ recording: RecordingItem) -> TranscriptionJob? {

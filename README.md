@@ -27,7 +27,7 @@ chmod +x scripts/package_app.sh
 open dist/MSR\ Meeting\ Recorder.app
 ```
 
-The script also creates `dist/MSR-Meeting-Recorder-0.2.1.dmg`.
+The script also creates `dist/MSR-Meeting-Recorder-0.2.2.dmg`.
 
 ## API Keys
 

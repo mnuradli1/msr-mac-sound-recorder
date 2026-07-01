@@ -4,6 +4,7 @@ import MSRCore
 
 struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
+    @FocusState private var recordingSearchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,6 +19,13 @@ struct ContentView: View {
         .background(WindowChromeConfigurator())
         .sheet(isPresented: $viewModel.showingRename) {
             renameSheet
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .focusRecordingSearch)) { _ in
+            recordingSearchFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .clearRecordingSearch)) { _ in
+            viewModel.clearRecordingSearch()
+            recordingSearchFocused = false
         }
     }
 
@@ -250,50 +258,58 @@ struct ContentView: View {
             .padding(.top, 30)
             .padding(.horizontal, 20)
 
+            recordingSearchField
+                .padding(.top, 14)
+                .padding(.horizontal, 20)
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    ForEach(recordingSections) { section in
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(section.title)
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(Color(hex: 0x667085))
-                                .padding(.horizontal, 12)
+                    if recordingSections.isEmpty {
+                        sidebarEmptyState
+                    } else {
+                        ForEach(recordingSections) { section in
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text(section.title)
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(Color(hex: 0x667085))
+                                    .padding(.horizontal, 12)
 
-                            VStack(spacing: 8) {
-                                ForEach(section.recordings) { recording in
-                                    RecordingRow(
-                                        recording: recording,
-                                        isSelected: recording.id == viewModel.selectedRecording?.id
-                                    )
-                                    .onTapGesture {
-                                        viewModel.select(recording)
-                                    }
-                                    .opacity(viewModel.canSelectHistory ? 1 : 0.68)
-                                    .contextMenu {
-                                        Button {
+                                VStack(spacing: 8) {
+                                    ForEach(section.recordings) { recording in
+                                        RecordingRow(
+                                            recording: recording,
+                                            isSelected: recording.id == viewModel.selectedRecording?.id
+                                        )
+                                        .onTapGesture {
                                             viewModel.select(recording)
-                                            viewModel.togglePlayback()
-                                        } label: {
-                                            Label("Play", systemImage: "play.fill")
                                         }
-                                        .disabled(!viewModel.canPlaySelectedRecording)
-                                        Button {
-                                            viewModel.startRename(recording)
-                                        } label: {
-                                            Label("Rename", systemImage: "pencil")
+                                        .opacity(viewModel.canSelectHistory ? 1 : 0.68)
+                                        .contextMenu {
+                                            Button {
+                                                viewModel.select(recording)
+                                                viewModel.togglePlayback()
+                                            } label: {
+                                                Label("Play", systemImage: "play.fill")
+                                            }
+                                            .disabled(!viewModel.canPlaySelectedRecording)
+                                            Button {
+                                                viewModel.startRename(recording)
+                                            } label: {
+                                                Label("Rename", systemImage: "pencil")
+                                            }
+                                            .disabled(!viewModel.canMutateRecordingLibrary)
+                                            Button {
+                                                viewModel.showInFinder(recording)
+                                            } label: {
+                                                Label("Show in Finder", systemImage: "finder")
+                                            }
+                                            Button(role: .destructive) {
+                                                viewModel.delete(recording)
+                                            } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                            .disabled(!viewModel.canMutateRecordingLibrary)
                                         }
-                                        .disabled(!viewModel.canMutateRecordingLibrary)
-                                        Button {
-                                            viewModel.showInFinder(recording)
-                                        } label: {
-                                            Label("Show in Finder", systemImage: "finder")
-                                        }
-                                        Button(role: .destructive) {
-                                            viewModel.delete(recording)
-                                        } label: {
-                                            Label("Delete", systemImage: "trash")
-                                        }
-                                        .disabled(!viewModel.canMutateRecordingLibrary)
                                     }
                                 }
                             }
@@ -306,6 +322,71 @@ struct ContentView: View {
             }
         }
         .background(Color(hex: 0xF6F8FB))
+    }
+
+    private var recordingSearchField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color(hex: 0x667085))
+
+                TextField("Search recordings", text: $viewModel.recordingSearchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color(hex: 0x111827))
+                    .focused($recordingSearchFocused)
+                    .disabled(!viewModel.canSelectHistory)
+
+                if viewModel.isSearchingRecordings {
+                    Button {
+                        viewModel.clearRecordingSearch()
+                        recordingSearchFocused = true
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color(hex: 0x98A2B3))
+                    .help("Clear search")
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .background(Color.white, in: RoundedRectangle(cornerRadius: 9))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(recordingSearchFocused ? Color(hex: 0xF97316) : Color(hex: 0xD0D5DD), lineWidth: 1)
+            }
+
+            if viewModel.isSearchingRecordings {
+                Text(recordingSearchResultText)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color(hex: 0x667085))
+                    .padding(.horizontal, 4)
+            }
+        }
+    }
+
+    private var recordingSearchResultText: String {
+        let count = viewModel.recordingSearchResultCount
+        return "\(count) result\(count == 1 ? "" : "s")"
+    }
+
+    private var sidebarEmptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(viewModel.isSearchingRecordings ? "No recordings found" : "No recordings yet")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(Color(hex: 0x344054))
+            Text(viewModel.isSearchingRecordings ? "Try a different query." : "Your recordings will appear here.")
+                .font(.system(size: 13))
+                .foregroundStyle(Color(hex: 0x667085))
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 18)
     }
 
     private var detail: some View {
@@ -606,9 +687,10 @@ struct ContentView: View {
 
     private var recordingSections: [RecordingSection] {
         let calendar = Calendar.current
-        let today = viewModel.recordings.filter { calendar.isDateInToday($0.startedAt) }
-        let yesterday = viewModel.recordings.filter { calendar.isDateInYesterday($0.startedAt) }
-        let earlier = viewModel.recordings.filter {
+        let recordings = viewModel.filteredRecordings
+        let today = recordings.filter { calendar.isDateInToday($0.startedAt) }
+        let yesterday = recordings.filter { calendar.isDateInYesterday($0.startedAt) }
+        let earlier = recordings.filter {
             !calendar.isDateInToday($0.startedAt) && !calendar.isDateInYesterday($0.startedAt)
         }
 
@@ -650,6 +732,11 @@ struct ContentView: View {
         }
         return String(format: "%02d:%02d", minutes, seconds)
     }
+}
+
+extension Notification.Name {
+    static let focusRecordingSearch = Notification.Name("MSRFocusRecordingSearch")
+    static let clearRecordingSearch = Notification.Name("MSRClearRecordingSearch")
 }
 
 struct NoticeBanner: View {

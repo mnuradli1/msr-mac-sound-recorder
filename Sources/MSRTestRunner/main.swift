@@ -26,6 +26,8 @@ struct MSRTestRunner {
             try testRecordingCaptureStrategyUsesMixdownForMicAndSystem()
             try testRecordingLibraryDeletesAudioAndSidecars()
             try testRecordingLibraryClearsSummarySidecar()
+            try testRecordingSearchMatchesNameSourceDateTranscriptAndSummary()
+            try testRecordingSearchRequiresAllTokens()
             try testTranscriptExporterBuildsTextAndMarkdown()
             try testAudioSampleLevelMeterNormalizesPCM()
             try testRecordingWorkflowStateLocksSourceAndChoosesPrimaryAction()
@@ -406,6 +408,104 @@ private func testRecordingLibraryClearsSummarySidecar() throws {
     try library.clearSummary(for: recording)
 
     try expect(!FileManager.default.fileExists(atPath: recording.summaryURL.path), "clearing summary should remove stale summary sidecar")
+}
+
+private func testRecordingSearchMatchesNameSourceDateTranscriptAndSummary() throws {
+    let folder = try TemporaryFolder()
+    let first = makeRecording(
+        folderURL: folder.url,
+        name: "Quarterly Planning",
+        source: .micAndSystem,
+        startedAt: makeLocalDate(year: 2026, month: 8, day: 22, hour: 9, minute: 45),
+        duration: 3_730
+    )
+    let second = makeRecording(
+        folderURL: folder.url,
+        name: "Supplier Interview",
+        source: .microphone,
+        startedAt: makeLocalDate(year: 2026, month: 8, day: 23, hour: 13, minute: 30),
+        duration: 82
+    )
+    let documents = [
+        RecordingSearchDocument(
+            recording: first,
+            transcriptText: "Speaker 1 discussed the refinery expansion timeline.",
+            summaryText: "Decision: approve field visit."
+        ),
+        RecordingSearchDocument(
+            recording: second,
+            transcriptText: "Small talk before the interview.",
+            summaryText: "Action item: send supplier scorecard."
+        )
+    ]
+
+    try expect(
+        RecordingSearch.filter(documents, query: "planning").map(\.recording.id) == [first.id],
+        "search should match recording names"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "both").map(\.recording.id) == [first.id],
+        "search should match Mic + System as both"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "2026-08-22").map(\.recording.id) == [first.id],
+        "search should match stable recording dates"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "01:02:10").map(\.recording.id) == [first.id],
+        "search should match long duration text"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "refinery").map(\.recording.id) == [first.id],
+        "search should match transcript text"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "scorecard").map(\.recording.id) == [second.id],
+        "search should match summary text"
+    )
+}
+
+private func testRecordingSearchRequiresAllTokens() throws {
+    let folder = try TemporaryFolder()
+    let first = makeRecording(
+        folderURL: folder.url,
+        name: "Board Review",
+        source: .system,
+        startedAt: makeLocalDate(year: 2026, month: 8, day: 22, hour: 9, minute: 45),
+        duration: 420
+    )
+    let second = makeRecording(
+        folderURL: folder.url,
+        name: "Board Prep",
+        source: .microphone,
+        startedAt: makeLocalDate(year: 2026, month: 8, day: 22, hour: 10, minute: 45),
+        duration: 65
+    )
+    let documents = [
+        RecordingSearchDocument(
+            recording: first,
+            transcriptText: "Speaker 2 said the budget risk is low.",
+            summaryText: ""
+        ),
+        RecordingSearchDocument(
+            recording: second,
+            transcriptText: "Budget packet is missing two appendices.",
+            summaryText: ""
+        )
+    ]
+
+    try expect(
+        RecordingSearch.filter(documents, query: "board budget").map(\.recording.id) == [first.id, second.id],
+        "search should keep recordings where all tokens appear anywhere in the document"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "board speaker").map(\.recording.id) == [first.id],
+        "search should require every query token"
+    )
+    try expect(
+        RecordingSearch.filter(documents, query: "   ").map(\.recording.id) == [first.id, second.id],
+        "blank search should return all recordings"
+    )
 }
 
 private func testTranscriptExporterBuildsTextAndMarkdown() throws {
@@ -806,6 +906,31 @@ private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.3
         data.appendInt16LE(sample)
     }
     try data.write(to: url)
+}
+
+private func makeRecording(
+    folderURL: URL,
+    name: String,
+    source: AudioSource,
+    startedAt: Date,
+    duration: TimeInterval
+) -> RecordingItem {
+    let metadata = RecordingMetadata(
+        id: UUID(),
+        displayName: name,
+        source: source,
+        audioFileName: "\(name).m4a",
+        startedAt: startedAt,
+        endedAt: startedAt.addingTimeInterval(duration),
+        durationSeconds: duration,
+        createdAt: startedAt,
+        updatedAt: startedAt
+    )
+    return RecordingItem(metadata: metadata, folderURL: folderURL)
+}
+
+private func makeLocalDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
+    DateComponents(calendar: Calendar(identifier: .gregorian), year: year, month: month, day: day, hour: hour, minute: minute).date!
 }
 
 private func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
