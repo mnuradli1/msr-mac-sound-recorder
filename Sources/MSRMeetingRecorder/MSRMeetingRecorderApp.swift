@@ -9,7 +9,6 @@ struct MSRMeetingRecorderApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(viewModel: viewModel)
-                .frame(width: 1280, height: 780)
                 .task {
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
@@ -31,28 +30,28 @@ struct MSRMeetingRecorderApp: App {
                     viewModel.togglePlayback()
                 }
                 .keyboardShortcut(.space, modifiers: [])
-                .disabled(viewModel.selectedRecording == nil)
+                .disabled(!viewModel.canPlaySelectedRecording)
 
                 Button("Rename") {
                     viewModel.startRename()
                 }
                 .keyboardShortcut("r", modifiers: [.command])
-                .disabled(viewModel.selectedRecording == nil)
+                .disabled(viewModel.selectedRecording == nil || !viewModel.canMutateRecordingLibrary)
 
                 Button("Transcribe") {
                     Task { await viewModel.transcribeSelected() }
                 }
-                .disabled(viewModel.selectedRecording == nil || viewModel.workflowState.isBusy || viewModel.isRecording)
+                .disabled(!viewModel.canRunPrimaryAction)
 
                 Button("Re-transcribe") {
                     Task { await viewModel.retranscribeSelected() }
                 }
-                .disabled(!viewModel.hasTranscript || viewModel.workflowState.isBusy || viewModel.isRecording)
+                .disabled(!viewModel.hasTranscript || !viewModel.canRunPrimaryAction)
 
                 Button("Summarize") {
                     Task { await viewModel.summarizeSelected() }
                 }
-                .disabled(viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.workflowState.isBusy || viewModel.isRecording)
+                .disabled(viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.canRunPrimaryAction)
 
                 Menu("Save Transcript") {
                     Button("Save as .txt") {

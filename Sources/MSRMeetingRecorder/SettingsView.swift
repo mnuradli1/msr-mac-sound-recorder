@@ -49,14 +49,12 @@ struct SettingsView: View {
 
             if !viewModel.credentialStatusMessage.isEmpty {
                 Section("Status") {
-                    Text(viewModel.credentialStatusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                    NoticeBanner(
+                        message: viewModel.credentialStatusMessage,
+                        severity: viewModel.credentialStatusSeverity,
+                        horizontalPadding: 0
+                    )
+                    .textSelection(.enabled)
                 }
             }
 

@@ -27,8 +27,10 @@ struct MSRTestRunner {
             try testAudioSampleLevelMeterNormalizesPCM()
             try testRecordingWorkflowStateLocksSourceAndChoosesPrimaryAction()
             try testRecordingWorkflowStateSupportsSleepPauseRecovery()
+            try testRecordingInteractionPolicyProtectsPausedBusyAndTargetedWork()
             try testRecordingSessionClockExcludesPausedSleepTime()
             try testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride()
+            try await testRecoveryKeepsSourceForSingleInterruptedSystemRecording()
             try await testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem()
             try await testAudioTrackMixerConcatenatesSegmentsSequentially()
             try await testAudioTrackMixerExportsSingleTrack()
@@ -379,6 +381,33 @@ private func testRecordingWorkflowStateSupportsSleepPauseRecovery() throws {
     try expect(RecordingWorkflowState.recovering.isRecovering, "recovering state should report recovery")
 }
 
+private func testRecordingInteractionPolicyProtectsPausedBusyAndTargetedWork() throws {
+    let paused = RecordingWorkflowState.paused(source: .micAndSystem, reason: .systemSleep)
+    let recording = RecordingWorkflowState.recording(source: .micAndSystem)
+    let transcribing = RecordingWorkflowState.transcribing
+    let saved = RecordingWorkflowState.saved
+    let targetID = UUID()
+    let otherID = UUID()
+
+    try expect(!RecordingInteractionPolicy.canSelectHistory(during: paused), "paused sessions should keep Resume/Save controls visible")
+    try expect(!RecordingInteractionPolicy.canRecoverInterruptedRecordings(during: paused), "paused live segments should not be recovered as orphans")
+    try expect(!RecordingInteractionPolicy.canPlayBack(during: recording), "playback should be disabled while recording")
+    try expect(!RecordingInteractionPolicy.canPlayBack(during: transcribing), "playback should be disabled while AI work is busy")
+    try expect(RecordingInteractionPolicy.canPlayBack(during: saved), "playback should be available for saved recordings")
+    try expect(
+        RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: targetID),
+        "AI results should apply to the visible recording only when the target is still selected"
+    )
+    try expect(
+        !RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: otherID),
+        "AI results should not overwrite the UI after the user switches recordings"
+    )
+    try expect(
+        !RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: nil),
+        "AI results should not repopulate the UI after the target is no longer selected"
+    )
+}
+
 private func testRecordingSessionClockExcludesPausedSleepTime() throws {
     var clock = RecordingSessionClock(startedAt: Date(timeIntervalSince1970: 100))
     try expect(clock.activeDuration(at: Date(timeIntervalSince1970: 220)) == 120, "active duration should start from first segment")
@@ -442,6 +471,22 @@ private func testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem() asy
     try expect(!FileManager.default.fileExists(atPath: micURL.path), "valid temp side should be consumed")
     try expect(!FileManager.default.fileExists(atPath: systemURL.path), "corrupt temp side should be moved out of the active folder")
     try expect(FileManager.default.fileExists(atPath: folder.url.appendingPathComponent("recovery-failed").path), "failed recovery folder should exist for corrupt leftovers")
+}
+
+private func testRecoveryKeepsSourceForSingleInterruptedSystemRecording() async throws {
+    let folder = try TemporaryFolder()
+    let wavURL = folder.url.appendingPathComponent("system.wav")
+    let interruptedURL = folder.url.appendingPathComponent(".in-progress-system-\(UUID().uuidString).m4a")
+    try writeToneWAV(to: wavURL, frequency: 660, duration: 0.35)
+    try await AudioTrackMixer.mixToSingleM4A(inputs: [wavURL], outputURL: interruptedURL)
+
+    let service = RecordingRecoveryService(folderURL: folder.url)
+    _ = try await service.recoverInterruptedRecordings(now: Date(timeIntervalSince1970: 1_000))
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+
+    try expect(recordings.count == 1, "single interrupted source-tagged recording should recover")
+    try expect(recordings.first?.source == .system, "source-tagged single recovery should preserve system source")
+    try expect(recordings.first?.metadata.recoveryNote?.contains("system") == true, "recovery note should mention system source")
 }
 
 private func testAudioTrackMixerConcatenatesSegmentsSequentially() async throws {

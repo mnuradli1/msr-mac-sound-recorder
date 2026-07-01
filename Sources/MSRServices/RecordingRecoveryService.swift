@@ -69,8 +69,8 @@ public final class RecordingRecoveryService: @unchecked Sendable {
                     candidate.systemURL = url
                 }
                 grouped[parsed.sessionID] = candidate
-            } else if name.hasPrefix(".in-progress-") {
-                singles.append(.single(url))
+            } else if let single = parseSingle(name: name, url: url) {
+                singles.append(.single(single))
             }
         }
 
@@ -82,14 +82,15 @@ public final class RecordingRecoveryService: @unchecked Sendable {
 
     private func recover(_ candidate: RecoveryCandidate, now: Date) async throws -> RecordingRecoveryResult {
         switch candidate {
-        case let .single(url):
-            return try await recoverSingle(url, now: now)
+        case let .single(candidate):
+            return try await recoverSingle(candidate, now: now)
         case let .paired(candidate):
             return try await recoverPaired(candidate, now: now)
         }
     }
 
-    private func recoverSingle(_ url: URL, now: Date) async throws -> RecordingRecoveryResult {
+    private func recoverSingle(_ candidate: SingleCandidate, now: Date) async throws -> RecordingRecoveryResult {
+        let url = candidate.url
         guard let audioInfo = try? await audioInfo(for: url) else {
             try moveToFailedFolder(url)
             return RecordingRecoveryResult(
@@ -104,16 +105,16 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         let recording = try RecordingLibrary(folderURL: folderURL, fileManager: fileManager).finishRecording(
             temporaryAudioURL: url,
             requestedName: recoveredName(startedAt: audioInfo.startedAt),
-            source: .microphone,
+            source: candidate.source,
             startedAt: audioInfo.startedAt,
             endedAt: audioInfo.endedAt,
             durationSecondsOverride: audioInfo.duration,
             recoveredAt: now,
-            recoveryNote: "Recovered from an interrupted recording.",
+            recoveryNote: "Recovered \(candidate.source.displayName.lowercased()) audio from an interrupted recording.",
             segmentCount: 1
         )
         return RecordingRecoveryResult(
-            status: .recoveredSingleSource(.microphone),
+            status: .recoveredSingleSource(channel(for: candidate.source)),
             recording: recording,
             message: "Recovered \(recording.displayName).",
             recoveredFiles: [recording.audioURL.lastPathComponent],
@@ -224,6 +225,26 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         return nil
     }
 
+    private func parseSingle(name: String, url: URL) -> SingleCandidate? {
+        guard name.hasPrefix(".in-progress-") else { return nil }
+        for source in AudioSource.allCases {
+            let prefix = ".in-progress-\(source.rawValue)-"
+            if name.hasPrefix(prefix) {
+                return SingleCandidate(url: url, source: source)
+            }
+        }
+        return SingleCandidate(url: url, source: .microphone)
+    }
+
+    private func channel(for source: AudioSource) -> AudioSignalChannel {
+        switch source {
+        case .microphone, .micAndSystem:
+            return .microphone
+        case .system:
+            return .system
+        }
+    }
+
     private func audioInfo(for url: URL) async throws -> AudioFileInfo {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -278,17 +299,22 @@ public final class RecordingRecoveryService: @unchecked Sendable {
 }
 
 private enum RecoveryCandidate {
-    case single(URL)
+    case single(SingleCandidate)
     case paired(PairedCandidate)
 
     var sortKey: String {
         switch self {
-        case let .single(url):
-            return url.lastPathComponent
+        case let .single(candidate):
+            return candidate.url.lastPathComponent
         case let .paired(candidate):
             return candidate.sessionID
         }
     }
+}
+
+private struct SingleCandidate {
+    let url: URL
+    let source: AudioSource
 }
 
 private struct PairedCandidate {

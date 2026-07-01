@@ -5,6 +5,13 @@ import SwiftUI
 import MSRCore
 import MSRServices
 
+enum AppNoticeSeverity {
+    case info
+    case success
+    case warning
+    case error
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var recordings: [RecordingItem] = []
@@ -29,9 +36,11 @@ final class AppViewModel: ObservableObject {
     @Published var recordingElapsed: TimeInterval = 0
     @Published var transcriptionStartedAt: Date?
     @Published var credentialStatusMessage = ""
+    @Published var credentialStatusSeverity: AppNoticeSeverity = .info
     @Published var isTestingCredential = false
     @Published var localAPIStatusMessage = ""
     @Published var recoveryMessage = ""
+    @Published var recoveryNoticeSeverity: AppNoticeSeverity = .info
 
     private let settingsStore = UserDefaultsSettingsStore()
     private let keyStore = APIKeyStore()
@@ -168,6 +177,22 @@ final class AppViewModel: ObservableObject {
         !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var canPlaySelectedRecording: Bool {
+        selectedRecording != nil && RecordingInteractionPolicy.canPlayBack(during: workflowState)
+    }
+
+    var canSelectHistory: Bool {
+        RecordingInteractionPolicy.canSelectHistory(during: workflowState)
+    }
+
+    var canMutateRecordingLibrary: Bool {
+        RecordingInteractionPolicy.canMutateRecordingLibrary(during: workflowState)
+    }
+
+    var canRunPrimaryAction: Bool {
+        selectedRecording != nil && canSelectHistory
+    }
+
     var workflowErrorMessage: String? {
         if case let .failed(message) = workflowState {
             return message
@@ -227,6 +252,12 @@ final class AppViewModel: ObservableObject {
     }
 
     func select(_ recording: RecordingItem) {
+        guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else {
+            statusMessage = workflowState.isPaused
+                ? "Save or resume the paused recording first."
+                : "Finish the current task first."
+            return
+        }
         selectedRecording = recording
         loadSelectedSidecars()
         preparePlayback(for: recording)
@@ -301,7 +332,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func recoverInterruptedRecordings() async {
-        guard !recordingActionInFlight, !isRecording, !workflowState.isBusy else { return }
+        guard !recordingActionInFlight,
+              RecordingInteractionPolicy.canRecoverInterruptedRecordings(during: workflowState) else { return }
         let previousState = workflowState
         workflowState = .recovering
         statusMessage = "Checking interrupted recordings"
@@ -313,6 +345,7 @@ final class AppViewModel: ObservableObject {
                 selectedRecording = recordings.first(where: { $0.id == firstRecovered.id }) ?? firstRecovered
                 loadSelectedSidecars()
                 recoveryMessage = "\(recovered.count) interrupted recording\(recovered.count == 1 ? "" : "s") recovered."
+                recoveryNoticeSeverity = .success
                 statusMessage = recoveryMessage
                 workflowState = .saved
             } else if results.contains(where: {
@@ -320,10 +353,12 @@ final class AppViewModel: ObservableObject {
                 return false
             }) {
                 recoveryMessage = "Some interrupted recording files could not be recovered."
+                recoveryNoticeSeverity = .warning
                 statusMessage = recoveryMessage
                 workflowState = selectedRecording == nil ? .ready : .saved
             } else {
                 recoveryMessage = ""
+                recoveryNoticeSeverity = .info
                 workflowState = previousState == .recovering ? (selectedRecording == nil ? .ready : .saved) : previousState
                 if statusMessage == "Checking interrupted recordings" {
                     statusMessage = selectedRecording == nil ? "Ready" : "Recording selected"
@@ -332,6 +367,7 @@ final class AppViewModel: ObservableObject {
         } catch {
             workflowState = .failed(error.localizedDescription)
             recoveryMessage = "Recovery failed: \(error.localizedDescription)"
+            recoveryNoticeSeverity = .error
             statusMessage = recoveryMessage
         }
     }
@@ -349,12 +385,13 @@ final class AppViewModel: ObservableObject {
         workflowState = .starting(source: source)
         statusMessage = "Starting \(source.displayName)"
         recoveryMessage = ""
+        recoveryNoticeSeverity = .info
         resetSignalLevels()
         stopPlayback()
 
         do {
             let startedAt = Date()
-            let temporaryURL = try makeTemporaryAudioURL()
+            let temporaryURL = try makeTemporaryAudioURL(source: source)
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
             recordingSessionClock = RecordingSessionClock(startedAt: startedAt)
@@ -389,7 +426,7 @@ final class AppViewModel: ObservableObject {
         resetSignalLevels()
 
         do {
-            let temporaryURL = try makeTemporaryAudioURL()
+            let temporaryURL = try makeTemporaryAudioURL(source: source)
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
             let resumedAt = Date()
@@ -435,6 +472,7 @@ final class AppViewModel: ObservableObject {
             endSleepPrevention()
             workflowState = .failed(error.localizedDescription)
             recoveryMessage = "Could not pause cleanly. Recovery will retry on next launch."
+            recoveryNoticeSeverity = .error
             statusMessage = error.localizedDescription
             resetSignalLevels()
         }
@@ -497,12 +535,17 @@ final class AppViewModel: ObservableObject {
             endSleepPrevention()
             workflowState = .failed(error.localizedDescription)
             recoveryMessage = "Could not finalize cleanly. Recovery will retry on next launch."
+            recoveryNoticeSeverity = .error
             resetSignalLevels()
             statusMessage = error.localizedDescription
         }
     }
 
     func startRename(_ recording: RecordingItem? = nil) {
+        guard RecordingInteractionPolicy.canMutateRecordingLibrary(during: workflowState) else {
+            statusMessage = "Finish the current recording task first."
+            return
+        }
         let target = recording ?? selectedRecording
         guard let target else { return }
         selectedRecording = target
@@ -528,6 +571,10 @@ final class AppViewModel: ObservableObject {
     }
 
     func delete(_ recording: RecordingItem? = nil) {
+        guard RecordingInteractionPolicy.canMutateRecordingLibrary(during: workflowState) else {
+            statusMessage = "Finish the current recording task first."
+            return
+        }
         let target = recording ?? selectedRecording
         guard let target else { return }
         do {
@@ -561,7 +608,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func transcribeSelected(replacingExistingTranscript: Bool = false) async {
-        guard let selectedRecording, !workflowState.isBusy, !isRecording else { return }
+        guard let selectedRecording, RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
+        let targetID = selectedRecording.id
         transcriptionStartedAt = Date()
         workflowState = .transcribing
         statusMessage = replacingExistingTranscript
@@ -578,11 +626,15 @@ final class AppViewModel: ObservableObject {
                 body: JSONEncoder().encode(request)
             )
             let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: response.body)
-            transcriptText = decoded.text
             try library().writeTranscript(decoded.text, for: selectedRecording)
             if replacingExistingTranscript {
                 try library().clearSummary(for: selectedRecording)
-                summaryText = ""
+            }
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
+                transcriptText = decoded.text
+                if replacingExistingTranscript {
+                    summaryText = ""
+                }
             }
             transcriptionStartedAt = nil
             workflowState = .saved
@@ -631,7 +683,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func summarizeSelected() async {
-        guard let selectedRecording, !workflowState.isBusy, !isRecording else { return }
+        guard let selectedRecording, RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
+        let targetID = selectedRecording.id
         let transcript = transcriptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
             statusMessage = "Transcript is empty."
@@ -646,8 +699,10 @@ final class AppViewModel: ObservableObject {
                 body: JSONEncoder().encode(SummarizeRequest(transcript: transcript))
             )
             let decoded = try JSONDecoder().decode(SummarizeResponse.self, from: response.body)
-            summaryText = decoded.markdown
             try library().writeSummary(decoded.markdown, for: selectedRecording)
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
+                summaryText = decoded.markdown
+            }
             workflowState = .saved
             statusMessage = "Summary ready"
         } catch {
@@ -665,6 +720,10 @@ final class AppViewModel: ObservableObject {
     }
 
     func togglePlayback() {
+        guard RecordingInteractionPolicy.canPlayBack(during: workflowState) else {
+            statusMessage = "Playback is disabled during the current recording task."
+            return
+        }
         guard let selectedRecording else { return }
         if audioPlayer?.url != selectedRecording.audioURL {
             preparePlayback(for: selectedRecording)
@@ -733,8 +792,10 @@ final class AppViewModel: ObservableObject {
         }
         let key = APIKeyNormalizer.normalized(draft) ?? keyStore.apiKey(for: provider) ?? ""
         credentialStatusMessage = "Testing \(provider.displayName) key..."
+        credentialStatusSeverity = .info
         let result = await credentialValidator.validate(provider: provider, apiKey: key)
         credentialStatusMessage = result.message
+        credentialStatusSeverity = result.isValid ? .success : .error
         statusMessage = result.message
     }
 
@@ -745,10 +806,10 @@ final class AppViewModel: ObservableObject {
         await operation()
     }
 
-    private func makeTemporaryAudioURL() throws -> URL {
+    private func makeTemporaryAudioURL(source: AudioSource) throws -> URL {
         let folder = recordingsFolderURL
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder.appendingPathComponent(".in-progress-\(UUID().uuidString).m4a")
+        return folder.appendingPathComponent(".in-progress-\(source.rawValue)-\(UUID().uuidString).m4a")
     }
 
     private func makeFinalTemporaryAudioURL() throws -> URL {

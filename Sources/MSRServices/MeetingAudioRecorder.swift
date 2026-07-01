@@ -58,17 +58,35 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
 
     public func stop() async throws {
         guard isRecording else { return }
+        var stopError: Error?
+        defer {
+            microphoneRecorder = nil
+            screenRecorder = nil
+            combinedRecorder = nil
+            isRecording = false
+            onLevelUpdate?(0)
+            onSourceLevelUpdate?(.microphone, 0)
+            onSourceLevelUpdate?(.system, 0)
+        }
+
         microphoneRecorder?.stop()
-        microphoneRecorder = nil
         if let screenRecorder {
-            try await screenRecorder.stop()
+            do {
+                try await screenRecorder.stop()
+            } catch {
+                stopError = error
+            }
         }
-        screenRecorder = nil
         if let combinedRecorder {
-            try await combinedRecorder.stop()
+            do {
+                try await combinedRecorder.stop()
+            } catch {
+                stopError = stopError ?? error
+            }
         }
-        combinedRecorder = nil
-        isRecording = false
+        if let stopError {
+            throw stopError
+        }
     }
 
     private func removeExistingFile(at url: URL) throws {
@@ -322,8 +340,23 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
     }
 
     func stop() async throws {
+        var stopError: Error?
+        defer {
+            stream = nil
+            writer = nil
+            systemInput = nil
+            microphoneInput = nil
+            didStartSession = false
+            onLevelUpdate?(0)
+            onSourceLevelUpdate?(.system, 0)
+        }
+
         if let stream {
-            try await stream.stopCapture()
+            do {
+                try await stream.stopCapture()
+            } catch {
+                stopError = error
+            }
         }
         if let writer, !didStartSession {
             writer.startSession(atSourceTime: .zero)
@@ -331,12 +364,14 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         }
         systemInput?.markAsFinished()
         microphoneInput?.markAsFinished()
-        try await finishWriter()
-        stream = nil
-        writer = nil
-        systemInput = nil
-        microphoneInput = nil
-        didStartSession = false
+        do {
+            try await finishWriter()
+        } catch {
+            stopError = stopError ?? error
+        }
+        if let stopError {
+            throw stopError
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
