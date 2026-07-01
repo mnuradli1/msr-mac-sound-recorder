@@ -5,6 +5,7 @@ import MSRCore
 public enum RecordingRecoveryStatus: Equatable, Sendable {
     case recoveredMixed
     case recoveredSingleSource(AudioSignalChannel)
+    case recoveredSession(segmentCount: Int)
     case failed(String)
 }
 
@@ -41,8 +42,12 @@ public final class RecordingRecoveryService: @unchecked Sendable {
 
     public func recoverInterruptedRecordings(now: Date = Date()) async throws -> [RecordingRecoveryResult] {
         try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
-        let candidates = try interruptedCandidates()
         var results: [RecordingRecoveryResult] = []
+        let sessionManifests = try RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager).loadAll()
+        for manifest in sessionManifests {
+            results.append(try await recoverSession(manifest, now: now))
+        }
+        let candidates = try interruptedCandidates()
         for candidate in candidates {
             results.append(try await recover(candidate, now: now))
         }
@@ -87,6 +92,86 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         case let .paired(candidate):
             return try await recoverPaired(candidate, now: now)
         }
+    }
+
+    private func recoverSession(_ manifest: RecordingSessionManifest, now: Date) async throws -> RecordingRecoveryResult {
+        let manifestStore = RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager)
+        let manifestURL = manifestStore.url(for: manifest.id)
+        let segments = manifest.allSegments
+        guard !segments.isEmpty else {
+            try moveManifestSessionToFailed(manifest, extraFailedFiles: [])
+            return RecordingRecoveryResult(
+                status: .failed("Session manifest had no recorded segments."),
+                recording: nil,
+                message: "Could not recover \(manifest.requestedName).",
+                recoveredFiles: [],
+                failedFiles: [manifestURL.lastPathComponent]
+            )
+        }
+
+        let segmentURLs = segments.map { folderURL.appendingPathComponent($0.fileName) }
+        let missingFiles = zip(segments, segmentURLs)
+            .filter { _, url in !fileManager.fileExists(atPath: url.path) }
+            .map { segment, _ in segment.fileName }
+        guard missingFiles.isEmpty else {
+            try moveManifestSessionToFailed(manifest, extraFailedFiles: missingFiles)
+            return RecordingRecoveryResult(
+                status: .failed("Session manifest referenced missing segment files."),
+                recording: nil,
+                message: "Could not recover \(manifest.requestedName).",
+                recoveredFiles: [],
+                failedFiles: [manifestURL.lastPathComponent] + segments.map(\.fileName)
+            )
+        }
+
+        let audioInfos = try await readableAudioInfos(for: segmentURLs)
+        guard audioInfos.count == segmentURLs.count else {
+            try moveManifestSessionToFailed(manifest, extraFailedFiles: [])
+            return RecordingRecoveryResult(
+                status: .failed("Session manifest contained unreadable segment files."),
+                recording: nil,
+                message: "Could not recover \(manifest.requestedName).",
+                recoveredFiles: [],
+                failedFiles: [manifestURL.lastPathComponent] + segments.map(\.fileName)
+            )
+        }
+
+        let finalTemporaryURL: URL
+        if segmentURLs.count == 1, let onlySegment = segmentURLs.first {
+            finalTemporaryURL = onlySegment
+        } else {
+            finalTemporaryURL = folderURL.appendingPathComponent(".recovered-session-\(manifest.id.uuidString).m4a")
+            try await AudioTrackMixer.concatenateToSingleM4A(inputs: segmentURLs, outputURL: finalTemporaryURL)
+        }
+
+        let audioDuration = audioInfos.reduce(0) { $0 + $1.duration }
+        let duration = max(manifest.accumulatedActiveDuration, audioDuration)
+        let endedAt = manifest.startedAt.addingTimeInterval(duration)
+        let recording = try RecordingLibrary(folderURL: folderURL, fileManager: fileManager).finishRecording(
+            temporaryAudioURL: finalTemporaryURL,
+            requestedName: manifest.requestedName,
+            source: manifest.source,
+            startedAt: manifest.startedAt,
+            endedAt: endedAt,
+            durationSecondsOverride: duration,
+            recoveredAt: now,
+            recoveryNote: "Recovered \(segmentURLs.count) segment\(segmentURLs.count == 1 ? "" : "s") from an interrupted recording session.",
+            segmentCount: segmentURLs.count
+        )
+
+        if segmentURLs.count > 1 {
+            for url in segmentURLs {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+        try manifestStore.delete(manifest)
+        return RecordingRecoveryResult(
+            status: .recoveredSession(segmentCount: segmentURLs.count),
+            recording: recording,
+            message: "Recovered \(recording.displayName).",
+            recoveredFiles: [recording.audioURL.lastPathComponent],
+            failedFiles: []
+        )
     }
 
     private func recoverSingle(_ candidate: SingleCandidate, now: Date) async throws -> RecordingRecoveryResult {
@@ -245,6 +330,17 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         }
     }
 
+    private func readableAudioInfos(for urls: [URL]) async throws -> [AudioFileInfo] {
+        var infos: [AudioFileInfo] = []
+        for url in urls {
+            guard let info = try? await audioInfo(for: url) else {
+                return infos
+            }
+            infos.append(info)
+        }
+        return infos
+    }
+
     private func audioInfo(for url: URL) async throws -> AudioFileInfo {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -270,6 +366,16 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH.mm"
         return "Recovered Meeting \(formatter.string(from: startedAt))"
+    }
+
+    private func moveManifestSessionToFailed(_ manifest: RecordingSessionManifest, extraFailedFiles: [String]) throws {
+        let store = RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager)
+        let existingURLs = ([store.url(for: manifest.id)] + manifest.allSegments.map { folderURL.appendingPathComponent($0.fileName) })
+            .filter { fileManager.fileExists(atPath: $0.path) }
+        for url in existingURLs {
+            try moveToFailedFolder(url)
+        }
+        _ = extraFailedFiles
     }
 
     private func moveToFailedFolder(_ url: URL) throws {

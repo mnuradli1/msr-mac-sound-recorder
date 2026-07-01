@@ -29,7 +29,11 @@ struct MSRTestRunner {
             try testRecordingWorkflowStateSupportsSleepPauseRecovery()
             try testRecordingInteractionPolicyProtectsPausedBusyAndTargetedWork()
             try testRecordingSessionClockExcludesPausedSleepTime()
+            try testRecordingSessionManifestTracksPauseResumeSegments()
+            try testRecordingSessionManifestStoreRoundTripsHiddenSession()
             try testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride()
+            try await testRecoveryUsesSessionManifestToRecoverSegments()
+            try await testRecoveryFailsSessionManifestWithMissingSegment()
             try await testRecoveryKeepsSourceForSingleInterruptedSystemRecording()
             try await testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem()
             try await testAudioTrackMixerConcatenatesSegmentsSequentially()
@@ -421,6 +425,90 @@ private func testRecordingSessionClockExcludesPausedSleepTime() throws {
     try expect(clock.pauseReason == nil, "resumed clock should clear pause reason")
 }
 
+private func testRecordingSessionManifestTracksPauseResumeSegments() throws {
+    var manifest = RecordingSessionManifest(
+        id: UUID(uuidString: "44444444-4444-4444-4444-444444444444")!,
+        source: .microphone,
+        requestedName: "Manifest Flow",
+        startedAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 100),
+        activeSegment: RecordingSessionSegment(
+            fileName: ".in-progress-microphone-first.m4a",
+            startedAt: Date(timeIntervalSince1970: 100)
+        )
+    )
+
+    manifest.finishActiveSegment(
+        endedAt: Date(timeIntervalSince1970: 160),
+        accumulatedActiveDuration: 60,
+        reason: .systemSleep,
+        updatedAt: Date(timeIntervalSince1970: 161)
+    )
+    try expect(manifest.completedSegments.count == 1, "pause should move active segment to completed list")
+    try expect(manifest.completedSegments.first?.endedAt == Date(timeIntervalSince1970: 160), "completed segment should capture ended timestamp")
+    try expect(manifest.activeSegment == nil, "pause should clear active segment")
+    try expect(manifest.pauseReason == .systemSleep, "pause should store reason")
+    try expect(manifest.accumulatedActiveDuration == 60, "pause should persist active duration")
+
+    manifest.startActiveSegment(
+        fileName: ".in-progress-microphone-second.m4a",
+        startedAt: Date(timeIntervalSince1970: 220),
+        updatedAt: Date(timeIntervalSince1970: 220)
+    )
+    try expect(manifest.completedSegments.count == 1, "resume should keep completed segment list")
+    try expect(manifest.activeSegment?.fileName == ".in-progress-microphone-second.m4a", "resume should store new active segment")
+    try expect(manifest.pauseReason == nil, "resume should clear pause reason")
+
+    manifest.finishActiveSegment(
+        endedAt: Date(timeIntervalSince1970: 260),
+        accumulatedActiveDuration: 100,
+        reason: .manual,
+        updatedAt: Date(timeIntervalSince1970: 260)
+    )
+    try expect(manifest.completedSegments.map(\.fileName) == [".in-progress-microphone-first.m4a", ".in-progress-microphone-second.m4a"], "final pause should preserve segment order")
+    try expect(manifest.accumulatedActiveDuration == 100, "final pause should update active duration")
+}
+
+private func testRecordingSessionManifestStoreRoundTripsHiddenSession() throws {
+    let folder = try TemporaryFolder()
+    let id = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+    let startedAt = Date(timeIntervalSince1970: 100)
+    let updatedAt = Date(timeIntervalSince1970: 180)
+    let manifest = RecordingSessionManifest(
+        id: id,
+        source: .micAndSystem,
+        requestedName: "Meeting 2026-07-01",
+        startedAt: startedAt,
+        updatedAt: updatedAt,
+        accumulatedActiveDuration: 80,
+        completedSegments: [
+            RecordingSessionSegment(
+                fileName: ".in-progress-micAndSystem-first.m4a",
+                startedAt: startedAt,
+                endedAt: Date(timeIntervalSince1970: 180)
+            )
+        ],
+        activeSegment: RecordingSessionSegment(
+            fileName: ".in-progress-micAndSystem-second.m4a",
+            startedAt: Date(timeIntervalSince1970: 220)
+        ),
+        pauseReason: nil
+    )
+    let store = RecordingSessionManifestStore(folderURL: folder.url)
+
+    try store.save(manifest)
+    let storedURL = store.url(for: id)
+    let loaded = try store.load(id: id)
+    let all = try store.loadAll()
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+
+    try expect(storedURL.lastPathComponent == ".session-\(id.uuidString).json", "manifest should use a hidden session filename")
+    try expect(FileManager.default.fileExists(atPath: storedURL.path), "manifest should be written to disk")
+    try expect(loaded == manifest, "manifest should round-trip through JSON")
+    try expect(all.map(\.id) == [id], "store should list saved manifests")
+    try expect(recordings.isEmpty, "hidden session manifests should not appear in recording history")
+}
+
 private func testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride() throws {
     let folder = try TemporaryFolder()
     let library = RecordingLibrary(folderURL: folder.url)
@@ -446,6 +534,89 @@ private func testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride() t
     try expect(reloaded?.metadata.recoveryNote == "Recovered microphone only after system track failed.", "recovery note should be persisted")
     try expect(reloaded?.metadata.segmentCount == 2, "segment count should be persisted")
     try expect(recording.audioURL.lastPathComponent == "Recovered Meeting.m4a", "recovered audio should use requested display name")
+}
+
+private func testRecoveryUsesSessionManifestToRecoverSegments() async throws {
+    let folder = try TemporaryFolder()
+    let firstWAV = folder.url.appendingPathComponent("first.wav")
+    let secondWAV = folder.url.appendingPathComponent("second.wav")
+    let firstSegment = folder.url.appendingPathComponent(".in-progress-micAndSystem-first.m4a")
+    let secondSegment = folder.url.appendingPathComponent(".in-progress-micAndSystem-second.m4a")
+    try writeToneWAV(to: firstWAV, frequency: 440, duration: 0.25)
+    try writeToneWAV(to: secondWAV, frequency: 660, duration: 0.30)
+    try await AudioTrackMixer.mixToSingleM4A(inputs: [firstWAV], outputURL: firstSegment)
+    try await AudioTrackMixer.mixToSingleM4A(inputs: [secondWAV], outputURL: secondSegment)
+
+    let manifest = RecordingSessionManifest(
+        id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+        source: .micAndSystem,
+        requestedName: "Recovered From Manifest",
+        startedAt: Date(timeIntervalSince1970: 500),
+        updatedAt: Date(timeIntervalSince1970: 560),
+        accumulatedActiveDuration: 55,
+        completedSegments: [
+            RecordingSessionSegment(fileName: firstSegment.lastPathComponent, startedAt: Date(timeIntervalSince1970: 500), endedAt: Date(timeIntervalSince1970: 525)),
+            RecordingSessionSegment(fileName: secondSegment.lastPathComponent, startedAt: Date(timeIntervalSince1970: 530), endedAt: Date(timeIntervalSince1970: 560))
+        ],
+        activeSegment: nil,
+        pauseReason: .systemSleep
+    )
+    let store = RecordingSessionManifestStore(folderURL: folder.url)
+    try store.save(manifest)
+
+    let results = try await RecordingRecoveryService(folderURL: folder.url).recoverInterruptedRecordings(now: Date(timeIntervalSince1970: 1_000))
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+
+    try expect(results.count == 1, "one manifest should produce one recovery result")
+    try expect(results.first?.status == .recoveredSession(segmentCount: 2), "manifest recovery should report recovered segment count")
+    try expect(recordings.count == 1, "manifest recovery should create one visible recording")
+    try expect(recordings.first?.source == .micAndSystem, "manifest recovery should preserve original source")
+    try expect(recordings.first?.metadata.segmentCount == 2, "manifest recovery should persist segment count")
+    try expect(recordings.first?.metadata.recoveryNote?.contains("2 segments") == true, "recovery note should mention segment recovery")
+    try expect(!FileManager.default.fileExists(atPath: store.url(for: manifest.id).path), "successful manifest recovery should delete manifest")
+    try expect(!FileManager.default.fileExists(atPath: firstSegment.path), "successful manifest recovery should consume first segment")
+    try expect(!FileManager.default.fileExists(atPath: secondSegment.path), "successful manifest recovery should consume second segment")
+}
+
+private func testRecoveryFailsSessionManifestWithMissingSegment() async throws {
+    let folder = try TemporaryFolder()
+    let firstWAV = folder.url.appendingPathComponent("first.wav")
+    let firstSegment = folder.url.appendingPathComponent(".in-progress-microphone-first.m4a")
+    try writeToneWAV(to: firstWAV, frequency: 440, duration: 0.25)
+    try await AudioTrackMixer.mixToSingleM4A(inputs: [firstWAV], outputURL: firstSegment)
+
+    let missingSegmentName = ".in-progress-microphone-missing.m4a"
+    let manifest = RecordingSessionManifest(
+        id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
+        source: .microphone,
+        requestedName: "Incomplete Manifest",
+        startedAt: Date(timeIntervalSince1970: 700),
+        updatedAt: Date(timeIntervalSince1970: 740),
+        accumulatedActiveDuration: 40,
+        completedSegments: [
+            RecordingSessionSegment(fileName: firstSegment.lastPathComponent, startedAt: Date(timeIntervalSince1970: 700), endedAt: Date(timeIntervalSince1970: 725)),
+            RecordingSessionSegment(fileName: missingSegmentName, startedAt: Date(timeIntervalSince1970: 730), endedAt: Date(timeIntervalSince1970: 740))
+        ],
+        activeSegment: nil,
+        pauseReason: .manual
+    )
+    let store = RecordingSessionManifestStore(folderURL: folder.url)
+    try store.save(manifest)
+
+    let results = try await RecordingRecoveryService(folderURL: folder.url).recoverInterruptedRecordings(now: Date(timeIntervalSince1970: 1_000))
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+    let failedFolder = folder.url.appendingPathComponent("recovery-failed", isDirectory: true)
+
+    try expect(results.count == 1, "one incomplete manifest should produce one recovery result")
+    if case .failed = results.first?.status {
+    } else {
+        throw TestFailure("missing manifest segment should fail recovery")
+    }
+    try expect(recordings.isEmpty, "missing manifest segment should not produce a shorter recording")
+    try expect(!FileManager.default.fileExists(atPath: store.url(for: manifest.id).path), "failed manifest recovery should move manifest out of active folder")
+    try expect(!FileManager.default.fileExists(atPath: firstSegment.path), "failed manifest recovery should move existing segment out of active folder")
+    try expect(FileManager.default.fileExists(atPath: failedFolder.appendingPathComponent(firstSegment.lastPathComponent).path), "existing segment should be moved to recovery-failed")
+    try expect(FileManager.default.fileExists(atPath: failedFolder.appendingPathComponent(store.url(for: manifest.id).lastPathComponent).path), "manifest should be moved to recovery-failed")
 }
 
 private func testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem() async throws {

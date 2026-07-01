@@ -52,6 +52,7 @@ final class AppViewModel: ObservableObject {
     private var recordingSessionClock: RecordingSessionClock?
     private var temporaryAudioURL: URL?
     private var completedSegmentURLs: [URL] = []
+    private var currentSessionManifest: RecordingSessionManifest?
     private var currentSessionSource: AudioSource?
     private var currentSessionName: String?
     private var audioPlayer: AVAudioPlayer?
@@ -392,22 +393,39 @@ final class AppViewModel: ObservableObject {
         do {
             let startedAt = Date()
             let temporaryURL = try makeTemporaryAudioURL(source: source)
+            let requestedName = defaultMeetingName(for: startedAt)
+            let manifest = RecordingSessionManifest(
+                source: source,
+                requestedName: requestedName,
+                startedAt: startedAt,
+                updatedAt: startedAt,
+                activeSegment: RecordingSessionSegment(
+                    fileName: temporaryURL.lastPathComponent,
+                    startedAt: startedAt
+                )
+            )
+            try manifestStore().save(manifest)
+            currentSessionManifest = manifest
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
             recordingSessionClock = RecordingSessionClock(startedAt: startedAt)
             completedSegmentURLs = []
             currentSessionSource = source
-            currentSessionName = defaultMeetingName(for: startedAt)
+            currentSessionName = requestedName
             workflowState = .recording(source: source)
             recordingElapsed = 0
             startRecordingTimer()
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
         } catch {
+            if let currentSessionManifest {
+                try? manifestStore().delete(currentSessionManifest)
+            }
             workflowState = .failed(error.localizedDescription)
             temporaryAudioURL = nil
             recordingSessionClock = nil
             completedSegmentURLs = []
+            currentSessionManifest = nil
             currentSessionSource = nil
             currentSessionName = nil
             resetSignalLevels()
@@ -427,16 +445,27 @@ final class AppViewModel: ObservableObject {
 
         do {
             let temporaryURL = try makeTemporaryAudioURL(source: source)
+            var manifest = try currentManifestFallback(source: source, clock: clock)
+            let resumedAt = Date()
+            manifest.startActiveSegment(
+                fileName: temporaryURL.lastPathComponent,
+                startedAt: resumedAt,
+                updatedAt: resumedAt
+            )
+            try manifestStore().save(manifest)
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
-            let resumedAt = Date()
             clock.resume(at: resumedAt)
             recordingSessionClock = clock
+            currentSessionManifest = manifest
             workflowState = .recording(source: source)
             startRecordingTimer()
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
         } catch {
+            if let currentSessionManifest {
+                try? manifestStore().save(currentSessionManifest)
+            }
             workflowState = .paused(source: source, reason: clock.pauseReason ?? .manual)
             temporaryAudioURL = nil
             resetSignalLevels()
@@ -457,11 +486,20 @@ final class AppViewModel: ObservableObject {
         do {
             try await recorder.stop()
             endSleepPrevention()
-            completedSegmentURLs.append(temporaryAudioURL)
-            self.temporaryAudioURL = nil
             let pausedAt = Date()
             clock.pause(at: pausedAt, reason: reason)
+            var manifest = try currentManifestFallback(source: source, clock: clock)
+            manifest.finishActiveSegment(
+                endedAt: pausedAt,
+                accumulatedActiveDuration: clock.activeDuration(at: pausedAt),
+                reason: reason,
+                updatedAt: pausedAt
+            )
+            try manifestStore().save(manifest)
+            completedSegmentURLs.append(temporaryAudioURL)
+            self.temporaryAudioURL = nil
             recordingSessionClock = clock
+            currentSessionManifest = manifest
             recordingElapsed = clock.activeDuration(at: pausedAt)
             resetSignalLevels()
             workflowState = .paused(source: source, reason: reason)
@@ -492,15 +530,26 @@ final class AppViewModel: ObservableObject {
             var finalizedClock = clock
             if wasRecording, let temporaryAudioURL = activeTemporaryAudioURL {
                 try await recorder.stop()
+                let stoppedAt = Date()
+                finalizedClock.pause(at: stoppedAt, reason: .manual)
+                var manifest = try currentManifestFallback(source: source, clock: finalizedClock)
+                manifest.finishActiveSegment(
+                    endedAt: stoppedAt,
+                    accumulatedActiveDuration: finalizedClock.activeDuration(at: stoppedAt),
+                    reason: .manual,
+                    updatedAt: stoppedAt
+                )
+                try manifestStore().save(manifest)
+                currentSessionManifest = manifest
                 completedSegmentURLs.append(temporaryAudioURL)
                 self.temporaryAudioURL = nil
-                finalizedClock.pause(at: Date(), reason: .manual)
             }
             endSleepPrevention()
-            let segmentURLs = completedSegmentURLs
+            let segmentURLs = try finalizedSegmentURLs()
             guard !segmentURLs.isEmpty else {
                 throw RecordingSessionError.noCapturedSegments
             }
+            try validateCapturedSegmentsExist(segmentURLs)
             let endedAt = Date()
             let finalTemporaryURL: URL
             if segmentURLs.count == 1, let onlySegment = segmentURLs.first {
@@ -522,6 +571,9 @@ final class AppViewModel: ObservableObject {
                 for url in segmentURLs {
                     try? FileManager.default.removeItem(at: url)
                 }
+            }
+            if let currentSessionManifest {
+                try? manifestStore().delete(currentSessionManifest)
             }
             clearRecordingSession()
             resetSignalLevels()
@@ -818,8 +870,52 @@ final class AppViewModel: ObservableObject {
         return folder.appendingPathComponent(".final-\(UUID().uuidString).m4a")
     }
 
+    private func manifestStore() -> RecordingSessionManifestStore {
+        RecordingSessionManifestStore(folderURL: recordingsFolderURL)
+    }
+
     private func library() -> RecordingLibrary {
         RecordingLibrary(folderURL: recordingsFolderURL)
+    }
+
+    private func currentManifestFallback(source: AudioSource, clock: RecordingSessionClock) throws -> RecordingSessionManifest {
+        if let currentSessionManifest {
+            return currentSessionManifest
+        }
+        let requestedName = currentSessionName ?? defaultMeetingName(for: clock.startedAt)
+        var manifest = RecordingSessionManifest(
+            source: source,
+            requestedName: requestedName,
+            startedAt: clock.startedAt,
+            updatedAt: Date(),
+            accumulatedActiveDuration: clock.accumulatedActiveDuration,
+            completedSegments: completedSegmentURLs.map {
+                RecordingSessionSegment(fileName: $0.lastPathComponent, startedAt: clock.startedAt)
+            },
+            pauseReason: clock.pauseReason
+        )
+        if let temporaryAudioURL, let segmentStartedAt = clock.currentSegmentStartedAt {
+            manifest.startActiveSegment(
+                fileName: temporaryAudioURL.lastPathComponent,
+                startedAt: segmentStartedAt
+            )
+        }
+        return manifest
+    }
+
+    private func finalizedSegmentURLs() throws -> [URL] {
+        if let currentSessionManifest, !currentSessionManifest.completedSegments.isEmpty {
+            return currentSessionManifest.completedSegments.map {
+                recordingsFolderURL.appendingPathComponent($0.fileName)
+            }
+        }
+        return completedSegmentURLs
+    }
+
+    private func validateCapturedSegmentsExist(_ urls: [URL]) throws {
+        for url in urls where !FileManager.default.fileExists(atPath: url.path) {
+            throw RecordingSessionError.missingCapturedSegment(url.lastPathComponent)
+        }
     }
 
     private func loadSelectedSidecars() {
@@ -921,6 +1017,7 @@ final class AppViewModel: ObservableObject {
         recordingSessionClock = nil
         temporaryAudioURL = nil
         completedSegmentURLs = []
+        currentSessionManifest = nil
         currentSessionSource = nil
         currentSessionName = nil
         recordingElapsed = 0
@@ -968,11 +1065,14 @@ final class AppViewModel: ObservableObject {
 
 private enum RecordingSessionError: LocalizedError {
     case noCapturedSegments
+    case missingCapturedSegment(String)
 
     var errorDescription: String? {
         switch self {
         case .noCapturedSegments:
             return "No captured audio segments were available to save."
+        case let .missingCapturedSegment(fileName):
+            return "A recorded audio segment is missing: \(fileName). Recovery will retry on next launch."
         }
     }
 }
