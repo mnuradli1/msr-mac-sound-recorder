@@ -15,7 +15,9 @@ struct MSRTestRunner {
             try await testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns()
             try testTranscriptionJobStoreRoundTripsHiddenJob()
             try testTranscriptionJobTracksRunningCompletedFailedAttempts()
+            try testTranscriptionJobQueueLifecycleAndStoreLoadAll()
             try testTranscriptionErrorMessageClassifiesFailures()
+            try testTranscriptParserBuildsSpeakerSegmentsWithTimestamps()
             try testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime()
             try await testSummarizeEndpointDelegates()
             try await testHealthEndpoint()
@@ -26,6 +28,8 @@ struct MSRTestRunner {
             try testRecordingCaptureStrategyUsesMixdownForMicAndSystem()
             try testRecordingLibraryDeletesAudioAndSidecars()
             try testRecordingLibraryClearsSummarySidecar()
+            try await testRecordingLibraryImportsExternalAudioWithConfidenceMetadata()
+            try await testRecordingConfidenceAnalyzerFlagsTooShortSilentAndMissingExpectedTracks()
             try testRecordingSearchMatchesNameSourceDateTranscriptAndSummary()
             try testRecordingSearchRequiresAllTokens()
             try testTranscriptExporterBuildsTextAndMarkdown()
@@ -254,6 +258,45 @@ private func testTranscriptionJobTracksRunningCompletedFailedAttempts() throws {
     try expect(interrupted.errorMessage?.contains("interrupted") == true, "interrupted job should explain retry state")
 }
 
+private func testTranscriptionJobQueueLifecycleAndStoreLoadAll() throws {
+    let folder = try TemporaryFolder()
+    let store = TranscriptionJobStore(folderURL: folder.url)
+    let firstID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+    let secondID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+    var first = TranscriptionJob.queue(
+        recordingID: firstID,
+        recordingName: "Queue First",
+        audioFileName: "Queue First.m4a",
+        provider: .elevenLabs,
+        replacingExistingTranscript: true,
+        previousAttemptCount: 2,
+        at: Date(timeIntervalSince1970: 1_000)
+    )
+    let second = TranscriptionJob.queue(
+        recordingID: secondID,
+        recordingName: "Queue Second",
+        audioFileName: "Queue Second.m4a",
+        provider: .openAI,
+        replacingExistingTranscript: false,
+        at: Date(timeIntervalSince1970: 1_100)
+    )
+
+    try expect(first.status == .queued, "queued job should start queued")
+    try expect(first.attemptCount == 3, "queued retry should increment previous attempt count")
+    try expect(first.replacingExistingTranscript, "queued job should remember re-transcribe intent")
+
+    first.markRunning(at: Date(timeIntervalSince1970: 1_200))
+    try expect(first.status == .running, "queued job should move to running")
+    try expect(first.startedAt == Date(timeIntervalSince1970: 1_200), "running job should update start timestamp")
+
+    try store.save(second)
+    try store.save(first)
+    let loaded = try store.loadAll()
+
+    try expect(loaded.map(\.recordingID) == [firstID, secondID], "loadAll should return newest transcription jobs first")
+    try expect(loaded.contains(where: { $0.status == .queued }), "loadAll should include queued jobs")
+}
+
 private func testTranscriptionErrorMessageClassifiesFailures() throws {
     try expect(
         TranscriptionErrorMessage.message(for: ProviderError.missingAPIKey("ELEVENLABS_API_KEY")).contains("API key"),
@@ -272,6 +315,29 @@ private func testTranscriptionErrorMessageClassifiesFailures() throws {
         TranscriptionErrorMessage.message(for: timeout).contains("timed out"),
         "timeout should produce retryable timeout guidance"
     )
+}
+
+private func testTranscriptParserBuildsSpeakerSegmentsWithTimestamps() throws {
+    let transcript = """
+    [00:01:02] Speaker 1:
+    We need the launch checklist today.
+
+    Speaker 2:
+    I can send it after the call.
+
+    [01:02:03] Speaker 1:
+    Great.
+    """
+
+    let segments = TranscriptParser.segments(from: transcript)
+
+    try expect(segments.count == 3, "parser should create one segment per speaker turn")
+    try expect(segments[0].speaker == "Speaker 1", "first segment should keep speaker label")
+    try expect(segments[0].startTime == 62, "timestamp should parse mm:ss into seconds")
+    try expect(segments[0].text == "We need the launch checklist today.", "segment text should trim label and timestamp")
+    try expect(segments[1].speaker == "Speaker 2", "untimestamped segment should still keep speaker")
+    try expect(segments[1].startTime == nil, "untimestamped segment should have no jump time")
+    try expect(segments[2].startTime == 3_723, "timestamp should parse hh:mm:ss into seconds")
 }
 
 private func testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime() throws {
@@ -408,6 +474,63 @@ private func testRecordingLibraryClearsSummarySidecar() throws {
     try library.clearSummary(for: recording)
 
     try expect(!FileManager.default.fileExists(atPath: recording.summaryURL.path), "clearing summary should remove stale summary sidecar")
+}
+
+private func testRecordingLibraryImportsExternalAudioWithConfidenceMetadata() async throws {
+    let folder = try TemporaryFolder()
+    let external = folder.url.appendingPathComponent("external meeting.wav")
+    try writeToneWAV(to: external, frequency: 330, duration: 0.35)
+    let libraryFolder = folder.url.appendingPathComponent("library", isDirectory: true)
+    let library = RecordingLibrary(folderURL: libraryFolder)
+    let confidence = RecordingConfidenceReport(
+        checkedAt: Date(timeIntervalSince1970: 2_000),
+        durationSeconds: 0.35,
+        peakLevel: 0.3,
+        averageLevel: 0.1,
+        issues: [
+            RecordingConfidenceIssue(
+                kind: .missingExpectedSource,
+                severity: .warning,
+                message: "Imported audio source is unknown."
+            )
+        ]
+    )
+
+    let recording = try library.importRecording(
+        sourceURL: external,
+        requestedName: "External Meeting",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 1_900),
+        durationSeconds: 0.35,
+        importedAt: Date(timeIntervalSince1970: 2_000),
+        confidenceReport: confidence
+    )
+    let loaded = try library.loadRecordings().first
+
+    try expect(recording.audioURL.pathExtension == "wav", "import should preserve original audio extension")
+    try expect(FileManager.default.fileExists(atPath: recording.audioURL.path), "import should copy the external file into the library")
+    try expect(FileManager.default.fileExists(atPath: external.path), "import should leave the original external file in place")
+    try expect(loaded?.metadata.importedAt == Date(timeIntervalSince1970: 2_000), "import metadata should persist import timestamp")
+    try expect(loaded?.metadata.confidenceReport == confidence, "import metadata should persist confidence report")
+}
+
+private func testRecordingConfidenceAnalyzerFlagsTooShortSilentAndMissingExpectedTracks() async throws {
+    let folder = try TemporaryFolder()
+    let silent = folder.url.appendingPathComponent("silent.wav")
+    try writeToneWAV(to: silent, frequency: 440, duration: 0.2, amplitude: 0)
+
+    let report = try await RecordingConfidenceAnalyzer.analyze(
+        audioURL: silent,
+        source: .micAndSystem,
+        expectedChannels: [.microphone: 0.0, .system: 0.45],
+        minimumDuration: 1.0,
+        silenceThreshold: 0.01
+    )
+
+    try expect(report.issues.contains(where: { $0.kind == .tooShort }), "short audio should raise a too-short warning")
+    try expect(report.issues.contains(where: { $0.kind == .silentAudio }), "silent audio should raise a silent-audio warning")
+    try expect(report.issues.contains(where: { $0.kind == .missingExpectedSource && $0.message.contains("Mic") }), "missing mic signal should be reported for Mic + System recordings")
+    try expect(!report.issues.contains(where: { $0.message.contains("System") }), "present system signal should not be reported missing")
 }
 
 private func testRecordingSearchMatchesNameSourceDateTranscriptAndSummary() throws {
@@ -883,7 +1006,7 @@ private func testAudioTrackMixerExportsSingleTrack() async throws {
     try expect(duration.seconds > 0.2, "mixed output should keep audio duration")
 }
 
-private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.35) throws {
+private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.35, amplitude: Double = 0.2) throws {
     let sampleRate = 16_000
     let sampleCount = Int(Double(sampleRate) * duration)
     var data = Data()
@@ -902,7 +1025,7 @@ private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.3
     data.appendUInt32LE(UInt32(sampleCount * 2))
     for index in 0..<sampleCount {
         let angle = 2 * Double.pi * frequency * Double(index) / Double(sampleRate)
-        let sample = Int16(Double(Int16.max) * 0.2 * sin(angle))
+        let sample = Int16(Double(Int16.max) * amplitude * sin(angle))
         data.appendInt16LE(sample)
     }
     try data.write(to: url)

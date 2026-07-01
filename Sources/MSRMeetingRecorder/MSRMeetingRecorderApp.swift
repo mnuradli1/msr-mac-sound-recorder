@@ -39,6 +39,14 @@ struct MSRMeetingRecorderApp: App {
 
                 Divider()
 
+                Button("Import Recording...") {
+                    viewModel.importRecording()
+                }
+                .keyboardShortcut("i", modifiers: [.command])
+                .disabled(!viewModel.canMutateRecordingLibrary)
+
+                Divider()
+
                 Button(viewModel.isPlaying ? "Pause" : "Play") {
                     viewModel.togglePlayback()
                 }

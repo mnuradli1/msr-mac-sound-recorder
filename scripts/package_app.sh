@@ -5,12 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="MSR Meeting Recorder"
 EXECUTABLE_NAME="MSRMeetingRecorder"
 PRODUCT_NAME="MSRMeetingRecorder"
-VERSION="0.2.3"
+VERSION="0.2.4"
 BUNDLE_ID="app.msr.meeting-recorder"
 DIST_DIR="$ROOT_DIR/dist"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
 DMG_STAGING="$DIST_DIR/dmg-staging"
 DMG_PATH="$DIST_DIR/MSR-Meeting-Recorder-$VERSION.dmg"
+APP_ZIP_PATH="$DIST_DIR/MSR-Meeting-Recorder-$VERSION-app.zip"
 INFO_PLIST="$ROOT_DIR/Config/MSRMeetingRecorder-Info.plist"
 ICON_PATH="$ROOT_DIR/Assets/AppIcon/MSRMeetingRecorder.icns"
 
@@ -27,7 +28,7 @@ if [[ ! -x "$EXECUTABLE_PATH" ]]; then
 fi
 
 echo "==> Creating app bundle"
-rm -rf "$APP_PATH" "$DMG_STAGING" "$DMG_PATH"
+rm -rf "$APP_PATH" "$DMG_STAGING" "$DMG_PATH" "$APP_ZIP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$EXECUTABLE_PATH" "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
 cp "$INFO_PLIST" "$APP_PATH/Contents/Info.plist"
@@ -43,6 +44,12 @@ echo "APPL????" > "$APP_PATH/Contents/PkgInfo"
 echo "==> Ad-hoc signing app bundle"
 codesign --force --deep --sign - "$APP_PATH"
 
+echo "==> Creating app zip"
+(
+  cd "$DIST_DIR"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_NAME.app" "$APP_ZIP_PATH"
+)
+
 echo "==> Creating DMG"
 mkdir -p "$DMG_STAGING"
 cp -R "$APP_PATH" "$DMG_STAGING/"
@@ -57,7 +64,9 @@ rm -rf "$DMG_STAGING"
 
 echo "==> Verifying artifacts"
 codesign --verify --deep --strict "$APP_PATH"
+unzip -tq "$APP_ZIP_PATH"
 hdiutil verify "$DMG_PATH"
 
 echo "App: $APP_PATH"
+echo "App ZIP: $APP_ZIP_PATH"
 echo "DMG: $DMG_PATH"

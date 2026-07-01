@@ -32,6 +32,8 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
     public var recoveredAt: Date?
     public var recoveryNote: String?
     public var segmentCount: Int?
+    public var importedAt: Date?
+    public var confidenceReport: RecordingConfidenceReport?
 
     public init(
         id: UUID,
@@ -45,7 +47,9 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         updatedAt: Date,
         recoveredAt: Date? = nil,
         recoveryNote: String? = nil,
-        segmentCount: Int? = nil
+        segmentCount: Int? = nil,
+        importedAt: Date? = nil,
+        confidenceReport: RecordingConfidenceReport? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -59,6 +63,8 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         self.recoveredAt = recoveredAt
         self.recoveryNote = recoveryNote
         self.segmentCount = segmentCount
+        self.importedAt = importedAt
+        self.confidenceReport = confidenceReport
     }
 }
 
@@ -87,6 +93,10 @@ public struct RecordingItem: Equatable, Identifiable, Sendable {
 
     public var summaryURL: URL {
         folderURL.appendingPathComponent("\(displayName).summary.md")
+    }
+
+    public var transcriptSegmentsURL: URL {
+        folderURL.appendingPathComponent("\(displayName).transcript.segments.json")
     }
 
     public init(metadata: RecordingMetadata, folderURL: URL) {

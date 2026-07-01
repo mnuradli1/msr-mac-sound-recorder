@@ -1,7 +1,9 @@
 import AppKit
 import AVFoundation
+import CoreGraphics
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 import MSRCore
 import MSRServices
 
@@ -10,6 +12,14 @@ enum AppNoticeSeverity {
     case success
     case warning
     case error
+}
+
+struct SetupHealthItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let detail: String
+    let severity: AppNoticeSeverity
+    let systemImage: String
 }
 
 @MainActor
@@ -37,6 +47,9 @@ final class AppViewModel: ObservableObject {
     @Published var recordingElapsed: TimeInterval = 0
     @Published var transcriptionStartedAt: Date?
     @Published var selectedTranscriptionJob: TranscriptionJob?
+    @Published var transcriptionJobs: [TranscriptionJob] = []
+    @Published var transcriptSegments: [TranscriptSegment] = []
+    @Published var setupHealthItems: [SetupHealthItem] = []
     @Published var credentialStatusMessage = ""
     @Published var credentialStatusSeverity: AppNoticeSeverity = .info
     @Published var isTestingCredential = false
@@ -62,6 +75,9 @@ final class AppViewModel: ObservableObject {
     private var playbackTimer: Timer?
     private var recordingTimer: Timer?
     private var recordingActionInFlight = false
+    private var transcriptionQueueTask: Task<Void, Never>?
+    private var microphonePeakDuringRecording: Float = 0
+    private var systemPeakDuringRecording: Float = 0
     private var powerObserverTokens: [NSObjectProtocol] = []
     private var sleepPreventionActivity: NSObjectProtocol?
 
@@ -169,6 +185,12 @@ final class AppViewModel: ObservableObject {
     var primaryActionTitle: String {
         switch primaryAction {
         case .transcribe:
+            if selectedTranscriptionJob?.status == .queued {
+                return "Queued"
+            }
+            if selectedTranscriptionJob?.status == .running {
+                return "Transcribing..."
+            }
             if selectedTranscriptionJob?.status == .failed {
                 return "Retry transcription"
             }
@@ -197,7 +219,52 @@ final class AppViewModel: ObservableObject {
     }
 
     var canRunPrimaryAction: Bool {
-        selectedRecording != nil && canSelectHistory
+        guard let selectedRecording, canSelectHistory else { return false }
+        return !hasPendingTranscription(for: selectedRecording.id)
+    }
+
+    var activeTranscriptionJob: TranscriptionJob? {
+        transcriptionJobs.first { $0.status == .running }
+    }
+
+    var visibleTranscriptionJobs: [TranscriptionJob] {
+        transcriptionJobs.filter { job in
+            switch job.status {
+            case .queued, .running, .failed:
+                return true
+            case .completed, .cancelled:
+                return false
+            }
+        }
+    }
+
+    var hasVisibleTranscriptionJobs: Bool {
+        !visibleTranscriptionJobs.isEmpty
+    }
+
+    var selectedRecordingIsTranscribing: Bool {
+        guard let selectedRecording else { return false }
+        return job(for: selectedRecording.id)?.status == .running
+    }
+
+    var selectedRecordingIsQueuedForTranscription: Bool {
+        guard let selectedRecording else { return false }
+        return job(for: selectedRecording.id)?.status == .queued
+    }
+
+    var selectedRecordingConfidenceIssues: [RecordingConfidenceIssue] {
+        selectedRecording?.metadata.confidenceReport?.issues ?? []
+    }
+
+    var miniRecordingIndicatorText: String? {
+        switch workflowState {
+        case let .recording(source):
+            return "Recording \(source.displayName) \(formatDuration(recordingElapsed))"
+        case let .paused(source, reason):
+            return "\(reason.displayName) \(source.displayName) \(formatDuration(recordingElapsed))"
+        default:
+            return nil
+        }
     }
 
     var isSearchingRecordings: Bool {
@@ -251,6 +318,9 @@ final class AppViewModel: ObservableObject {
     func bootstrap() async {
         installPowerObservers()
         loadRecordings()
+        loadTranscriptionJobs(markInterruptedRunning: true)
+        refreshSetupHealth()
+        processTranscriptionQueueIfNeeded()
         await recoverInterruptedRecordings()
     }
 
@@ -264,7 +334,9 @@ final class AppViewModel: ObservableObject {
             } else {
                 selectedRecording = recordings.first
             }
+            loadTranscriptionJobs()
             loadSelectedSidecars()
+            refreshSetupHealth()
         } catch {
             statusMessage = error.localizedDescription
             workflowState = .failed(error.localizedDescription)
@@ -312,6 +384,55 @@ final class AppViewModel: ObservableObject {
             settings.recordingsFolderPath = url.path
             saveSettings()
             loadRecordings()
+        }
+    }
+
+    func importRecording() {
+        guard RecordingInteractionPolicy.canMutateRecordingLibrary(during: workflowState) else {
+            statusMessage = "Finish the current recording task first."
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.audio, .movie]
+        panel.directoryURL = recordingsFolderURL
+        panel.message = "Choose an audio or video file to import for transcription."
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await importRecording(from: url) }
+    }
+
+    func importRecording(from url: URL) async {
+        guard RecordingInteractionPolicy.canMutateRecordingLibrary(during: workflowState) else {
+            statusMessage = "Finish the current recording task first."
+            return
+        }
+
+        statusMessage = "Importing \(url.lastPathComponent)"
+        do {
+            let duration = try await audioDuration(for: url)
+            let confidenceReport = await confidenceReportForImportedRecording(url: url, duration: duration)
+            let imported = try library().importRecording(
+                sourceURL: url,
+                requestedName: url.deletingPathExtension().lastPathComponent,
+                source: .microphone,
+                startedAt: Date(),
+                durationSeconds: duration,
+                importedAt: Date(),
+                confidenceReport: confidenceReport
+            )
+            loadRecordings()
+            selectedRecording = recordings.first(where: { $0.id == imported.id }) ?? imported
+            loadSelectedSidecars()
+            preparePlayback(for: imported)
+            workflowState = .saved
+            statusMessage = "Imported \(imported.displayName)"
+        } catch {
+            workflowState = .failed(error.localizedDescription)
+            statusMessage = error.localizedDescription
         }
     }
 
@@ -411,6 +532,8 @@ final class AppViewModel: ObservableObject {
         recoveryMessage = ""
         recoveryNoticeSeverity = .info
         resetSignalLevels()
+        microphonePeakDuringRecording = 0
+        systemPeakDuringRecording = 0
         stopPlayback()
 
         do {
@@ -581,6 +704,16 @@ final class AppViewModel: ObservableObject {
                 finalTemporaryURL = try makeFinalTemporaryAudioURL()
                 try await AudioTrackMixer.concatenateToSingleM4A(inputs: segmentURLs, outputURL: finalTemporaryURL)
             }
+            let confidenceReport = try await RecordingConfidenceAnalyzer.analyze(
+                audioURL: finalTemporaryURL,
+                source: source,
+                expectedChannels: [
+                    .microphone: microphonePeakDuringRecording,
+                    .system: systemPeakDuringRecording
+                ],
+                minimumDuration: 3,
+                silenceThreshold: 0.01
+            )
             let recording = try library().finishRecording(
                 temporaryAudioURL: finalTemporaryURL,
                 requestedName: currentSessionName ?? defaultMeetingName(for: finalizedClock.startedAt),
@@ -588,7 +721,8 @@ final class AppViewModel: ObservableObject {
                 startedAt: finalizedClock.startedAt,
                 endedAt: endedAt,
                 durationSecondsOverride: finalizedClock.activeDuration(at: endedAt),
-                segmentCount: max(1, segmentURLs.count)
+                segmentCount: max(1, segmentURLs.count),
+                confidenceReport: confidenceReport
             )
             if segmentURLs.count > 1 {
                 for url in segmentURLs {
@@ -661,6 +795,7 @@ final class AppViewModel: ObservableObject {
             if target.id == selectedRecording?.id {
                 selectedRecording = nil
                 transcriptText = ""
+                transcriptSegments = []
                 summaryText = ""
                 selectedTranscriptionJob = nil
             }
@@ -686,66 +821,67 @@ final class AppViewModel: ObservableObject {
 
     func transcribeSelected(replacingExistingTranscript: Bool = false) async {
         guard let selectedRecording, RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
-        let targetID = selectedRecording.id
-        let jobStore = transcriptionJobStore()
-        let previousAttemptCount = jobStore.loadIfExists(recordingID: selectedRecording.id)?.attemptCount ?? 0
-        var job = TranscriptionJob.start(
-            recordingID: selectedRecording.id,
-            recordingName: selectedRecording.displayName,
-            audioFileName: selectedRecording.audioURL.lastPathComponent,
-            provider: settings.provider,
-            previousAttemptCount: previousAttemptCount
-        )
-        try? jobStore.save(job)
-        selectedTranscriptionJob = job
-        transcriptionStartedAt = Date()
-        workflowState = .transcribing
-        statusMessage = replacingExistingTranscript
-            ? "Re-transcribing with \(settings.provider.displayName)"
-            : "Transcribing with \(settings.provider.displayName)"
-        do {
-            let request = TranscribeRequest(
-                audioPath: selectedRecording.audioURL.path,
-                provider: settings.provider
-            )
-            let response = try await proxy.handle(
-                method: "POST",
-                path: "/transcribe",
-                body: JSONEncoder().encode(request)
-            )
-            let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: response.body)
-            try library().writeTranscript(decoded.text, for: selectedRecording)
-            if replacingExistingTranscript {
-                try library().clearSummary(for: selectedRecording)
-            }
-            refreshSearchDocument(for: selectedRecording)
-            job.markCompleted(transcriptFileName: selectedRecording.transcriptURL.lastPathComponent)
-            try? jobStore.save(job)
-            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
-                transcriptText = decoded.text
-                selectedTranscriptionJob = job
-                if replacingExistingTranscript {
-                    summaryText = ""
-                }
-            }
-            transcriptionStartedAt = nil
-            workflowState = .saved
-            statusMessage = replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
-        } catch {
-            let message = TranscriptionErrorMessage.message(for: error)
-            job.markFailed(message)
-            try? jobStore.save(job)
-            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
-                selectedTranscriptionJob = job
-            }
-            transcriptionStartedAt = nil
-            workflowState = .failed(message)
-            statusMessage = message
-        }
+        enqueueTranscription(recording: selectedRecording, replacingExistingTranscript: replacingExistingTranscript)
     }
 
     func retranscribeSelected() async {
         await transcribeSelected(replacingExistingTranscript: true)
+    }
+
+    func retryTranscription(recordingID: UUID) {
+        guard let recording = recordings.first(where: { $0.id == recordingID }) else { return }
+        let hasExistingTranscript = !readTextIfExists(at: recording.transcriptURL)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        enqueueTranscription(recording: recording, replacingExistingTranscript: hasExistingTranscript)
+    }
+
+    func cancelTranscription(recordingID: UUID) {
+        guard var job = job(for: recordingID),
+              job.status == .queued || job.status == .running else { return }
+        if job.status == .running {
+            transcriptionQueueTask?.cancel()
+        }
+        job.markCancelled()
+        do {
+            try transcriptionJobStore().save(job)
+            loadTranscriptionJobs()
+            statusMessage = "Transcription cancelled"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func transcriptionStatusText(for recording: RecordingItem) -> String? {
+        guard let job = job(for: recording.id) else { return nil }
+        switch job.status {
+        case .queued:
+            return "Queued"
+        case .running:
+            return "Transcribing"
+        case .failed:
+            return "Needs retry"
+        case .completed:
+            return nil
+        case .cancelled:
+            return nil
+        }
+    }
+
+    func jumpToTranscriptSegment(_ segment: TranscriptSegment) {
+        guard let startTime = segment.startTime else { return }
+        if let selectedRecording, audioPlayer?.url != selectedRecording.audioURL {
+            preparePlayback(for: selectedRecording)
+        }
+        guard let audioPlayer else { return }
+        audioPlayer.currentTime = min(max(0, startTime), audioPlayer.duration)
+        playbackPosition = audioPlayer.currentTime
+        if !audioPlayer.isPlaying {
+            audioPlayer.play()
+            isPlaying = true
+            startPlaybackTimer()
+        }
+        statusMessage = "Jumped to \(formatDuration(startTime))"
     }
 
     func saveTranscript(format: TranscriptExportFormat) {
@@ -857,6 +993,7 @@ final class AppViewModel: ObservableObject {
 
     func saveSettings() {
         settingsStore.save(settings)
+        refreshSetupHealth()
     }
 
     func saveAPIKeys() {
@@ -896,6 +1033,257 @@ final class AppViewModel: ObservableObject {
         credentialStatusMessage = result.message
         credentialStatusSeverity = result.isValid ? .success : .error
         statusMessage = result.message
+        refreshSetupHealth()
+    }
+
+    func refreshSetupHealth() {
+        let microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        let microphoneItem: SetupHealthItem
+        switch microphoneStatus {
+        case .authorized:
+            microphoneItem = SetupHealthItem(
+                id: "microphone",
+                title: "Microphone Permission",
+                detail: "Allowed",
+                severity: .success,
+                systemImage: "mic.fill"
+            )
+        case .notDetermined:
+            microphoneItem = SetupHealthItem(
+                id: "microphone",
+                title: "Microphone Permission",
+                detail: "Not requested yet",
+                severity: .warning,
+                systemImage: "mic"
+            )
+        case .denied, .restricted:
+            microphoneItem = SetupHealthItem(
+                id: "microphone",
+                title: "Microphone Permission",
+                detail: "Open macOS Privacy settings to allow microphone access.",
+                severity: .error,
+                systemImage: "mic.slash.fill"
+            )
+        @unknown default:
+            microphoneItem = SetupHealthItem(
+                id: "microphone",
+                title: "Microphone Permission",
+                detail: "Unknown status",
+                severity: .warning,
+                systemImage: "questionmark.circle"
+            )
+        }
+
+        let screenAllowed = CGPreflightScreenCaptureAccess()
+        let screenItem = SetupHealthItem(
+            id: "screen",
+            title: "System Audio Permission",
+            detail: screenAllowed ? "Screen capture permission looks allowed" : "Allow Screen Recording for system audio capture.",
+            severity: screenAllowed ? .success : .warning,
+            systemImage: screenAllowed ? "speaker.wave.2.fill" : "speaker.slash.fill"
+        )
+
+        let elevenLabsItem = SetupHealthItem(
+            id: "elevenlabs",
+            title: "ElevenLabs Key",
+            detail: keyStore.apiKey(for: .elevenLabs) == nil ? "Missing" : "Saved",
+            severity: keyStore.apiKey(for: .elevenLabs) == nil ? .warning : .success,
+            systemImage: "text.quote"
+        )
+
+        let openAIItem = SetupHealthItem(
+            id: "openai",
+            title: "OpenAI Key",
+            detail: keyStore.apiKey(for: .openAI) == nil ? "Missing for summaries" : "Saved",
+            severity: keyStore.apiKey(for: .openAI) == nil ? .info : .success,
+            systemImage: "sparkles"
+        )
+
+        let folderItem: SetupHealthItem
+        do {
+            try FileManager.default.createDirectory(at: recordingsFolderURL, withIntermediateDirectories: true)
+            let writable = FileManager.default.isWritableFile(atPath: recordingsFolderURL.path)
+            folderItem = SetupHealthItem(
+                id: "folder",
+                title: "Recordings Folder",
+                detail: writable ? recordingsFolderURL.path : "Folder is not writable.",
+                severity: writable ? .success : .error,
+                systemImage: writable ? "folder.fill" : "folder.badge.questionmark"
+            )
+        } catch {
+            folderItem = SetupHealthItem(
+                id: "folder",
+                title: "Recordings Folder",
+                detail: error.localizedDescription,
+                severity: .error,
+                systemImage: "folder.badge.questionmark"
+            )
+        }
+
+        setupHealthItems = [microphoneItem, screenItem, elevenLabsItem, openAIItem, folderItem]
+    }
+
+    private func enqueueTranscription(recording: RecordingItem, replacingExistingTranscript: Bool) {
+        guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
+        guard !hasPendingTranscription(for: recording.id) else {
+            statusMessage = "Transcription already queued"
+            return
+        }
+
+        let store = transcriptionJobStore()
+        let previousAttemptCount = store.loadIfExists(recordingID: recording.id)?.attemptCount ?? 0
+        let job = TranscriptionJob.queue(
+            recordingID: recording.id,
+            recordingName: recording.displayName,
+            audioFileName: recording.audioURL.lastPathComponent,
+            provider: settings.provider,
+            replacingExistingTranscript: replacingExistingTranscript,
+            previousAttemptCount: previousAttemptCount
+        )
+
+        do {
+            try store.save(job)
+            loadTranscriptionJobs()
+            statusMessage = replacingExistingTranscript ? "Re-transcription queued" : "Transcription queued"
+            processTranscriptionQueueIfNeeded()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func processTranscriptionQueueIfNeeded() {
+        guard transcriptionQueueTask == nil else { return }
+        guard transcriptionJobs.contains(where: { $0.status == .queued }) else { return }
+        transcriptionQueueTask = Task { [weak self] in
+            await self?.runTranscriptionQueue()
+        }
+    }
+
+    private func runTranscriptionQueue() async {
+        defer {
+            transcriptionQueueTask = nil
+            transcriptionStartedAt = nil
+            if transcriptionJobs.contains(where: { $0.status == .queued }) {
+                processTranscriptionQueueIfNeeded()
+            }
+        }
+
+        while !Task.isCancelled {
+            loadTranscriptionJobs()
+            guard var job = transcriptionJobs
+                .filter({ $0.status == .queued })
+                .sorted(by: { $0.updatedAt < $1.updatedAt })
+                .first else {
+                break
+            }
+
+            job.markRunning()
+            saveTranscriptionJob(job)
+            transcriptionStartedAt = job.startedAt
+            statusMessage = "Transcribing \(job.recordingName)"
+            await performTranscriptionJob(job)
+        }
+    }
+
+    private func performTranscriptionJob(_ job: TranscriptionJob) async {
+        guard let recording = recording(for: job) else {
+            var failed = job
+            failed.markFailed("Recording file is missing.")
+            saveTranscriptionJob(failed)
+            return
+        }
+
+        do {
+            let request = TranscribeRequest(
+                audioPath: recording.audioURL.path,
+                provider: job.provider
+            )
+            let response = try await proxy.handle(
+                method: "POST",
+                path: "/transcribe",
+                body: JSONEncoder().encode(request)
+            )
+            try Task.checkCancellation()
+            let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: response.body)
+            let segments = decoded.segments.isEmpty
+                ? TranscriptParser.segments(from: decoded.text)
+                : decoded.segments
+            try library().writeTranscript(decoded.text, for: recording)
+            try library().writeTranscriptSegments(segments, for: recording)
+            if job.replacingExistingTranscript {
+                try library().clearSummary(for: recording)
+            }
+            refreshSearchDocument(for: recording)
+
+            var completed = job
+            completed.markCompleted(transcriptFileName: recording.transcriptURL.lastPathComponent)
+            saveTranscriptionJob(completed)
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recording.id, selectedID: selectedRecording?.id) {
+                transcriptText = decoded.text
+                transcriptSegments = segments
+                selectedTranscriptionJob = completed
+                if job.replacingExistingTranscript {
+                    summaryText = ""
+                }
+            }
+            statusMessage = job.replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
+        } catch is CancellationError {
+            var cancelled = job
+            cancelled.markCancelled()
+            saveTranscriptionJob(cancelled)
+            statusMessage = "Transcription cancelled"
+        } catch {
+            let message = TranscriptionErrorMessage.message(for: error)
+            var failed = job
+            failed.markFailed(message)
+            saveTranscriptionJob(failed)
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recording.id, selectedID: selectedRecording?.id) {
+                selectedTranscriptionJob = failed
+            }
+            statusMessage = message
+        }
+    }
+
+    private func loadTranscriptionJobs(markInterruptedRunning: Bool = false) {
+        do {
+            var jobs = try transcriptionJobStore().loadAll()
+            if markInterruptedRunning {
+                for index in jobs.indices where jobs[index].status == .running {
+                    jobs[index].markInterruptedIfRunning()
+                    try? transcriptionJobStore().save(jobs[index])
+                }
+            }
+            transcriptionJobs = jobs
+            if let selectedRecording {
+                selectedTranscriptionJob = jobs.first { $0.recordingID == selectedRecording.id }
+            } else {
+                selectedTranscriptionJob = nil
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func saveTranscriptionJob(_ job: TranscriptionJob) {
+        try? transcriptionJobStore().save(job)
+        loadTranscriptionJobs()
+    }
+
+    private func job(for recordingID: UUID) -> TranscriptionJob? {
+        transcriptionJobs.first { $0.recordingID == recordingID }
+            ?? transcriptionJobStore().loadIfExists(recordingID: recordingID)
+    }
+
+    private func hasPendingTranscription(for recordingID: UUID) -> Bool {
+        guard let job = job(for: recordingID) else { return false }
+        return job.status == .queued || job.status == .running
+    }
+
+    private func recording(for job: TranscriptionJob) -> RecordingItem? {
+        if let recording = recordings.first(where: { $0.id == job.recordingID }) {
+            return recording
+        }
+        return (try? library().loadRecordings())?.first { $0.id == job.recordingID }
     }
 
     private func performRecordingAction(_ operation: () async -> Void) async {
@@ -972,11 +1360,15 @@ final class AppViewModel: ObservableObject {
     private func loadSelectedSidecars() {
         guard let selectedRecording else {
             transcriptText = ""
+            transcriptSegments = []
             summaryText = ""
             selectedTranscriptionJob = nil
             return
         }
+        let recordingLibrary = library()
         transcriptText = (try? String(contentsOf: selectedRecording.transcriptURL, encoding: .utf8)) ?? ""
+        let savedSegments = recordingLibrary.loadTranscriptSegments(for: selectedRecording)
+        transcriptSegments = savedSegments.isEmpty ? TranscriptParser.segments(from: transcriptText) : savedSegments
         summaryText = (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
         selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
         preparePlayback(for: selectedRecording)
@@ -1008,15 +1400,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func loadTranscriptionJobForSelection(_ recording: RecordingItem) -> TranscriptionJob? {
-        let store = transcriptionJobStore()
-        guard var job = store.loadIfExists(recordingID: recording.id) else {
-            return nil
-        }
-        if job.status == .running {
-            job.markInterruptedIfRunning()
-            try? store.save(job)
-        }
-        return job
+        job(for: recording.id)
     }
 
     private func copy(_ value: String) {
@@ -1029,6 +1413,63 @@ final class AppViewModel: ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH.mm"
         return "Meeting \(formatter.string(from: date))"
+    }
+
+    private func audioDuration(for url: URL) async throws -> TimeInterval {
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0 else {
+            throw ImportedRecordingError.unreadableDuration
+        }
+        return duration
+    }
+
+    private func confidenceReportForImportedRecording(url: URL, duration: TimeInterval) async -> RecordingConfidenceReport {
+        do {
+            var report = try await RecordingConfidenceAnalyzer.analyze(
+                audioURL: url,
+                source: .microphone,
+                expectedChannels: [.microphone: 1],
+                minimumDuration: 1,
+                silenceThreshold: 0.01
+            )
+            report.issues.append(importedSourceIssue)
+            return report
+        } catch {
+            return RecordingConfidenceReport(
+                checkedAt: Date(),
+                durationSeconds: duration,
+                peakLevel: 0,
+                averageLevel: 0,
+                issues: [
+                    importedSourceIssue,
+                    RecordingConfidenceIssue(
+                        kind: .silentAudio,
+                        severity: .warning,
+                        message: "Audio level could not be checked for this file format."
+                    )
+                ]
+            )
+        }
+    }
+
+    private var importedSourceIssue: RecordingConfidenceIssue {
+        RecordingConfidenceIssue(
+            kind: .missingExpectedSource,
+            severity: .info,
+            message: "Imported file source is external. Confirm it contains the meeting audio you expect."
+        )
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 
     private func preparePlayback(for recording: RecordingItem) {
@@ -1089,8 +1530,10 @@ final class AppViewModel: ObservableObject {
         switch channel {
         case .microphone:
             microphoneLevel = clamped
+            microphonePeakDuringRecording = max(microphonePeakDuringRecording, clamped)
         case .system:
             systemLevel = clamped
+            systemPeakDuringRecording = max(systemPeakDuringRecording, clamped)
         }
         inputLevel = max(microphoneLevel, systemLevel)
         waveform.append(inputLevel)
@@ -1110,6 +1553,8 @@ final class AppViewModel: ObservableObject {
         currentSessionManifest = nil
         currentSessionSource = nil
         currentSessionName = nil
+        microphonePeakDuringRecording = 0
+        systemPeakDuringRecording = 0
         recordingElapsed = 0
         endSleepPrevention()
     }
@@ -1163,6 +1608,17 @@ private enum RecordingSessionError: LocalizedError {
             return "No captured audio segments were available to save."
         case let .missingCapturedSegment(fileName):
             return "A recorded audio segment is missing: \(fileName). Recovery will retry on next launch."
+        }
+    }
+}
+
+private enum ImportedRecordingError: LocalizedError {
+    case unreadableDuration
+
+    var errorDescription: String? {
+        switch self {
+        case .unreadableDuration:
+            return "Could not read the selected file duration."
         }
     }
 }

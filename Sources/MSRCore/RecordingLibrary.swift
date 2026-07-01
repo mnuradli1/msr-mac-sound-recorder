@@ -39,7 +39,8 @@ public final class RecordingLibrary {
         durationSecondsOverride: TimeInterval? = nil,
         recoveredAt: Date? = nil,
         recoveryNote: String? = nil,
-        segmentCount: Int? = nil
+        segmentCount: Int? = nil,
+        confidenceReport: RecordingConfidenceReport? = nil
     ) throws -> RecordingItem {
         try ensureFolderExists()
         let baseName = try uniqueBaseName(FileNameSanitizer.sanitizedBaseName(requestedName))
@@ -63,7 +64,47 @@ public final class RecordingLibrary {
             updatedAt: now,
             recoveredAt: recoveredAt,
             recoveryNote: recoveryNote,
-            segmentCount: segmentCount
+            segmentCount: segmentCount,
+            confidenceReport: confidenceReport
+        )
+        let recording = RecordingItem(metadata: metadata, folderURL: folderURL)
+        try write(metadata: metadata, to: recording.metadataURL)
+        return recording
+    }
+
+    @discardableResult
+    public func importRecording(
+        sourceURL: URL,
+        requestedName: String,
+        source: AudioSource,
+        startedAt: Date,
+        durationSeconds: TimeInterval,
+        importedAt: Date = Date(),
+        confidenceReport: RecordingConfidenceReport? = nil
+    ) throws -> RecordingItem {
+        try ensureFolderExists()
+        let baseName = try uniqueBaseName(FileNameSanitizer.sanitizedBaseName(requestedName))
+        let fileExtension = sourceURL.pathExtension.isEmpty ? "m4a" : sourceURL.pathExtension
+        let destinationAudioURL = folderURL.appendingPathComponent("\(baseName).\(fileExtension)")
+        if sourceURL.standardizedFileURL != destinationAudioURL.standardizedFileURL {
+            if fileManager.fileExists(atPath: destinationAudioURL.path) {
+                try fileManager.removeItem(at: destinationAudioURL)
+            }
+            try fileManager.copyItem(at: sourceURL, to: destinationAudioURL)
+        }
+        let now = Date()
+        let metadata = RecordingMetadata(
+            id: UUID(),
+            displayName: baseName,
+            source: source,
+            audioFileName: destinationAudioURL.lastPathComponent,
+            startedAt: startedAt,
+            endedAt: startedAt.addingTimeInterval(max(0, durationSeconds)),
+            durationSeconds: max(0, durationSeconds),
+            createdAt: now,
+            updatedAt: now,
+            importedAt: importedAt,
+            confidenceReport: confidenceReport
         )
         let recording = RecordingItem(metadata: metadata, folderURL: folderURL)
         try write(metadata: metadata, to: recording.metadataURL)
@@ -79,11 +120,13 @@ public final class RecordingLibrary {
         )
         let newAudioURL = folderURL.appendingPathComponent("\(baseName).m4a")
         let newTranscriptURL = folderURL.appendingPathComponent("\(baseName).transcript.txt")
+        let newTranscriptSegmentsURL = folderURL.appendingPathComponent("\(baseName).transcript.segments.json")
         let newSummaryURL = folderURL.appendingPathComponent("\(baseName).summary.md")
         let oldMetadataURL = recording.metadataURL
 
         try moveIfExists(from: recording.audioURL, to: newAudioURL)
         try moveIfExists(from: recording.transcriptURL, to: newTranscriptURL)
+        try moveIfExists(from: recording.transcriptSegmentsURL, to: newTranscriptSegmentsURL)
         try moveIfExists(from: recording.summaryURL, to: newSummaryURL)
 
         var metadata = recording.metadata
@@ -103,6 +146,20 @@ public final class RecordingLibrary {
         try transcript.write(to: recording.transcriptURL, atomically: true, encoding: .utf8)
     }
 
+    public func writeTranscriptSegments(_ segments: [TranscriptSegment], for recording: RecordingItem) throws {
+        let data = try Self.makeEncoder().encode(segments)
+        try data.write(to: recording.transcriptSegmentsURL, options: .atomic)
+    }
+
+    public func loadTranscriptSegments(for recording: RecordingItem) -> [TranscriptSegment] {
+        guard fileManager.fileExists(atPath: recording.transcriptSegmentsURL.path),
+              let data = try? Data(contentsOf: recording.transcriptSegmentsURL),
+              let segments = try? Self.makeDecoder().decode([TranscriptSegment].self, from: data) else {
+            return []
+        }
+        return segments
+    }
+
     public func writeSummary(_ summary: String, for recording: RecordingItem) throws {
         try summary.write(to: recording.summaryURL, atomically: true, encoding: .utf8)
     }
@@ -114,7 +171,7 @@ public final class RecordingLibrary {
     }
 
     public func delete(_ recording: RecordingItem) throws {
-        for url in [recording.audioURL, recording.metadataURL, recording.transcriptURL, recording.summaryURL] {
+        for url in [recording.audioURL, recording.metadataURL, recording.transcriptURL, recording.transcriptSegmentsURL, recording.summaryURL] {
             if fileManager.fileExists(atPath: url.path) {
                 try fileManager.removeItem(at: url)
             }
@@ -140,6 +197,7 @@ public final class RecordingLibrary {
             "\(baseName).m4a",
             "\(baseName).json",
             "\(baseName).transcript.txt",
+            "\(baseName).transcript.segments.json",
             "\(baseName).summary.md"
         ]
         return candidates.contains { fileManager.fileExists(atPath: folderURL.appendingPathComponent($0).path) }

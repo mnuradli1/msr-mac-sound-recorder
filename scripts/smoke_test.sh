@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_PATH="$ROOT_DIR/dist/MSR Meeting Recorder.app"
-DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.2.3.dmg"
+APP_ZIP_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.2.4-app.zip"
+DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.2.4.dmg"
 
 cd "$ROOT_DIR"
 
@@ -22,6 +23,8 @@ plutil -lint "$APP_PATH/Contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
 echo "==> DMG check"
+test -f "$APP_ZIP_PATH"
+unzip -tq "$APP_ZIP_PATH"
 test -f "$DMG_PATH"
 hdiutil verify "$DMG_PATH"
 

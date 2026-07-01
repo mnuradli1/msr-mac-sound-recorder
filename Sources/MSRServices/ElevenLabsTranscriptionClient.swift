@@ -40,7 +40,8 @@ public final class ElevenLabsTranscriptionClient {
         return TranscribeResponse(
             text: decoded.diarizedText ?? decoded.text,
             provider: .elevenLabs,
-            languageCode: decoded.languageCode
+            languageCode: decoded.languageCode,
+            segments: decoded.segments
         )
     }
 
@@ -71,6 +72,11 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
             return nil
         }
         return Self.formatSpeakerTurns(from: words)
+    }
+
+    var segments: [TranscriptSegment] {
+        guard let words else { return [] }
+        return Self.makeSegments(from: words)
     }
 
     private static func formatSpeakerTurns(from words: [ElevenLabsWord]) -> String? {
@@ -104,15 +110,57 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
 
         return rendered.isEmpty ? nil : rendered
     }
+
+    private static func makeSegments(from words: [ElevenLabsWord]) -> [TranscriptSegment] {
+        var speakerLabels: [String: String] = [:]
+        var turns: [TranscriptSegment] = []
+
+        for word in words {
+            guard let speakerID = word.speakerID, !word.text.isEmpty else {
+                continue
+            }
+            let label = speakerLabels[speakerID] ?? {
+                let newLabel = "Speaker \(speakerLabels.count + 1)"
+                speakerLabels[speakerID] = newLabel
+                return newLabel
+            }()
+            let trimmedText = word.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedText.isEmpty else { continue }
+
+            if let lastIndex = turns.indices.last, turns[lastIndex].speaker == label {
+                turns[lastIndex].text += word.text
+                turns[lastIndex].endTime = word.end ?? turns[lastIndex].endTime
+            } else {
+                turns.append(
+                    TranscriptSegment(
+                        speaker: label,
+                        startTime: word.start,
+                        endTime: word.end,
+                        text: trimmedText
+                    )
+                )
+            }
+        }
+
+        return turns.map { segment in
+            var cleaned = segment
+            cleaned.text = cleaned.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleaned
+        }.filter { !$0.text.isEmpty }
+    }
 }
 
 private struct ElevenLabsWord: Decodable {
     let text: String
     let speakerID: String?
+    let start: TimeInterval?
+    let end: TimeInterval?
 
     enum CodingKeys: String, CodingKey {
         case text
         case speakerID = "speaker_id"
+        case start
+        case end
     }
 }
 

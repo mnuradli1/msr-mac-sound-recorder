@@ -20,6 +20,10 @@ struct ContentView: View {
         .sheet(isPresented: $viewModel.showingRename) {
             renameSheet
         }
+        .overlay(alignment: .bottomTrailing) {
+            miniRecordingIndicator
+                .padding(20)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .focusRecordingSearch)) { _ in
             recordingSearchFocused = true
         }
@@ -181,7 +185,66 @@ struct ContentView: View {
         }
     }
 
+    private var miniRecordingIndicator: some View {
+        Group {
+            if let text = viewModel.miniRecordingIndicatorText {
+                HStack(spacing: 8) {
+                    Image(systemName: viewModel.isRecording ? "record.circle.fill" : "pause.circle.fill")
+                        .font(.system(size: 14, weight: .bold))
+                    Text(text)
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 14)
+                .frame(height: 36)
+                .background(Color(hex: viewModel.isRecording ? 0xB91C1C : 0x92400E), in: Capsule())
+                .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+                .accessibilityLabel(text)
+            }
+        }
+    }
+
+    private var transcriptionTaskCenter: some View {
+        Group {
+            if viewModel.hasVisibleTranscriptionJobs {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Transcription", systemImage: "text.quote")
+                            .font(.system(size: 13, weight: .bold))
+                        Spacer()
+                        Text("\(viewModel.visibleTranscriptionJobs.count)")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .foregroundStyle(Color(hex: 0x475467))
+                    }
+                    .foregroundStyle(Color(hex: 0x344054))
+
+                    VStack(spacing: 8) {
+                        ForEach(Array(viewModel.visibleTranscriptionJobs.prefix(3)), id: \.recordingID) { job in
+                            TranscriptionJobRow(
+                                job: job,
+                                onCancel: { viewModel.cancelTranscription(recordingID: job.recordingID) },
+                                onRetry: { viewModel.retryTranscription(recordingID: job.recordingID) }
+                            )
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color(hex: 0xE4E7EC), lineWidth: 1)
+                }
+            }
+        }
+    }
+
     private var statusChipText: String {
+        if !viewModel.workflowState.isRecording,
+           !viewModel.workflowState.isPaused,
+           viewModel.activeTranscriptionJob != nil {
+            return "Transcribing"
+        }
         switch viewModel.workflowState {
         case .ready:
             return "Ready"
@@ -209,6 +272,11 @@ struct ContentView: View {
     }
 
     private var statusChipForeground: Color {
+        if !viewModel.workflowState.isRecording,
+           !viewModel.workflowState.isPaused,
+           viewModel.activeTranscriptionJob != nil {
+            return Color(hex: 0x1D4ED8)
+        }
         switch viewModel.workflowState {
         case .recording:
             return Color(hex: 0x991B1B)
@@ -224,6 +292,11 @@ struct ContentView: View {
     }
 
     private var statusChipBackground: Color {
+        if !viewModel.workflowState.isRecording,
+           !viewModel.workflowState.isPaused,
+           viewModel.activeTranscriptionJob != nil {
+            return Color(hex: 0xDBEAFE)
+        }
         switch viewModel.workflowState {
         case .recording:
             return Color(hex: 0xFEE2E2)
@@ -259,6 +332,19 @@ struct ContentView: View {
                     .foregroundStyle(Color(hex: 0x111827))
                 Spacer()
                 Button {
+                    viewModel.importRecording()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .medium))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color(hex: 0x667085))
+                .disabled(!viewModel.canMutateRecordingLibrary)
+                .help("Import audio")
+                .accessibilityLabel("Import audio")
+
+                Button {
                     viewModel.loadRecordings()
                 } label: {
                     Image(systemName: "arrow.clockwise")
@@ -278,6 +364,10 @@ struct ContentView: View {
                 .padding(.top, 14)
                 .padding(.horizontal, 20)
 
+            transcriptionTaskCenter
+                .padding(.top, viewModel.hasVisibleTranscriptionJobs ? 14 : 0)
+                .padding(.horizontal, 20)
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if recordingSections.isEmpty {
@@ -294,7 +384,9 @@ struct ContentView: View {
                                     ForEach(section.recordings) { recording in
                                         RecordingRow(
                                             recording: recording,
-                                            isSelected: recording.id == viewModel.selectedRecording?.id
+                                            isSelected: recording.id == viewModel.selectedRecording?.id,
+                                            jobStatusText: viewModel.transcriptionStatusText(for: recording),
+                                            hasConfidenceWarning: recording.metadata.confidenceReport?.hasWarnings == true
                                         )
                                         .onTapGesture {
                                             viewModel.select(recording)
@@ -438,8 +530,11 @@ struct ContentView: View {
                 Spacer()
             }
 
+            confidencePanel
+                .padding(.top, viewModel.selectedRecordingConfidenceIssues.isEmpty ? 0 : 18)
+
             playbackStrip
-                .padding(.top, 24)
+                .padding(.top, viewModel.selectedRecordingConfidenceIssues.isEmpty ? 24 : 18)
 
             actionRow
                 .padding(.top, 25)
@@ -448,6 +543,36 @@ struct ContentView: View {
                 .padding(.top, 34)
 
             Spacer(minLength: 0)
+        }
+    }
+
+    private var confidencePanel: some View {
+        Group {
+            if !viewModel.selectedRecordingConfidenceIssues.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "waveform.badge.exclamationmark")
+                            .font(.system(size: 14, weight: .bold))
+                        Text("Recording Check")
+                            .font(.system(size: 14, weight: .bold))
+                    }
+                    .foregroundStyle(Color(hex: 0x92400E))
+
+                    ForEach(viewModel.selectedRecordingConfidenceIssues) { issue in
+                        Text(issue.message)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Color(hex: 0x475467))
+                            .lineLimit(2)
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(hex: 0xFFFBEB), in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color(hex: 0xFDE68A), lineWidth: 1)
+                }
+            }
         }
     }
 
@@ -518,7 +643,9 @@ struct ContentView: View {
                 Task { await viewModel.runPrimaryAction() }
             } label: {
                 HStack(spacing: 8) {
-                    if viewModel.workflowState.isTranscribing || viewModel.workflowState.isSummarizing {
+                    if viewModel.selectedRecordingIsTranscribing ||
+                        viewModel.selectedRecordingIsQueuedForTranscription ||
+                        viewModel.workflowState.isSummarizing {
                         ProgressView()
                             .controlSize(.small)
                     }
@@ -561,40 +688,28 @@ struct ContentView: View {
                 .foregroundStyle(Color(hex: 0x111827))
 
             ZStack(alignment: .topLeading) {
-                TextEditor(text: $viewModel.transcriptText)
-                    .font(.system(size: 16))
-                    .foregroundStyle(Color(hex: 0x344054))
-                    .scrollContentBackground(.hidden)
-                    .background(Color.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 16)
-                    .contextMenu {
-                        Button {
-                            viewModel.copyTranscript()
-                        } label: {
-                            Label("Copy Transcript", systemImage: "doc.on.doc")
+                if viewModel.transcriptSegments.isEmpty {
+                    TextEditor(text: $viewModel.transcriptText)
+                        .font(.system(size: 16))
+                        .foregroundStyle(Color(hex: 0x344054))
+                        .scrollContentBackground(.hidden)
+                        .background(Color.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 16)
+                        .disabled(viewModel.selectedRecordingIsTranscribing)
+                } else {
+                    TranscriptReaderView(
+                        segments: viewModel.transcriptSegments,
+                        formatDuration: formatDuration,
+                        onJump: { segment in
+                            viewModel.jumpToTranscriptSegment(segment)
                         }
-                        Button {
-                            Task { await viewModel.retranscribeSelected() }
-                        } label: {
-                            Label("Re-transcribe", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                        Divider()
-                        Button {
-                            viewModel.saveTranscript(format: .text)
-                        } label: {
-                            Label("Save as .txt", systemImage: "doc.plaintext")
-                        }
-                        Button {
-                            viewModel.saveTranscript(format: .markdown)
-                        } label: {
-                            Label("Save as .md", systemImage: "doc.richtext")
-                        }
-                    }
-                    .disabled(viewModel.workflowState.isTranscribing)
+                    )
+                }
 
                 if viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   !viewModel.workflowState.isTranscribing {
+                   !viewModel.selectedRecordingIsTranscribing,
+                   !viewModel.selectedRecordingIsQueuedForTranscription {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No transcript yet")
                             .font(.system(size: 17, weight: .semibold))
@@ -607,7 +722,13 @@ struct ContentView: View {
                     .allowsHitTesting(false)
                 }
 
-                if viewModel.workflowState.isTranscribing {
+                if viewModel.selectedRecordingIsQueuedForTranscription {
+                    TranscriptionQueuedOverlay(provider: viewModel.settings.provider)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
+
+                if viewModel.selectedRecordingIsTranscribing {
                     TranscriptionProgressOverlay(
                         provider: viewModel.settings.provider,
                         startedAt: viewModel.transcriptionStartedAt ?? Date()
@@ -622,6 +743,29 @@ struct ContentView: View {
             .overlay {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color(hex: 0xD0D5DD), lineWidth: 1)
+            }
+            .contextMenu {
+                Button {
+                    viewModel.copyTranscript()
+                } label: {
+                    Label("Copy Transcript", systemImage: "doc.on.doc")
+                }
+                Button {
+                    Task { await viewModel.retranscribeSelected() }
+                } label: {
+                    Label("Re-transcribe", systemImage: "arrow.triangle.2.circlepath")
+                }
+                Divider()
+                Button {
+                    viewModel.saveTranscript(format: .text)
+                } label: {
+                    Label("Save as .txt", systemImage: "doc.plaintext")
+                }
+                Button {
+                    viewModel.saveTranscript(format: .markdown)
+                } label: {
+                    Label("Save as .md", systemImage: "doc.richtext")
+                }
             }
         }
     }
@@ -718,7 +862,8 @@ struct ContentView: View {
     }
 
     private func recordingSubtitle(_ recording: RecordingItem) -> String {
-        "\(recording.source.displayName) - \(formatDuration(recording.durationSeconds)) - \(relativeSavedText(recording.metadata.updatedAt))"
+        let source = recording.metadata.importedAt == nil ? recording.source.displayName : "Imported"
+        return "\(source) - \(formatDuration(recording.durationSeconds)) - \(relativeSavedText(recording.metadata.updatedAt))"
     }
 
     private func relativeSavedText(_ date: Date) -> String {
@@ -780,6 +925,189 @@ struct NoticeBanner: View {
                 .fill(severity.borderColor)
                 .frame(height: 1)
                 .frame(maxHeight: .infinity, alignment: .bottom)
+        }
+    }
+}
+
+private struct TranscriptionJobRow: View {
+    let job: TranscriptionJob
+    let onCancel: () -> Void
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.recordingName)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x111827))
+                    .lineLimit(1)
+                Text(statusText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color(hex: 0x667085))
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            if job.status == .failed {
+                Button(action: onRetry) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .help("Retry transcription")
+            }
+
+            if job.status == .queued || job.status == .running {
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color(hex: 0x667085))
+                .help("Cancel transcription")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 44)
+        .background(Color(hex: 0xF8FAFC), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var statusText: String {
+        switch job.status {
+        case .queued:
+            return "Queued"
+        case .running:
+            return "Running"
+        case .failed:
+            return job.errorMessage ?? "Failed"
+        case .completed:
+            return "Completed"
+        case .cancelled:
+            return "Cancelled"
+        }
+    }
+
+    private var iconName: String {
+        switch job.status {
+        case .queued:
+            return "clock.fill"
+        case .running:
+            return "waveform"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .completed:
+            return "checkmark.circle.fill"
+        case .cancelled:
+            return "xmark.circle.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch job.status {
+        case .queued, .running:
+            return Color(hex: 0x2563EB)
+        case .failed:
+            return Color(hex: 0xDC2626)
+        case .completed:
+            return Color(hex: 0x16A34A)
+        case .cancelled:
+            return Color(hex: 0x667085)
+        }
+    }
+}
+
+private struct TranscriptionQueuedOverlay: View {
+    let provider: AIProvider
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.35)) { context in
+            let phase = Int(context.date.timeIntervalSinceReferenceDate * 2) % 4
+            VStack(spacing: 12) {
+                Image(systemName: "clock.badge.checkmark")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x2563EB))
+                Text("Queued for \(provider.displayName)\(String(repeating: ".", count: phase))")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x111827))
+                    .contentTransition(.opacity)
+                Text("It will start after the current transcription finishes.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color(hex: 0x667085))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.white.opacity(0.95))
+        }
+    }
+}
+
+private struct TranscriptReaderView: View {
+    let segments: [TranscriptSegment]
+    let formatDuration: (TimeInterval) -> String
+    let onJump: (TranscriptSegment) -> Void
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(segments) { segment in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Text(segment.speaker)
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(speakerColor(for: segment.speaker))
+                                .padding(.horizontal, 9)
+                                .frame(height: 24)
+                                .background(speakerColor(for: segment.speaker).opacity(0.12), in: Capsule())
+
+                            if let startTime = segment.startTime {
+                                Button {
+                                    onJump(segment)
+                                } label: {
+                                    Label(formatDuration(startTime), systemImage: "play.circle")
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Color(hex: 0x2563EB))
+                                .help("Jump to audio")
+                            }
+
+                            Spacer(minLength: 0)
+                        }
+
+                        Text(segment.text)
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color(hex: 0x344054))
+                            .lineSpacing(3)
+                            .textSelection(.enabled)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(hex: 0xF8FAFC), in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+            .padding(14)
+        }
+        .background(Color.white)
+    }
+
+    private func speakerColor(for speaker: String) -> Color {
+        let total = speaker.unicodeScalars.reduce(0) { $0 + Int($1.value) }
+        switch total % 4 {
+        case 0:
+            return Color(hex: 0xB91C1C)
+        case 1:
+            return Color(hex: 0x2563EB)
+        case 2:
+            return Color(hex: 0x047857)
+        default:
+            return Color(hex: 0x7C3AED)
         }
     }
 }
@@ -952,21 +1280,44 @@ private struct SourceSegmentedControl: View {
 private struct RecordingRow: View {
     let recording: RecordingItem
     let isSelected: Bool
+    var jobStatusText: String?
+    var hasConfidenceWarning: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(recording.displayName)
-                .font(.system(size: 16, weight: .bold))
-                .foregroundStyle(Color(hex: 0x111827))
-                .lineLimit(1)
-            Text("\(recording.source.displayName) - \(formatDuration(recording.durationSeconds))")
-                .font(.system(size: 13))
-                .foregroundStyle(Color(hex: 0x475467))
-                .lineLimit(1)
+            HStack(spacing: 6) {
+                Text(recording.displayName)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x111827))
+                    .lineLimit(1)
+
+                if hasConfidenceWarning {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color(hex: 0xD97706))
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text("\(recording.metadata.importedAt == nil ? recording.source.displayName : "Imported") - \(formatDuration(recording.durationSeconds))")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color(hex: 0x475467))
+                    .lineLimit(1)
+
+                if let jobStatusText {
+                    Text(jobStatusText)
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color(hex: 0x1D4ED8))
+                        .padding(.horizontal, 7)
+                        .frame(height: 20)
+                        .background(Color(hex: 0xDBEAFE), in: Capsule())
+                        .lineLimit(1)
+                }
+            }
         }
         .padding(.leading, isSelected ? 28 : 28)
         .padding(.trailing, 16)
-        .frame(height: 74)
+        .frame(height: 78)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(isSelected ? Color.white : Color.clear, in: RoundedRectangle(cornerRadius: 10))
         .overlay(alignment: .leading) {
@@ -1102,7 +1453,7 @@ private struct CircleIconButtonStyle: ButtonStyle {
     }
 }
 
-private extension AppNoticeSeverity {
+extension AppNoticeSeverity {
     var iconName: String {
         switch self {
         case .info:

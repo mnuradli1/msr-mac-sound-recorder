@@ -6,6 +6,31 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Setup Health") {
+                ForEach(viewModel.setupHealthItems) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.systemImage)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(item.severity.foregroundColor)
+                            .frame(width: 18)
+                            .padding(.top, 2)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(item.title)
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(item.detail)
+                                .font(.system(size: 12))
+                                .foregroundStyle(Color.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+
+                Button("Refresh Health") {
+                    viewModel.refreshSetupHealth()
+                }
+            }
+
             Section("Storage") {
                 HStack {
                     TextField("Recordings Folder", text: Binding(

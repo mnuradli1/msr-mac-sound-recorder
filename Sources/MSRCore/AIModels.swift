@@ -45,11 +45,18 @@ public struct TranscribeResponse: Codable, Equatable, Sendable {
     public var text: String
     public var provider: AIProvider
     public var languageCode: String?
+    public var segments: [TranscriptSegment]
 
-    public init(text: String, provider: AIProvider, languageCode: String?) {
+    public init(
+        text: String,
+        provider: AIProvider,
+        languageCode: String?,
+        segments: [TranscriptSegment] = []
+    ) {
         self.text = text
         self.provider = provider
         self.languageCode = languageCode
+        self.segments = segments
     }
 }
 
