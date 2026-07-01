@@ -2,7 +2,7 @@ import Foundation
 import MSRCore
 
 public final class OpenAIClient {
-    private static let transcriptionTimeout: TimeInterval = 30 * 60
+    private static let transcriptionTimeout: TimeInterval = 60 * 60
 
     private let transcriptionEndpoint: URL
     private let responsesEndpoint: URL

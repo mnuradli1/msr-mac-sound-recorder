@@ -711,7 +711,7 @@ private struct TranscriptionProgressOverlay: View {
                 HStack(spacing: 8) {
                     Image(systemName: "waveform")
                         .font(.system(size: 14, weight: .semibold))
-                    Text("Uploading audio. Waiting for transcript.")
+                    Text("Uploading full recording. Waiting for transcript.")
                         .font(.system(size: 13))
                         .lineLimit(1)
                 }

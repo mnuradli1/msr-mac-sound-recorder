@@ -13,6 +13,9 @@ struct MSRTestRunner {
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
             try await testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns()
+            try testTranscriptionJobStoreRoundTripsHiddenJob()
+            try testTranscriptionJobTracksRunningCompletedFailedAttempts()
+            try testTranscriptionErrorMessageClassifiesFailures()
             try testTranscriptionProgressDisplayAnimatesMessageAndElapsedTime()
             try await testSummarizeEndpointDelegates()
             try await testHealthEndpoint()
@@ -135,7 +138,7 @@ private func testElevenLabsTranscriptionUsesLongRequestTimeout() async throws {
     _ = try await client.transcribe(audioURL: audioURL, apiKey: "test-key")
 
     let timeout = CapturingURLProtocol.capturedTimeoutInterval
-    try expect((timeout ?? 0) >= 600, "long transcription request timeout should be at least ten minutes")
+    try expect((timeout ?? 0) >= 3_600, "long transcription request timeout should be at least one hour")
 }
 
 private func testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns() async throws {
@@ -181,6 +184,91 @@ private func testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns
         Hi Adli
         """,
         "ElevenLabs diarized words should be formatted as speaker turns"
+    )
+}
+
+private func testTranscriptionJobStoreRoundTripsHiddenJob() throws {
+    let folder = try TemporaryFolder()
+    let recordingID = UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!
+    let startedAt = Date(timeIntervalSince1970: 1_000)
+    let job = TranscriptionJob(
+        recordingID: recordingID,
+        recordingName: "Long Meeting",
+        audioFileName: "Long Meeting.m4a",
+        provider: .elevenLabs,
+        status: .running,
+        attemptCount: 1,
+        startedAt: startedAt,
+        updatedAt: startedAt
+    )
+    let store = TranscriptionJobStore(folderURL: folder.url)
+
+    try store.save(job)
+    let storedURL = store.url(for: recordingID)
+    let loaded = try store.load(recordingID: recordingID)
+    let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
+
+    try expect(storedURL.lastPathComponent == ".transcription-\(recordingID.uuidString).json", "transcription job should use a hidden filename")
+    try expect(FileManager.default.fileExists(atPath: storedURL.path), "transcription job should be written")
+    try expect(loaded == job, "transcription job should round-trip through JSON")
+    try expect(recordings.isEmpty, "hidden transcription jobs should not appear in recording history")
+}
+
+private func testTranscriptionJobTracksRunningCompletedFailedAttempts() throws {
+    let recordingID = UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!
+    var job = TranscriptionJob.start(
+        recordingID: recordingID,
+        recordingName: "Retry Meeting",
+        audioFileName: "Retry Meeting.m4a",
+        provider: .elevenLabs,
+        previousAttemptCount: 1,
+        at: Date(timeIntervalSince1970: 2_000)
+    )
+
+    try expect(job.status == .running, "started job should be running")
+    try expect(job.attemptCount == 2, "started job should increment previous attempt count")
+    try expect(job.errorMessage == nil, "started job should clear error")
+
+    job.markFailed("Upload timed out.", at: Date(timeIntervalSince1970: 2_100))
+    try expect(job.status == .failed, "failed job should persist failed status")
+    try expect(job.errorMessage == "Upload timed out.", "failed job should persist readable error")
+    try expect(job.completedAt == nil, "failed job should not set completed timestamp")
+
+    job.markCompleted(transcriptFileName: "Retry Meeting.transcript.txt", at: Date(timeIntervalSince1970: 2_200))
+    try expect(job.status == .completed, "completed job should persist completed status")
+    try expect(job.transcriptFileName == "Retry Meeting.transcript.txt", "completed job should remember transcript file")
+    try expect(job.completedAt == Date(timeIntervalSince1970: 2_200), "completed job should persist completed timestamp")
+    try expect(job.errorMessage == nil, "completed job should clear previous error")
+
+    var interrupted = TranscriptionJob.start(
+        recordingID: recordingID,
+        recordingName: "Retry Meeting",
+        audioFileName: "Retry Meeting.m4a",
+        provider: .elevenLabs,
+        at: Date(timeIntervalSince1970: 3_000)
+    )
+    interrupted.markInterruptedIfRunning(at: Date(timeIntervalSince1970: 3_100))
+    try expect(interrupted.status == .failed, "running job from previous launch should become retryable")
+    try expect(interrupted.errorMessage?.contains("interrupted") == true, "interrupted job should explain retry state")
+}
+
+private func testTranscriptionErrorMessageClassifiesFailures() throws {
+    try expect(
+        TranscriptionErrorMessage.message(for: ProviderError.missingAPIKey("ELEVENLABS_API_KEY")).contains("API key"),
+        "missing API key should produce credential guidance"
+    )
+    try expect(
+        TranscriptionErrorMessage.message(for: ProviderError.audioFileMissing("/tmp/missing.m4a")).contains("Audio file"),
+        "missing audio should mention audio file"
+    )
+    try expect(
+        TranscriptionErrorMessage.message(for: ProviderError.providerRejected(413, "too large")).contains("Provider rejected"),
+        "provider rejection should include provider context"
+    )
+    let timeout = URLError(.timedOut)
+    try expect(
+        TranscriptionErrorMessage.message(for: timeout).contains("timed out"),
+        "timeout should produce retryable timeout guidance"
     )
 }
 

@@ -35,6 +35,7 @@ final class AppViewModel: ObservableObject {
     @Published var playbackDuration: TimeInterval = 0
     @Published var recordingElapsed: TimeInterval = 0
     @Published var transcriptionStartedAt: Date?
+    @Published var selectedTranscriptionJob: TranscriptionJob?
     @Published var credentialStatusMessage = ""
     @Published var credentialStatusSeverity: AppNoticeSeverity = .info
     @Published var isTestingCredential = false
@@ -166,6 +167,9 @@ final class AppViewModel: ObservableObject {
     var primaryActionTitle: String {
         switch primaryAction {
         case .transcribe:
+            if selectedTranscriptionJob?.status == .failed {
+                return "Retry transcription"
+            }
             return "Transcribe with \(settings.provider.displayName)"
         case .summarize:
             return "Summarize"
@@ -634,10 +638,12 @@ final class AppViewModel: ObservableObject {
                 stopPlayback()
             }
             try library().delete(target)
+            try? transcriptionJobStore().delete(recordingID: target.id)
             if target.id == selectedRecording?.id {
                 selectedRecording = nil
                 transcriptText = ""
                 summaryText = ""
+                selectedTranscriptionJob = nil
             }
             loadRecordings()
             workflowState = selectedRecording == nil ? .ready : .saved
@@ -662,6 +668,17 @@ final class AppViewModel: ObservableObject {
     func transcribeSelected(replacingExistingTranscript: Bool = false) async {
         guard let selectedRecording, RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
         let targetID = selectedRecording.id
+        let jobStore = transcriptionJobStore()
+        let previousAttemptCount = jobStore.loadIfExists(recordingID: selectedRecording.id)?.attemptCount ?? 0
+        var job = TranscriptionJob.start(
+            recordingID: selectedRecording.id,
+            recordingName: selectedRecording.displayName,
+            audioFileName: selectedRecording.audioURL.lastPathComponent,
+            provider: settings.provider,
+            previousAttemptCount: previousAttemptCount
+        )
+        try? jobStore.save(job)
+        selectedTranscriptionJob = job
         transcriptionStartedAt = Date()
         workflowState = .transcribing
         statusMessage = replacingExistingTranscript
@@ -682,8 +699,11 @@ final class AppViewModel: ObservableObject {
             if replacingExistingTranscript {
                 try library().clearSummary(for: selectedRecording)
             }
+            job.markCompleted(transcriptFileName: selectedRecording.transcriptURL.lastPathComponent)
+            try? jobStore.save(job)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 transcriptText = decoded.text
+                selectedTranscriptionJob = job
                 if replacingExistingTranscript {
                     summaryText = ""
                 }
@@ -692,9 +712,15 @@ final class AppViewModel: ObservableObject {
             workflowState = .saved
             statusMessage = replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
         } catch {
+            let message = TranscriptionErrorMessage.message(for: error)
+            job.markFailed(message)
+            try? jobStore.save(job)
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
+                selectedTranscriptionJob = job
+            }
             transcriptionStartedAt = nil
-            workflowState = .failed(error.localizedDescription)
-            statusMessage = error.localizedDescription
+            workflowState = .failed(message)
+            statusMessage = message
         }
     }
 
@@ -874,6 +900,10 @@ final class AppViewModel: ObservableObject {
         RecordingSessionManifestStore(folderURL: recordingsFolderURL)
     }
 
+    private func transcriptionJobStore() -> TranscriptionJobStore {
+        TranscriptionJobStore(folderURL: recordingsFolderURL)
+    }
+
     private func library() -> RecordingLibrary {
         RecordingLibrary(folderURL: recordingsFolderURL)
     }
@@ -922,11 +952,25 @@ final class AppViewModel: ObservableObject {
         guard let selectedRecording else {
             transcriptText = ""
             summaryText = ""
+            selectedTranscriptionJob = nil
             return
         }
         transcriptText = (try? String(contentsOf: selectedRecording.transcriptURL, encoding: .utf8)) ?? ""
         summaryText = (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
+        selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
         preparePlayback(for: selectedRecording)
+    }
+
+    private func loadTranscriptionJobForSelection(_ recording: RecordingItem) -> TranscriptionJob? {
+        let store = transcriptionJobStore()
+        guard var job = store.loadIfExists(recordingID: recording.id) else {
+            return nil
+        }
+        if job.status == .running {
+            job.markInterruptedIfRunning()
+            try? store.save(job)
+        }
+        return job
     }
 
     private func copy(_ value: String) {
