@@ -13,6 +13,7 @@ struct MSRTestRunner {
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
             try await testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns()
+            try await testElevenLabsTranscriptionInsertsSpacesBetweenWordTokens()
             try testTranscriptionJobStoreRoundTripsHiddenJob()
             try testTranscriptionJobTracksRunningCompletedFailedAttempts()
             try testTranscriptionJobQueueLifecycleAndStoreLoadAll()
@@ -190,6 +191,50 @@ private func testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns
         Hi Adli
         """,
         "ElevenLabs diarized words should be formatted as speaker turns"
+    )
+}
+
+private func testElevenLabsTranscriptionInsertsSpacesBetweenWordTokens() async throws {
+    let folder = try TemporaryFolder()
+    let audioURL = folder.url.appendingPathComponent("meeting.m4a")
+    try Data("audio".utf8).write(to: audioURL)
+
+    CapturingURLProtocol.reset(
+        statusCode: 200,
+        body: Data("""
+        {
+          "text": "Minyak sawit itu sudah digunakan.",
+          "language_code": "id",
+          "words": [
+            {"text": "Minyak", "type": "word", "speaker_id": "speaker_0", "start": 39.0, "end": 39.2},
+            {"text": "sawit", "type": "word", "speaker_id": "speaker_0", "start": 39.2, "end": 39.4},
+            {"text": "itu", "type": "word", "speaker_id": "speaker_0", "start": 39.4, "end": 39.5},
+            {"text": "sudah", "type": "word", "speaker_id": "speaker_0", "start": 39.5, "end": 39.7},
+            {"text": "digunakan", "type": "word", "speaker_id": "speaker_0", "start": 39.7, "end": 40.0},
+            {"text": ".", "type": "punctuation", "speaker_id": "speaker_0", "start": 40.0, "end": 40.0}
+          ]
+        }
+        """.utf8)
+    )
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CapturingURLProtocol.self]
+    let client = ElevenLabsTranscriptionClient(
+        endpoint: URL(string: "https://example.test/speech-to-text")!,
+        urlSession: URLSession(configuration: configuration)
+    )
+
+    let response = try await client.transcribe(audioURL: audioURL, apiKey: "test-key")
+
+    try expect(
+        response.text == """
+        Speaker 1:
+        Minyak sawit itu sudah digunakan.
+        """,
+        "ElevenLabs diarized text should insert spaces between adjacent word tokens"
+    )
+    try expect(
+        response.segments.first?.text == "Minyak sawit itu sudah digunakan.",
+        "ElevenLabs transcript segments should insert spaces between adjacent word tokens"
     )
 }
 

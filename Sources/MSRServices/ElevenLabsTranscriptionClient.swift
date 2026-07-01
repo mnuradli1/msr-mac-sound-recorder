@@ -94,7 +94,7 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
             }()
 
             if let lastIndex = turns.indices.last, turns[lastIndex].label == label {
-                turns[lastIndex].text += word.text
+                appendToken(word.text, to: &turns[lastIndex].text)
             } else {
                 turns.append(SpeakerTurn(label: label, text: word.text))
             }
@@ -128,7 +128,7 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
             guard !trimmedText.isEmpty else { continue }
 
             if let lastIndex = turns.indices.last, turns[lastIndex].speaker == label {
-                turns[lastIndex].text += word.text
+                appendToken(word.text, to: &turns[lastIndex].text)
                 turns[lastIndex].endTime = word.end ?? turns[lastIndex].endTime
             } else {
                 turns.append(
@@ -147,6 +147,43 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
             cleaned.text = cleaned.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return cleaned
         }.filter { !$0.text.isEmpty }
+    }
+
+    private static func appendToken(_ token: String, to text: inout String) {
+        guard !token.isEmpty else { return }
+        if text.isEmpty {
+            text += token
+            return
+        }
+        if shouldInsertSpace(before: token, after: text) {
+            text += " "
+        }
+        text += token
+    }
+
+    private static func shouldInsertSpace(before token: String, after existingText: String) -> Bool {
+        guard let firstTokenCharacter = token.first,
+              let lastExistingCharacter = existingText.last else {
+            return false
+        }
+        if firstTokenCharacter.isWhitespace || lastExistingCharacter.isWhitespace {
+            return false
+        }
+        if isClosingPunctuation(firstTokenCharacter) {
+            return false
+        }
+        if isOpeningPunctuation(lastExistingCharacter) {
+            return false
+        }
+        return true
+    }
+
+    private static func isClosingPunctuation(_ character: Character) -> Bool {
+        [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…"].contains(character)
+    }
+
+    private static func isOpeningPunctuation(_ character: Character) -> Bool {
+        ["(", "[", "{", "“", "\"", "'"].contains(character)
     }
 }
 
