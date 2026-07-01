@@ -43,16 +43,32 @@ struct ContentView: View {
     }
 
     private var topRecordingBar: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 16) {
-                sourcePickerSection
-                meterSection
-                Spacer(minLength: 0)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 28) {
+                HStack(alignment: .top, spacing: 16) {
+                    sourcePickerSection
+                    meterSection
+                }
+
+                Spacer(minLength: 24)
+
+                HStack(alignment: .center, spacing: 16) {
+                    recordingStatusBlock
+                    recordingControlButtons
+                }
             }
-            HStack(spacing: 16) {
-                recordingStatusBlock
-                recordingControlButtons
-                Spacer(minLength: 0)
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 16) {
+                    sourcePickerSection
+                    meterSection
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 16) {
+                    recordingStatusBlock
+                    recordingControlButtons
+                    Spacer(minLength: 0)
+                }
             }
         }
         .padding(.horizontal, 32)
