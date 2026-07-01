@@ -17,11 +17,13 @@ public final class RecordingLibrary {
             options: [.skipsHiddenFiles]
         )
         let decoder = Self.makeDecoder()
-        return try urls
+        return urls
             .filter { $0.pathExtension == "json" }
-            .map { url in
-                let data = try Data(contentsOf: url)
-                let metadata = try decoder.decode(RecordingMetadata.self, from: data)
+            .compactMap { url in
+                guard let data = try? Data(contentsOf: url),
+                      let metadata = try? decoder.decode(RecordingMetadata.self, from: data) else {
+                    return nil
+                }
                 return RecordingItem(metadata: metadata, folderURL: folderURL)
             }
             .sorted { lhs, rhs in

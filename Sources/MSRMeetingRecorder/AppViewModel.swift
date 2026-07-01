@@ -80,6 +80,7 @@ final class AppViewModel: ObservableObject {
     private var systemPeakDuringRecording: Float = 0
     private var powerObserverTokens: [NSObjectProtocol] = []
     private var sleepPreventionActivity: NSObjectProtocol?
+    private var settingsWindow: NSWindow?
 
     init(recorder: AudioRecording = MeetingAudioRecorder()) {
         settings = settingsStore.load()
@@ -371,7 +372,25 @@ final class AppViewModel: ObservableObject {
     }
 
     func openSettingsWindow() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "MSR Settings"
+        window.center()
+        window.contentView = NSHostingView(rootView: SettingsView(viewModel: self))
+        window.isReleasedWhenClosed = false
+        settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func chooseRecordingsFolder() {

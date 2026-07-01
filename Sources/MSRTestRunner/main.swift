@@ -8,6 +8,7 @@ struct MSRTestRunner {
     static func main() async {
         do {
             try testCreatesMetadataAndReloads()
+            try testRecordingLibraryIgnoresNonMetadataJSONSidecars()
             try testRenamesSidecarsTogether()
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
@@ -78,6 +79,37 @@ private func testCreatesMetadataAndReloads() throws {
     try expect(reloaded.map(\.displayName) == ["Weekly Sync"], "history should reload from metadata")
     try expect(reloaded.first?.durationSeconds == 60, "duration should be persisted")
     try expect(reloaded.first?.source == .micAndSystem, "source should be persisted")
+}
+
+private func testRecordingLibraryIgnoresNonMetadataJSONSidecars() throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let audioURL = folder.url.appendingPathComponent("Original.m4a")
+    FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8))
+
+    let recording = try library.finishRecording(
+        temporaryAudioURL: audioURL,
+        requestedName: "Original",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 10),
+        endedAt: Date(timeIntervalSince1970: 20)
+    )
+    try library.writeTranscriptSegments(
+        [TranscriptSegment(speaker: "Speaker 1", startTime: 0, text: "Hello there.")],
+        for: recording
+    )
+    try #"{"kind":"not recording metadata"}"#.write(
+        to: folder.url.appendingPathComponent("notes.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let reloaded = try library.loadRecordings()
+
+    try expect(
+        reloaded.map(\.displayName) == [recording.displayName],
+        "history should ignore transcript segment and unrelated JSON sidecars"
+    )
 }
 
 private func testRenamesSidecarsTogether() throws {
