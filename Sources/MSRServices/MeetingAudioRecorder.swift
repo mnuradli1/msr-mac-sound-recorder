@@ -340,7 +340,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
     private var stream: SCStream?
     private var writer: AVAssetWriter?
     private var systemInput: AVAssetWriterInput?
-    private var microphoneInput: AVAssetWriterInput?
     private var didStartSession = false
     private var outputURL: URL?
 
@@ -356,7 +355,7 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         self.onSourceLevelUpdate = onSourceLevelUpdate
     }
 
-    func start(source: AudioSource, outputURL: URL) async throws {
+    func start(source _: AudioSource, outputURL: URL) async throws {
         self.outputURL = outputURL
         let content: SCShareableContent
         do {
@@ -377,10 +376,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        if #available(macOS 15.0, *) {
-            configuration.captureMicrophone = source == .micAndSystem
-        }
-
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
         let systemInput = makeAudioInput()
         guard writer.canAdd(systemInput) else {
@@ -389,15 +384,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         writer.add(systemInput)
         self.systemInput = systemInput
 
-        if #available(macOS 15.0, *), source == .micAndSystem {
-            let microphoneInput = makeAudioInput()
-            guard writer.canAdd(microphoneInput) else {
-                throw RecordingError.writerFailed("Microphone audio input could not be added.")
-            }
-            writer.add(microphoneInput)
-            self.microphoneInput = microphoneInput
-        }
-
         guard writer.startWriting() else {
             throw RecordingError.writerFailed(writer.error?.localizedDescription ?? "Writer failed to start.")
         }
@@ -405,9 +391,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        if #available(macOS 15.0, *), source == .micAndSystem {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue)
-        }
         self.stream = stream
         try await stream.startCapture()
     }
@@ -418,7 +401,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
             stream = nil
             writer = nil
             systemInput = nil
-            microphoneInput = nil
             didStartSession = false
             onLevelUpdate?(0)
             onSourceLevelUpdate?(.system, 0)
@@ -436,7 +418,6 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
             didStartSession = true
         }
         systemInput?.markAsFinished()
-        microphoneInput?.markAsFinished()
         do {
             try await finishWriter()
         } catch {
@@ -451,15 +432,7 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else {
             return
         }
-        let input: AVAssetWriterInput?
-        if type == .audio {
-            input = systemInput
-        } else if #available(macOS 15.0, *), type == .microphone {
-            input = microphoneInput
-        } else {
-            input = nil
-        }
-        guard let writer, let input else {
+        guard type == .audio, let writer, let input = systemInput else {
             return
         }
         if !didStartSession {
@@ -470,15 +443,8 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
             input.append(sampleBuffer)
             let level = AudioSampleLevelMeter.normalizedLevel(from: sampleBuffer)
             onLevelUpdate?(level)
-            onSourceLevelUpdate?(signalChannel(for: type), level)
+            onSourceLevelUpdate?(.system, level)
         }
-    }
-
-    private func signalChannel(for type: SCStreamOutputType) -> AudioSignalChannel {
-        if #available(macOS 15.0, *), type == .microphone {
-            return .microphone
-        }
-        return .system
     }
 
     private func makeAudioInput() -> AVAssetWriterInput {
