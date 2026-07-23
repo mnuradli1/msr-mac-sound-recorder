@@ -1080,7 +1080,12 @@ private func testAudioTrackMixerConcatenatesSegmentsSequentially() async throws 
     let tracks = try await asset.loadTracks(withMediaType: .audio)
     let duration = try await asset.load(.duration)
     try expect(tracks.count == 1, "concatenated output should contain one audio track")
-    try expect(duration.seconds > 0.60, "concatenated duration should add both segment durations")
+    let expectedDuration = 0.70
+    let encoderTolerance = 0.15
+    try expect(
+        abs(duration.seconds - expectedDuration) <= encoderTolerance,
+        "concatenated duration should add both segments within AAC tolerance (actual: \(duration.seconds))"
+    )
 }
 
 private func testAudioTrackMixerExportsSingleTrack() async throws {
