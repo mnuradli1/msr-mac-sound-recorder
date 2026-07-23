@@ -1,13 +1,15 @@
 import SwiftUI
 
 struct WaveformView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     let samples: [Float]
     let level: Float
     let isActive: Bool
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-            VStack(alignment: .leading, spacing: 6) {
+        let renderDate = Date()
+        VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     HStack(spacing: 6) {
                         Circle()
@@ -23,7 +25,7 @@ struct WaveformView: View {
                         .foregroundStyle(.secondary)
                 }
                 GeometryReader { geometry in
-                    let bars = animatedSamples(at: timeline.date)
+                    let bars = animatedSamples(at: renderDate)
                     let spacing: CGFloat = 3
                     let barWidth = max(3, (geometry.size.width - spacing * CGFloat(max(0, bars.count - 1))) / CGFloat(max(1, bars.count)))
                     HStack(alignment: .center, spacing: spacing) {
@@ -31,18 +33,17 @@ struct WaveformView: View {
                             Capsule()
                                 .fill(barColor(index: index, count: bars.count))
                                 .frame(width: barWidth, height: max(4, geometry.size.height * CGFloat(sample)))
-                                .animation(.easeOut(duration: 0.08), value: sample)
+                                .animation(reduceMotion ? nil : .easeOut(duration: 0.08), value: sample)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
             }
             .padding(10)
-            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+            .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .controlBackgroundColor)) : AnyShapeStyle(.quaternary.opacity(0.55)), in: RoundedRectangle(cornerRadius: 8))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(statusText)
             .accessibilityValue("\(Int(level * 100)) percent")
-        }
     }
 
     private func animatedSamples(at date: Date) -> [Float] {
@@ -57,7 +58,7 @@ struct WaveformView: View {
             padded = Array(repeating: 0.04, count: target - samples.count) + samples
         }
         return padded.enumerated().map { index, sample in
-            let ripple = isActive && level > 0.02 ? realSignalRipple(index: index, time: time) : 0
+            let ripple = isActive && !reduceMotion && level > 0.02 ? realSignalRipple(index: index, time: time) : 0
             if isActive {
                 return max(0.04, min(1.0, sample + ripple))
             }

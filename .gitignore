@@ -4,6 +4,8 @@
 DerivedData/
 *.xcuserdata/
 *.xcuserstate
+.codegraph/
+graphify-out/
 
 .env
 .env.*

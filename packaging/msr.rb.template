@@ -1,0 +1,12 @@
+cask "msr" do
+  version "__VERSION__"
+  sha256 "__SHA256__"
+
+  url "__URL__"
+  name "MSR Meeting Recorder"
+  desc "Native macOS meeting recorder with system audio and AI notes"
+  homepage "https://github.com/mnuradli1/msr-mac-sound-recorder"
+
+  depends_on macos: ">= :sonoma"
+  app "MSR Meeting Recorder.app"
+end

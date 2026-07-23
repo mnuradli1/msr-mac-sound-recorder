@@ -97,6 +97,18 @@ public final class RecordingRecoveryService: @unchecked Sendable {
     private func recoverSession(_ manifest: RecordingSessionManifest, now: Date) async throws -> RecordingRecoveryResult {
         let manifestStore = RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager)
         let manifestURL = manifestStore.url(for: manifest.id)
+        if let finalRecordingID = manifest.finalRecordingID,
+           let published = try RecordingLibrary(folderURL: folderURL, fileManager: fileManager)
+            .loadRecordings().first(where: { $0.id == finalRecordingID }) {
+            try manifestStore.delete(manifest)
+            return RecordingRecoveryResult(
+                status: .recoveredSession(segmentCount: manifest.allSegments.count),
+                recording: published,
+                message: "Finished recovery for \(published.displayName).",
+                recoveredFiles: [published.audioURL.lastPathComponent],
+                failedFiles: []
+            )
+        }
         let segments = manifest.allSegments
         guard !segments.isEmpty else {
             try moveManifestSessionToFailed(manifest, extraFailedFiles: [])
@@ -110,6 +122,19 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         }
 
         let segmentURLs = segments.map { folderURL.appendingPathComponent($0.fileName) }
+        if let active = manifest.activeSegment,
+           let activeIndex = segments.firstIndex(where: { $0.fileName == active.fileName }),
+           !fileManager.fileExists(atPath: segmentURLs[activeIndex].path) {
+            let microphoneURL = manifest.microphoneFileName.map { folderURL.appendingPathComponent($0) }
+            let systemURL = manifest.systemFileName.map { folderURL.appendingPathComponent($0) }
+            let available = [systemURL, microphoneURL].compactMap { $0 }.filter { fileManager.fileExists(atPath: $0.path) }
+            if available.count == 2 {
+                try await AudioTrackMixer.mixToSingleM4A(inputs: available, outputURL: segmentURLs[activeIndex])
+                for url in available { try? fileManager.removeItem(at: url) }
+            } else if let only = available.first {
+                try fileManager.moveItem(at: only, to: segmentURLs[activeIndex])
+            }
+        }
         let missingFiles = zip(segments, segmentURLs)
             .filter { _, url in !fileManager.fileExists(atPath: url.path) }
             .map { segment, _ in segment.fileName }
@@ -156,7 +181,8 @@ public final class RecordingRecoveryService: @unchecked Sendable {
             durationSecondsOverride: duration,
             recoveredAt: now,
             recoveryNote: "Recovered \(segmentURLs.count) segment\(segmentURLs.count == 1 ? "" : "s") from an interrupted recording session.",
-            segmentCount: segmentURLs.count
+            segmentCount: segmentURLs.count,
+            recordingID: manifest.finalRecordingID ?? manifest.id
         )
 
         if segmentURLs.count > 1 {

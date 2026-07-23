@@ -9,12 +9,18 @@ public protocol AIService: AnyObject, Sendable {
 public enum LocalAPIError: Error, LocalizedError {
     case notFound
     case badRequest(String)
+    case unauthorized
+    case forbidden(String)
 
     public var errorDescription: String? {
         switch self {
         case .notFound:
             return "Endpoint not found."
         case let .badRequest(message):
+            return message
+        case .unauthorized:
+            return "A valid bearer token is required."
+        case let .forbidden(message):
             return message
         }
     }

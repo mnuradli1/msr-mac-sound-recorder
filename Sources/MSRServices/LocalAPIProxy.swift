@@ -3,11 +3,13 @@ import MSRCore
 
 public final class LocalAPIProxy: @unchecked Sendable {
     private let aiService: AIService
+    private let pathAuthorization: (@Sendable (URL) -> Bool)?
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    public init(aiService: AIService) {
+    public init(aiService: AIService, pathAuthorization: (@Sendable (URL) -> Bool)? = nil) {
         self.aiService = aiService
+        self.pathAuthorization = pathAuthorization
     }
 
     public func handle(method: String, path: String, body: Data) async throws -> LocalAPIHTTPResponse {
@@ -19,8 +21,12 @@ public final class LocalAPIProxy: @unchecked Sendable {
             guard !request.audioPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw LocalAPIError.badRequest("audioPath is required.")
             }
+            let audioURL = URL(fileURLWithPath: request.audioPath).standardizedFileURL
+            if let pathAuthorization, !pathAuthorization(audioURL) {
+                throw LocalAPIError.forbidden("The requested audio file is outside the approved recordings library.")
+            }
             let response = try await aiService.transcribe(
-                audioURL: URL(fileURLWithPath: request.audioPath),
+                audioURL: audioURL,
                 provider: request.provider
             )
             return try json(response)

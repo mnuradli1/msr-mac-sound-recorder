@@ -72,7 +72,8 @@ private func testCreatesMetadataAndReloads() throws {
     )
 
     try expect(recording.displayName == "Weekly Sync", "display name should be saved")
-    try expect(recording.audioURL.lastPathComponent == "Weekly Sync.m4a", "audio should use sanitized name")
+    try expect(recording.audioURL.lastPathComponent.hasPrefix("recording-"), "audio should use immutable storage key")
+    try expect(recording.audioURL.pathExtension == "m4a", "audio should retain its format")
     try expect(FileManager.default.fileExists(atPath: recording.metadataURL.path), "metadata sidecar should exist")
 
     let reloaded = try RecordingLibrary(folderURL: folder.url).loadRecordings()
@@ -130,12 +131,12 @@ private func testRenamesSidecarsTogether() throws {
     let renamed = try library.rename(recording, to: "Client Demo / Roadmap?")
 
     try expect(renamed.displayName == "Client Demo Roadmap", "rename should sanitize display name")
-    try expect(FileManager.default.fileExists(atPath: renamed.audioURL.path), "renamed audio should exist")
+    try expect(renamed.audioURL == recording.audioURL, "rename should not move immutable audio")
+    try expect(renamed.metadataURL == recording.metadataURL, "rename should not move immutable metadata")
+    try expect(FileManager.default.fileExists(atPath: renamed.audioURL.path), "recording audio should exist")
     try expect(FileManager.default.fileExists(atPath: renamed.metadataURL.path), "renamed metadata should exist")
     try expect(FileManager.default.fileExists(atPath: renamed.transcriptURL.path), "renamed transcript should exist")
     try expect(FileManager.default.fileExists(atPath: renamed.summaryURL.path), "renamed summary should exist")
-    try expect(!FileManager.default.fileExists(atPath: recording.audioURL.path), "old audio should be moved")
-    try expect(!FileManager.default.fileExists(atPath: recording.metadataURL.path), "old metadata should be moved")
 }
 
 private func testDefaultsProviderToElevenLabs() {
@@ -177,7 +178,7 @@ private func testElevenLabsTranscriptionUsesLongRequestTimeout() async throws {
     _ = try await client.transcribe(audioURL: audioURL, apiKey: "test-key")
 
     let timeout = CapturingURLProtocol.capturedTimeoutInterval
-    try expect((timeout ?? 0) >= 3_600, "long transcription request timeout should be at least one hour")
+    try expect((timeout ?? 0) >= 900, "transcription request timeout should allow fifteen minutes")
 }
 
 private func testElevenLabsTranscriptionEnablesDiarizationAndFormatsSpeakerTurns() async throws {
@@ -287,11 +288,11 @@ private func testTranscriptionJobStoreRoundTripsHiddenJob() throws {
     let store = TranscriptionJobStore(folderURL: folder.url)
 
     try store.save(job)
-    let storedURL = store.url(for: recordingID)
+    let storedURL = store.url(for: job.id)
     let loaded = try store.load(recordingID: recordingID)
     let recordings = try RecordingLibrary(folderURL: folder.url).loadRecordings()
 
-    try expect(storedURL.lastPathComponent == ".transcription-\(recordingID.uuidString).json", "transcription job should use a hidden filename")
+    try expect(storedURL.lastPathComponent == ".transcription-\(job.id.uuidString).json", "transcription job should use an independent hidden job ID")
     try expect(FileManager.default.fileExists(atPath: storedURL.path), "transcription job should be written")
     try expect(loaded == job, "transcription job should round-trip through JSON")
     try expect(recordings.isEmpty, "hidden transcription jobs should not appear in recording history")
@@ -331,8 +332,8 @@ private func testTranscriptionJobTracksRunningCompletedFailedAttempts() throws {
         at: Date(timeIntervalSince1970: 3_000)
     )
     interrupted.markInterruptedIfRunning(at: Date(timeIntervalSince1970: 3_100))
-    try expect(interrupted.status == .failed, "running job from previous launch should become retryable")
-    try expect(interrupted.errorMessage?.contains("interrupted") == true, "interrupted job should explain retry state")
+    try expect(interrupted.status == .queued, "running job from previous launch should be requeued")
+    try expect(interrupted.errorMessage?.contains("queued again") == true, "interrupted job should explain retry state")
 }
 
 private func testTranscriptionJobQueueLifecycleAndStoreLoadAll() throws {
@@ -470,6 +471,23 @@ private func testLocalHTTPServerHealthEndpoint() async throws {
     let statusCode = (response as? HTTPURLResponse)?.statusCode
     try expect(statusCode == 200, "HTTP /health should return 200")
     try expect(String(data: data, encoding: .utf8)?.contains("ok") == true, "HTTP /health body should be ok")
+
+    var unauthorized = URLRequest(url: URL(string: "http://127.0.0.1:48937/transcribe")!)
+    unauthorized.httpMethod = "POST"
+    unauthorized.httpBody = try JSONEncoder().encode(
+        TranscribeRequest(audioPath: "/tmp/auth-check.m4a", provider: .elevenLabs)
+    )
+    let (_, unauthorizedResponse) = try await URLSession.shared.data(for: unauthorized)
+    try expect((unauthorizedResponse as? HTTPURLResponse)?.statusCode == 401, "HTTP provider routes should require the bearer token")
+
+    var authorized = unauthorized
+    authorized.setValue("Bearer \(server.bearerToken)", forHTTPHeaderField: "Authorization")
+    let (authorizedData, authorizedResponse) = try await URLSession.shared.data(for: authorized)
+    let authorizedStatus = (authorizedResponse as? HTTPURLResponse)?.statusCode
+    try expect(
+        authorizedStatus == 200,
+        "HTTP provider routes should accept the per-run bearer token (status \(authorizedStatus ?? -1), body \(String(data: authorizedData, encoding: .utf8) ?? ""))"
+    )
 }
 
 private func testAPIKeyNormalizerRemovesPasteWhitespace() throws {
@@ -921,7 +939,7 @@ private func testRecordingLibraryPersistsRecoveryMetadataAndDurationOverride() t
     try expect(reloaded?.metadata.recoveredAt == recoveredAt, "recovered timestamp should be persisted")
     try expect(reloaded?.metadata.recoveryNote == "Recovered microphone only after system track failed.", "recovery note should be persisted")
     try expect(reloaded?.metadata.segmentCount == 2, "segment count should be persisted")
-    try expect(recording.audioURL.lastPathComponent == "Recovered Meeting.m4a", "recovered audio should use requested display name")
+    try expect(recording.audioURL.lastPathComponent.hasPrefix("recording-"), "recovered audio should use immutable storage")
 }
 
 private func testRecoveryUsesSessionManifestToRecoverSegments() async throws {

@@ -1,10 +1,13 @@
 import AppKit
 import AVFoundation
 import CoreGraphics
+import Combine
+import CryptoKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import MSRCore
+import MSRPresentation
 import MSRServices
 
 enum AppNoticeSeverity {
@@ -12,6 +15,13 @@ enum AppNoticeSeverity {
     case success
     case warning
     case error
+}
+
+enum RecordingDetailTab: String, CaseIterable, Identifiable {
+    case review = "Review"
+    case notes = "Notes"
+    case export = "Export"
+    var id: String { rawValue }
 }
 
 struct SetupHealthItem: Identifiable, Equatable {
@@ -24,12 +34,22 @@ struct SetupHealthItem: Identifiable, Equatable {
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    let presentation: PresentationCoordinator
     @Published var recordings: [RecordingItem] = []
     @Published var selectedRecording: RecordingItem?
     @Published var selectedSource: AudioSource = .micAndSystem
     @Published var settings: AppSettings
     @Published var workflowState: RecordingWorkflowState = .ready
-    @Published var statusMessage = "Ready"
+    @Published var statusMessage = "Ready" {
+        didSet {
+            guard statusMessage != oldValue else { return }
+            NSAccessibility.post(
+                element: NSApp as Any,
+                notification: .announcementRequested,
+                userInfo: [.announcement: statusMessage, .priority: NSAccessibilityPriorityLevel.medium.rawValue]
+            )
+        }
+    }
     @Published var transcriptText = ""
     @Published var summaryText = ""
     @Published var recordingSearchQuery = ""
@@ -49,7 +69,16 @@ final class AppViewModel: ObservableObject {
     @Published var selectedTranscriptionJob: TranscriptionJob?
     @Published var transcriptionJobs: [TranscriptionJob] = []
     @Published var transcriptSegments: [TranscriptSegment] = []
+    @Published var reviewWaveform: [Float] = []
+    @Published var trimStartSeconds: TimeInterval = 0
+    @Published var trimEndSeconds: TimeInterval = 0
+    @Published var selectedDetailTab: RecordingDetailTab = .review
+    @Published var selectedExportFormat: TranscriptExportFormat = .markdown
+    @Published var exportPreview = ""
+    @Published var transcriptSaveMessage = ""
+    @Published var lastExportURL: URL?
     @Published var setupHealthItems: [SetupHealthItem] = []
+    @Published var microphoneDevices: [MicrophoneDevice] = []
     @Published var credentialStatusMessage = ""
     @Published var credentialStatusSeverity: AppNoticeSeverity = .info
     @Published var isTestingCredential = false
@@ -57,13 +86,14 @@ final class AppViewModel: ObservableObject {
     @Published var recoveryMessage = ""
     @Published var recoveryNoticeSeverity: AppNoticeSeverity = .info
     @Published private var recordingSearchDocuments: [RecordingSearchDocument] = []
+    @Published private var filteredRecordingIDs: [UUID]?
 
     private let settingsStore = UserDefaultsSettingsStore()
     private let keyStore = APIKeyStore()
     private let credentialValidator = CredentialValidator()
     private let recorder: AudioRecording
     private let aiService: ProviderAIService
-    private let proxy: LocalAPIProxy
+    private let libraryFactory: (URL) -> any RecordingLibraryServing
     private var localServer: LocalHTTPServer?
     private var recordingSessionClock: RecordingSessionClock?
     private var temporaryAudioURL: URL?
@@ -81,12 +111,47 @@ final class AppViewModel: ObservableObject {
     private var powerObserverTokens: [NSObjectProtocol] = []
     private var sleepPreventionActivity: NSObjectProtocol?
     private var settingsWindow: NSWindow?
+    private var securityScopedFolderURL: URL?
+    private let waveformAnalyzer = WaveformAnalyzer(capacity: 64)
+    private var waveformTask: Task<Void, Never>?
+    private var transcriptAutosaveTask: Task<Void, Never>?
+    private var summaryAutosaveTask: Task<Void, Never>?
+    private var recordingSearchTask: Task<Void, Never>?
+    private var windowSaveTask: Task<Void, Never>?
+    private let globalHotkeyService = GlobalHotkeyService()
+    private let folderWatcher = RecordingFolderWatcher()
+    private let searchIndexer = RecordingSearchIndexer(capacity: 64)
+    private var searchIndexTask: Task<Void, Never>?
+    private var watchedFolderPath: String?
 
-    init(recorder: AudioRecording = MeetingAudioRecorder()) {
-        settings = settingsStore.load()
+    init(
+        recorder: AudioRecording = MeetingAudioRecorder(),
+        libraryFactory: @escaping (URL) -> any RecordingLibraryServing = { RecordingLibrary(folderURL: $0) }
+    ) {
+        let loadedSettings = settingsStore.load()
+        settings = loadedSettings
+        presentation = PresentationCoordinator(settings: loadedSettings)
         self.recorder = recorder
+        self.libraryFactory = libraryFactory
         aiService = ProviderAIService(keyStore: keyStore)
-        proxy = LocalAPIProxy(aiService: aiService)
+        selectedSource = settings.preferredSource
+        self.recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
+        if let bookmark = settings.recordingsFolderBookmark {
+            var stale = false
+            if let url = try? URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ) {
+                _ = url.startAccessingSecurityScopedResource()
+                securityScopedFolderURL = url
+                if stale,
+                   let refreshed = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                    settings.recordingsFolderBookmark = refreshed
+                }
+            }
+        }
         self.recorder.onLevelUpdate = { [weak self] level in
             Task { @MainActor in
                 self?.updateFallbackInputLevel(level)
@@ -97,6 +162,43 @@ final class AppViewModel: ObservableObject {
                 self?.updateSourceLevel(channel, level)
             }
         }
+        bindPresentationModels()
+    }
+
+    private func bindPresentationModels() {
+        $recordings.assign(to: &presentation.library.$recordings)
+        $selectedRecording.assign(to: &presentation.library.$selectedRecording)
+        $recordingSearchQuery.assign(to: &presentation.library.$searchQuery)
+        $renameDraft.assign(to: &presentation.library.$renameDraft)
+        $showingRename.assign(to: &presentation.library.$showingRename)
+
+        $selectedSource.assign(to: &presentation.recordingSession.$selectedSource)
+        $workflowState.assign(to: &presentation.recordingSession.$workflowState)
+        $inputLevel.assign(to: &presentation.recordingSession.$inputLevel)
+        $microphoneLevel.assign(to: &presentation.recordingSession.$microphoneLevel)
+        $systemLevel.assign(to: &presentation.recordingSession.$systemLevel)
+        $waveform.assign(to: &presentation.recordingSession.$waveform)
+        $recordingElapsed.assign(to: &presentation.recordingSession.$elapsed)
+
+        $isPlaying.assign(to: &presentation.playback.$isPlaying)
+        $playbackPosition.assign(to: &presentation.playback.$position)
+        $playbackDuration.assign(to: &presentation.playback.$duration)
+        $reviewWaveform.assign(to: &presentation.playback.$waveform)
+        $trimStartSeconds.assign(to: &presentation.playback.$trimStart)
+        $trimEndSeconds.assign(to: &presentation.playback.$trimEnd)
+
+        $transcriptionJobs.assign(to: &presentation.queue.$jobs)
+        $selectedTranscriptionJob.assign(to: &presentation.queue.$selectedJob)
+        $transcriptionStartedAt.assign(to: &presentation.queue.$startedAt)
+
+        $transcriptText.assign(to: &presentation.notes.$transcript)
+        $summaryText.assign(to: &presentation.notes.$summary)
+        $transcriptSegments.assign(to: &presentation.notes.$segments)
+        $selectedExportFormat.assign(to: &presentation.notes.$exportFormat)
+        $exportPreview.assign(to: &presentation.notes.$exportPreview)
+        $transcriptSaveMessage.assign(to: &presentation.notes.$saveMessage)
+        $lastExportURL.assign(to: &presentation.notes.$lastExportURL)
+        $settings.assign(to: &presentation.settings.$settings)
     }
 
     var isRecording: Bool {
@@ -243,6 +345,14 @@ final class AppViewModel: ObservableObject {
         !visibleTranscriptionJobs.isEmpty
     }
 
+    var recentTranscriptionHistory: [TranscriptionJob] {
+        transcriptionJobs
+            .filter { $0.status == .completed || $0.status == .cancelled }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(20)
+            .map { $0 }
+    }
+
     var selectedRecordingIsTranscribing: Bool {
         guard let selectedRecording else { return false }
         return job(for: selectedRecording.id)?.status == .running
@@ -273,7 +383,21 @@ final class AppViewModel: ObservableObject {
     }
 
     var filteredRecordings: [RecordingItem] {
-        RecordingSearch.filter(recordingSearchDocuments, query: recordingSearchQuery).map(\.recording)
+        let matches: [RecordingItem]
+        if let filteredRecordingIDs {
+            let lookup = Dictionary(uniqueKeysWithValues: recordingSearchDocuments.map { ($0.recording.id, $0.recording) })
+            matches = filteredRecordingIDs.compactMap { lookup[$0] }
+        } else {
+            matches = recordingSearchDocuments.map(\.recording)
+        }
+        switch settings.sortOrder {
+        case .newest: return matches.sorted { $0.startedAt > $1.startedAt }
+        case .oldest: return matches.sorted { $0.startedAt < $1.startedAt }
+        case .nameAscending: return matches.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        case .nameDescending: return matches.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedDescending }
+        case .durationLongest: return matches.sorted { $0.durationSeconds > $1.durationSeconds }
+        case .durationShortest: return matches.sorted { $0.durationSeconds < $1.durationSeconds }
+        }
     }
 
     var recordingSearchResultCount: Int {
@@ -288,6 +412,7 @@ final class AppViewModel: ObservableObject {
     }
 
     var recordingsFolderURL: URL {
+        if let securityScopedFolderURL { return securityScopedFolderURL }
         if let path = settings.recordingsFolderPath, !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
@@ -301,12 +426,20 @@ final class AppViewModel: ObservableObject {
     }
 
     func startLocalAPI() {
+        guard settings.localAPIEnabled else {
+            localAPIStatusMessage = "Local API disabled"
+            return
+        }
         guard localServer == nil else { return }
-        let server = LocalHTTPServer(proxy: proxy)
+        let approvedFolder = recordingsFolderURL.standardizedFileURL
+        let securedProxy = LocalAPIProxy(aiService: aiService) { url in
+            StoragePath.isContained(url, in: approvedFolder)
+        }
+        let server = LocalHTTPServer(proxy: securedProxy)
         do {
             try server.start()
             localServer = server
-            localAPIStatusMessage = "Local API running on 127.0.0.1:\(server.port)"
+            localAPIStatusMessage = "Local API running on 127.0.0.1:\(server.port) · token \(server.bearerToken)"
             if statusMessage.hasPrefix("Local API") {
                 statusMessage = "Ready"
             }
@@ -316,8 +449,19 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func stopLocalAPI() {
+        localServer?.stop()
+        localServer = nil
+        localAPIStatusMessage = "Local API disabled"
+    }
+
     func bootstrap() async {
         installPowerObservers()
+        microphoneDevices = AudioDeviceCatalog.microphones()
+        globalHotkeyService.configure(enabled: settings.globalShortcutEnabled) { [weak self] in
+            Task { await self?.toggleRecording() }
+        }
+        startLibraryWatcher()
         loadRecordings()
         loadTranscriptionJobs(markInterruptedRunning: true)
         refreshSetupHealth()
@@ -328,7 +472,16 @@ final class AppViewModel: ObservableObject {
     func loadRecordings() {
         do {
             recordings = try library().loadRecordings()
-            recordingSearchDocuments = makeSearchDocuments(for: recordings)
+            recordingSearchDocuments = recordings.map { RecordingSearchDocument(recording: $0) }
+            searchIndexTask?.cancel()
+            let snapshot = recordings
+            searchIndexTask = Task { [weak self] in
+                guard let self else { return }
+                let documents = await searchIndexer.documents(for: snapshot)
+                guard !Task.isCancelled, self.recordings.map(\.id) == snapshot.map(\.id) else { return }
+                self.recordingSearchDocuments = documents
+                self.scheduleRecordingSearch()
+            }
             if let selectedRecording,
                let refreshed = recordings.first(where: { $0.id == selectedRecording.id }) {
                 self.selectedRecording = refreshed
@@ -346,6 +499,26 @@ final class AppViewModel: ObservableObject {
 
     func clearRecordingSearch() {
         recordingSearchQuery = ""
+        scheduleRecordingSearch()
+    }
+
+    func scheduleRecordingSearch() {
+        recordingSearchTask?.cancel()
+        let documents = recordingSearchDocuments
+        let query = recordingSearchQuery
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            filteredRecordingIDs = nil
+            return
+        }
+        recordingSearchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            let ids = await Task.detached(priority: .userInitiated) {
+                RecordingSearch.filter(documents, query: query).map { $0.recording.id }
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.filteredRecordingIDs = ids
+        }
     }
 
     func select(_ recording: RecordingItem) {
@@ -355,6 +528,7 @@ final class AppViewModel: ObservableObject {
                 : "Finish the current task first."
             return
         }
+        flushTranscriptEdits()
         selectedRecording = recording
         loadSelectedSidecars()
         preparePlayback(for: recording)
@@ -369,6 +543,32 @@ final class AppViewModel: ObservableObject {
         guard let target else { return }
         NSWorkspace.shared.activateFileViewerSelecting([target.audioURL])
         statusMessage = "Showing \(target.displayName) in Finder"
+    }
+
+    func selectAdjacentRecording(offset: Int) {
+        let items = filteredRecordings
+        guard !items.isEmpty else { return }
+        let current = selectedRecording.flatMap { selected in items.firstIndex(where: { $0.id == selected.id }) } ?? 0
+        select(items[min(max(0, current + offset), items.count - 1)])
+    }
+
+    func checkForUpdates() {
+        if let url = URL(string: "https://github.com/mnuradli1/msr-mac-sound-recorder/releases") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func persistWindowSize(_ size: CGSize) {
+        guard size.width >= 980, size.height >= 640 else { return }
+        guard abs(settings.windowWidth - size.width) > 0.5 || abs(settings.windowHeight - size.height) > 0.5 else { return }
+        settings.windowWidth = size.width
+        settings.windowHeight = size.height
+        windowSaveTask?.cancel()
+        windowSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, let self else { return }
+            self.settingsStore.save(self.settings)
+        }
     }
 
     func openSettingsWindow() {
@@ -400,9 +600,42 @@ final class AppViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.directoryURL = recordingsFolderURL
         if panel.runModal() == .OK, let url = panel.url {
-            settings.recordingsFolderPath = url.path
-            saveSettings()
-            loadRecordings()
+            let gainedScope = url.startAccessingSecurityScopedResource()
+            do {
+                try preflightRecordingsFolder(url)
+                let bookmark = try url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+                securityScopedFolderURL?.stopAccessingSecurityScopedResource()
+                securityScopedFolderURL = url
+                settings.recordingsFolderPath = url.path
+                settings.recordingsFolderBookmark = bookmark
+                saveSettings()
+                loadRecordings()
+            } catch {
+                if gainedScope { url.stopAccessingSecurityScopedResource() }
+                statusMessage = "The recordings folder was not changed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func preflightRecordingsFolder(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        _ = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+        let probe = url.appendingPathComponent(".msr-write-probe-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: probe.path, contents: Data("MSR".utf8)) else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: probe)
+            try handle.synchronize()
+            try handle.close()
+            try FileManager.default.removeItem(at: probe)
+        } catch {
+            try? FileManager.default.removeItem(at: probe)
+            throw error
         }
     }
 
@@ -415,13 +648,17 @@ final class AppViewModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.audio, .movie]
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.wav, .mp3, .mpeg4Audio]
         panel.directoryURL = recordingsFolderURL
         panel.message = "Choose an audio or video file to import for transcription."
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await importRecording(from: url) }
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        Task { await importRecordings(from: panel.urls) }
+    }
+
+    func importRecordings(from urls: [URL]) async {
+        for url in urls { await importRecording(from: url) }
     }
 
     func importRecording(from url: URL) async {
@@ -458,7 +695,7 @@ final class AppViewModel: ObservableObject {
     func toggleRecording() async {
         await performRecordingAction {
             if self.isRecording {
-                await self.finalizeRecordingSession()
+                await self.runNonCancellableFinalization()
             } else if self.workflowState.isPaused {
                 await self.resumeRecordingSession()
             } else {
@@ -475,7 +712,7 @@ final class AppViewModel: ObservableObject {
 
     func stopRecording() async {
         await performRecordingAction {
-            await self.finalizeRecordingSession()
+            await self.runNonCancellableFinalization()
         }
     }
 
@@ -490,7 +727,7 @@ final class AppViewModel: ObservableObject {
             if self.isRecording {
                 await self.pauseCurrentRecording(reason: .manual)
             } else if self.workflowState.isPaused {
-                await self.finalizeRecordingSession()
+                await self.runNonCancellableFinalization()
             }
         }
     }
@@ -556,10 +793,13 @@ final class AppViewModel: ObservableObject {
         stopPlayback()
 
         do {
+            try ensureMinimumRecordingSpace()
             let startedAt = Date()
             let temporaryURL = try makeTemporaryAudioURL(source: source)
             let requestedName = defaultMeetingName(for: startedAt)
             let manifest = RecordingSessionManifest(
+                state: .starting,
+                finalRecordingID: UUID(),
                 source: source,
                 requestedName: requestedName,
                 startedAt: startedAt,
@@ -573,18 +813,31 @@ final class AppViewModel: ObservableObject {
             currentSessionManifest = manifest
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
+            var capturingManifest = manifest
+            capturingManifest.state = .capturing
+            capturingManifest.microphoneFileName = recorder.captureArtifacts?.microphoneFileName
+            capturingManifest.systemFileName = recorder.captureArtifacts?.systemFileName
+            capturingManifest.updatedAt = Date()
+            try manifestStore().save(capturingManifest)
             recordingSessionClock = RecordingSessionClock(startedAt: startedAt)
             completedSegmentURLs = []
             currentSessionSource = source
             currentSessionName = requestedName
+            currentSessionManifest = capturingManifest
             workflowState = .recording(source: source)
             recordingElapsed = 0
             startRecordingTimer()
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
         } catch {
-            if let currentSessionManifest {
-                try? manifestStore().delete(currentSessionManifest)
+            if recorder.isRecording {
+                try? await recorder.stop()
+            }
+            if var interrupted = currentSessionManifest {
+                interrupted.state = .failed
+                interrupted.recoveryNote = error.localizedDescription
+                interrupted.updatedAt = Date()
+                try? manifestStore().save(interrupted)
             }
             workflowState = .failed(error.localizedDescription)
             temporaryAudioURL = nil
@@ -609,6 +862,7 @@ final class AppViewModel: ObservableObject {
         resetSignalLevels()
 
         do {
+            try ensureMinimumRecordingSpace()
             let temporaryURL = try makeTemporaryAudioURL(source: source)
             var manifest = try currentManifestFallback(source: source, clock: clock)
             let resumedAt = Date()
@@ -620,6 +874,11 @@ final class AppViewModel: ObservableObject {
             try manifestStore().save(manifest)
             temporaryAudioURL = temporaryURL
             try await recorder.start(source: source, outputURL: temporaryURL)
+            manifest.state = .capturing
+            manifest.microphoneFileName = recorder.captureArtifacts?.microphoneFileName
+            manifest.systemFileName = recorder.captureArtifacts?.systemFileName
+            manifest.updatedAt = Date()
+            try manifestStore().save(manifest)
             clock.resume(at: resumedAt)
             recordingSessionClock = clock
             currentSessionManifest = manifest
@@ -628,12 +887,20 @@ final class AppViewModel: ObservableObject {
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
         } catch {
-            if let currentSessionManifest {
-                try? manifestStore().save(currentSessionManifest)
+            if recorder.isRecording {
+                try? await recorder.stop()
             }
-            workflowState = .paused(source: source, reason: clock.pauseReason ?? .manual)
+            if var interrupted = currentSessionManifest {
+                interrupted.state = .failed
+                interrupted.recoveryNote = error.localizedDescription
+                interrupted.updatedAt = Date()
+                try? manifestStore().save(interrupted)
+            }
+            workflowState = .failed(error.localizedDescription)
             temporaryAudioURL = nil
             resetSignalLevels()
+            recoveryMessage = "The interrupted segment was preserved for recovery."
+            recoveryNoticeSeverity = .warning
             statusMessage = error.localizedDescription
         }
     }
@@ -693,6 +960,13 @@ final class AppViewModel: ObservableObject {
 
         do {
             var finalizedClock = clock
+            var finalizingManifest = try currentManifestFallback(source: source, clock: finalizedClock)
+            finalizingManifest.state = .finalizing
+            finalizingManifest.finalRecordingID = finalizingManifest.finalRecordingID ?? UUID()
+            finalizingManifest.finalizationProgress = 0.1
+            finalizingManifest.updatedAt = Date()
+            try manifestStore().save(finalizingManifest)
+            currentSessionManifest = finalizingManifest
             if wasRecording, let temporaryAudioURL = activeTemporaryAudioURL {
                 try await recorder.stop()
                 let stoppedAt = Date()
@@ -704,6 +978,9 @@ final class AppViewModel: ObservableObject {
                     reason: .manual,
                     updatedAt: stoppedAt
                 )
+                manifest.state = .finalizing
+                manifest.finalRecordingID = finalizingManifest.finalRecordingID
+                manifest.finalizationProgress = 0.3
                 try manifestStore().save(manifest)
                 currentSessionManifest = manifest
                 completedSegmentURLs.append(temporaryAudioURL)
@@ -731,8 +1008,15 @@ final class AppViewModel: ObservableObject {
                     .system: systemPeakDuringRecording
                 ],
                 minimumDuration: 3,
-                silenceThreshold: 0.01
+                silenceThreshold: Float(settings.silenceThreshold)
             )
+            if var manifest = currentSessionManifest {
+                manifest.state = .finalizing
+                manifest.finalizationProgress = 0.75
+                manifest.updatedAt = Date()
+                try manifestStore().save(manifest)
+                currentSessionManifest = manifest
+            }
             let recording = try library().finishRecording(
                 temporaryAudioURL: finalTemporaryURL,
                 requestedName: currentSessionName ?? defaultMeetingName(for: finalizedClock.startedAt),
@@ -740,8 +1024,11 @@ final class AppViewModel: ObservableObject {
                 startedAt: finalizedClock.startedAt,
                 endedAt: endedAt,
                 durationSecondsOverride: finalizedClock.activeDuration(at: endedAt),
+                recoveredAt: nil,
+                recoveryNote: nil,
                 segmentCount: max(1, segmentURLs.count),
-                confidenceReport: confidenceReport
+                confidenceReport: confidenceReport,
+                recordingID: currentSessionManifest?.finalRecordingID
             )
             if segmentURLs.count > 1 {
                 for url in segmentURLs {
@@ -749,7 +1036,12 @@ final class AppViewModel: ObservableObject {
                 }
             }
             if let currentSessionManifest {
-                try? manifestStore().delete(currentSessionManifest)
+                var completed = currentSessionManifest
+                completed.state = .completed
+                completed.finalizationProgress = 1
+                completed.updatedAt = Date()
+                try? manifestStore().save(completed)
+                try? manifestStore().delete(completed)
             }
             clearRecordingSession()
             resetSignalLevels()
@@ -761,12 +1053,28 @@ final class AppViewModel: ObservableObject {
             statusMessage = segmentURLs.count > 1 ? "Recording saved from \(segmentURLs.count) segments" : "Recording saved"
         } catch {
             endSleepPrevention()
+            if var manifest = currentSessionManifest {
+                manifest.state = .failed
+                manifest.recoveryNote = error.localizedDescription
+                manifest.updatedAt = Date()
+                try? manifestStore().save(manifest)
+                currentSessionManifest = manifest
+            }
             workflowState = .failed(error.localizedDescription)
             recoveryMessage = "Could not finalize cleanly. Recovery will retry on next launch."
             recoveryNoticeSeverity = .error
             resetSignalLevels()
             statusMessage = error.localizedDescription
         }
+    }
+
+    private func runNonCancellableFinalization() async {
+        // An unstructured task does not inherit cancellation from a closing view,
+        // command, or menu action. Await it so callers cannot start another state
+        // transition before the durable finalization checkpoint completes.
+        await Task { @MainActor [self] in
+            await finalizeRecordingSession()
+        }.value
     }
 
     func startRename(_ recording: RecordingItem? = nil) {
@@ -841,6 +1149,16 @@ final class AppViewModel: ObservableObject {
     func transcribeSelected(replacingExistingTranscript: Bool = false) async {
         guard let selectedRecording, RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
         enqueueTranscription(recording: selectedRecording, replacingExistingTranscript: replacingExistingTranscript)
+    }
+
+    func transcribeSelectedRange() {
+        guard let selectedRecording else { return }
+        let fullRange = trimStartSeconds <= 0.01 && trimEndSeconds >= selectedRecording.durationSeconds - 0.1
+        enqueueTranscription(
+            recording: selectedRecording,
+            replacingExistingTranscript: hasTranscript,
+            trimRange: fullRange ? nil : AudioTrimRange(startSeconds: trimStartSeconds, endSeconds: trimEndSeconds)
+        )
     }
 
     func retranscribeSelected() async {
@@ -946,13 +1264,8 @@ final class AppViewModel: ObservableObject {
         workflowState = .summarizing
         statusMessage = "Summarizing"
         do {
-            let response = try await proxy.handle(
-                method: "POST",
-                path: "/summarize",
-                body: JSONEncoder().encode(SummarizeRequest(transcript: transcript))
-            )
-            let decoded = try JSONDecoder().decode(SummarizeResponse.self, from: response.body)
-            try library().writeSummary(decoded.markdown, for: selectedRecording)
+            let decoded = try await aiService.summarize(transcript: transcript)
+            _ = try library().writeSummary(decoded.markdown, for: selectedRecording)
             refreshSearchDocument(for: selectedRecording)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 summaryText = decoded.markdown
@@ -971,6 +1284,14 @@ final class AppViewModel: ObservableObject {
 
     func copySummary() {
         copy(summaryText)
+    }
+
+    func copyAllNotes() {
+        let sections = [
+            transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : "Transcript\n\n\(transcriptText)",
+            summaryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : "Summary\n\n\(summaryText)"
+        ].compactMap { $0 }
+        copy(sections.joined(separator: "\n\n---\n\n"))
     }
 
     func togglePlayback() {
@@ -1010,25 +1331,200 @@ final class AppViewModel: ObservableObject {
         playbackPosition = audioPlayer.currentTime
     }
 
+    func seekPlayback(to seconds: TimeInterval) {
+        guard let audioPlayer else { return }
+        audioPlayer.currentTime = min(max(0, seconds), audioPlayer.duration)
+        playbackPosition = audioPlayer.currentTime
+    }
+
+    func setPlaybackSpeed(_ speed: Double) {
+        settings.playbackSpeed = [0.75, 1, 1.25, 1.5, 2].min(by: { abs($0 - speed) < abs($1 - speed) }) ?? 1
+        audioPlayer?.enableRate = true
+        audioPlayer?.rate = Float(settings.playbackSpeed)
+        saveSettings()
+    }
+
+    func resetTrim() {
+        trimStartSeconds = 0
+        trimEndSeconds = selectedRecording?.durationSeconds ?? playbackDuration
+        updateExportPreview()
+    }
+
+    func saveTrimmedCopy() async {
+        guard let recording = selectedRecording else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Audio]
+        panel.nameFieldStringValue = "\(recording.displayName).trimmed.m4a"
+        panel.directoryURL = recordingsFolderURL
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            try await TranscriptionAudioPreparer.saveTrimmedCopy(
+                sourceURL: recording.audioURL,
+                destinationURL: destination,
+                range: AudioTrimRange(startSeconds: trimStartSeconds, endSeconds: trimEndSeconds)
+            )
+            lastExportURL = destination
+            statusMessage = "Trimmed copy saved"
+        } catch { statusMessage = error.localizedDescription }
+    }
+
+    func scheduleTranscriptAutosave() {
+        transcriptAutosaveTask?.cancel()
+        if let recording = selectedRecording,
+           ((try? String(contentsOf: recording.transcriptURL, encoding: .utf8)) ?? "") == transcriptText {
+            transcriptSaveMessage = ""
+            return
+        }
+        transcriptSaveMessage = "Unsaved changes"
+        transcriptAutosaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.flushTranscriptEdits() }
+        }
+        updateExportPreview()
+    }
+
+    func flushTranscriptEdits() {
+        transcriptAutosaveTask?.cancel()
+        transcriptAutosaveTask = nil
+        guard let recording = selectedRecording else { return }
+        if transcriptText.isEmpty, !FileManager.default.fileExists(atPath: recording.transcriptURL.path) { return }
+        if (try? String(contentsOf: recording.transcriptURL, encoding: .utf8)) == transcriptText {
+            transcriptSaveMessage = ""
+            return
+        }
+        do {
+            let updated = try library().writeTranscript(transcriptText, for: recording)
+            selectedRecording = updated
+            transcriptSaveMessage = "Saved"
+        } catch {
+            transcriptSaveMessage = "Save failed"
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func scheduleSummaryAutosave() {
+        summaryAutosaveTask?.cancel()
+        if let recording = selectedRecording,
+           ((try? String(contentsOf: recording.summaryURL, encoding: .utf8)) ?? "") == summaryText {
+            return
+        }
+        summaryAutosaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.flushSummaryEdits() }
+        }
+        updateExportPreview()
+    }
+
+    func flushSummaryEdits() {
+        summaryAutosaveTask?.cancel()
+        summaryAutosaveTask = nil
+        guard let recording = selectedRecording else { return }
+        if summaryText.isEmpty, !FileManager.default.fileExists(atPath: recording.summaryURL.path) { return }
+        if (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) == summaryText { return }
+        do { _ = try library().writeSummary(summaryText, for: recording) }
+        catch { statusMessage = error.localizedDescription }
+    }
+
+    func updateExportPreview() {
+        guard let recording = selectedRecording else { exportPreview = ""; return }
+        exportPreview = (try? TranscriptExporter.preview(
+            MeetingNotesExportInput(recording: recording, transcript: transcriptText, segments: transcriptSegments, summary: summaryText),
+            format: selectedExportFormat
+        )) ?? "This format is unavailable for the current transcript."
+    }
+
+    func exportSelected() {
+        guard let recording = selectedRecording else { return }
+        flushTranscriptEdits()
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(recording.displayName).export.\(selectedExportFormat.fileExtension)"
+        panel.directoryURL = recordingsFolderURL
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.export(
+                MeetingNotesExportInput(recording: recording, transcript: transcriptText, segments: transcriptSegments, summary: summaryText),
+                format: selectedExportFormat,
+                to: url
+            )
+            lastExportURL = url
+            statusMessage = "Exported \(url.lastPathComponent)"
+        } catch { statusMessage = error.localizedDescription }
+    }
+
+    func revealLastExport() {
+        guard let lastExportURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([lastExportURL])
+    }
+
     func saveSettings() {
         settingsStore.save(settings)
+        selectedSource = settings.preferredSource
+        recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
+        audioPlayer?.rate = Float(settings.playbackSpeed)
+        if settings.localAPIEnabled {
+            startLocalAPI()
+        } else {
+            stopLocalAPI()
+        }
+        globalHotkeyService.configure(enabled: settings.globalShortcutEnabled) { [weak self] in
+            Task { await self?.toggleRecording() }
+        }
+        startLibraryWatcher()
         refreshSetupHealth()
+    }
+
+    func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+    }
+
+    private func startLibraryWatcher() {
+        let folder = recordingsFolderURL
+        guard watchedFolderPath != folder.path else { return }
+        watchedFolderPath = folder.path
+        try? folderWatcher.start(folderURL: folder) { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.workflowState.isRecording, !self.workflowState.isBusy else { return }
+                self.loadRecordings()
+            }
+        }
     }
 
     func saveAPIKeys() {
         do {
             if !elevenLabsKeyDraft.isEmpty {
-                try keyStore.save(apiKey: elevenLabsKeyDraft, for: .elevenLabs)
+                if settings.rememberCredentials {
+                    try keyStore.save(apiKey: elevenLabsKeyDraft, for: .elevenLabs)
+                } else {
+                    try keyStore.setSession(apiKey: elevenLabsKeyDraft, for: .elevenLabs)
+                }
                 elevenLabsKeyDraft = ""
             }
             if !openAIKeyDraft.isEmpty {
-                try keyStore.save(apiKey: openAIKeyDraft, for: .openAI)
+                if settings.rememberCredentials {
+                    try keyStore.save(apiKey: openAIKeyDraft, for: .openAI)
+                } else {
+                    try keyStore.setSession(apiKey: openAIKeyDraft, for: .openAI)
+                }
                 openAIKeyDraft = ""
             }
             saveSettings()
             statusMessage = "Settings saved"
         } catch {
             workflowState = .failed(error.localizedDescription)
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func forgetAPIKeys() {
+        do {
+            try keyStore.forget(.elevenLabs)
+            try keyStore.forget(.openAI)
+            refreshSetupHealth()
+            statusMessage = "Saved API keys forgotten"
+        } catch {
             statusMessage = error.localizedDescription
         }
     }
@@ -1142,7 +1638,11 @@ final class AppViewModel: ObservableObject {
         setupHealthItems = [microphoneItem, screenItem, elevenLabsItem, openAIItem, folderItem]
     }
 
-    private func enqueueTranscription(recording: RecordingItem, replacingExistingTranscript: Bool) {
+    private func enqueueTranscription(
+        recording: RecordingItem,
+        replacingExistingTranscript: Bool,
+        trimRange: AudioTrimRange? = nil
+    ) {
         guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
         guard !hasPendingTranscription(for: recording.id) else {
             statusMessage = "Transcription already queued"
@@ -1157,7 +1657,9 @@ final class AppViewModel: ObservableObject {
             audioFileName: recording.audioURL.lastPathComponent,
             provider: settings.provider,
             replacingExistingTranscript: replacingExistingTranscript,
-            previousAttemptCount: previousAttemptCount
+            previousAttemptCount: previousAttemptCount,
+            trimStartSeconds: trimRange?.startSeconds,
+            trimEndSeconds: trimRange?.endSeconds
         )
 
         do {
@@ -1190,10 +1692,15 @@ final class AppViewModel: ObservableObject {
         while !Task.isCancelled {
             loadTranscriptionJobs()
             guard var job = transcriptionJobs
-                .filter({ $0.status == .queued })
-                .sorted(by: { $0.updatedAt < $1.updatedAt })
+                .filter({ $0.status == .queued && credentialAvailable(for: $0.provider) })
+                .sorted(by: { $0.queuedAt < $1.queuedAt })
                 .first else {
                 break
+            }
+
+            if recoverPublishedJobIfPossible(&job) {
+                saveTranscriptionJob(job)
+                continue
             }
 
             job.markRunning()
@@ -1213,31 +1720,54 @@ final class AppViewModel: ObservableObject {
         }
 
         do {
-            let request = TranscribeRequest(
-                audioPath: recording.audioURL.path,
-                provider: job.provider
+            let stableRecording = try library().rename(recording, to: recording.displayName)
+            let trimRange: AudioTrimRange? = {
+                guard let end = job.trimEndSeconds else { return nil }
+                return AudioTrimRange(startSeconds: job.trimStartSeconds ?? 0, endSeconds: end)
+            }()
+            let prepared = try await TranscriptionAudioPreparer.prepare(
+                sourceURL: stableRecording.audioURL,
+                durationSeconds: stableRecording.durationSeconds,
+                trimRange: trimRange,
+                compressionEnabled: settings.compressUploads
             )
-            let response = try await proxy.handle(
-                method: "POST",
-                path: "/transcribe",
-                body: JSONEncoder().encode(request)
-            )
+            defer { prepared.cleanUp() }
+            var running = job
+            running.usedUncompressedAudioFallback = prepared.usedUncompressedFallback
+            running.audioPreparationWarning = prepared.warning
+            saveTranscriptionJob(running)
+
+            let decoded = try await aiService.transcribe(audioURL: prepared.url, provider: job.provider)
             try Task.checkCancellation()
-            let decoded = try JSONDecoder().decode(TranscribeResponse.self, from: response.body)
             let segments = decoded.segments.isEmpty
                 ? TranscriptParser.segments(from: decoded.text)
                 : decoded.segments
-            try library().writeTranscript(decoded.text, for: recording)
-            try library().writeTranscriptSegments(segments, for: recording)
+            let hash = Self.sha256(decoded.text)
+            running.markPublishing(
+                transcriptFileName: stableRecording.transcriptURL.lastPathComponent,
+                contentSHA256: hash
+            )
+            saveTranscriptionJob(running)
+            let publishedRecording = try library().writeTranscriptBundle(decoded.text, segments: segments, for: stableRecording)
             if job.replacingExistingTranscript {
-                try library().clearSummary(for: recording)
+                _ = try library().clearSummary(for: publishedRecording)
             }
-            refreshSearchDocument(for: recording)
+            var finalRecording = publishedRecording
+            if settings.autoTitle,
+               job.provider == .openAI,
+               isDefaultMeetingName(finalRecording.displayName),
+               let generatedTitle = try? await aiService.generateTitle(transcript: decoded.text),
+               !generatedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                finalRecording = try library().rename(finalRecording, to: generatedTitle)
+            }
+            loadRecordings()
+            refreshSearchDocument(for: finalRecording)
 
-            var completed = job
-            completed.markCompleted(transcriptFileName: recording.transcriptURL.lastPathComponent)
+            var completed = running
+            completed.markCompleted(transcriptFileName: finalRecording.transcriptURL.lastPathComponent)
             saveTranscriptionJob(completed)
-            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recording.id, selectedID: selectedRecording?.id) {
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: finalRecording.id, selectedID: selectedRecording?.id) {
+                selectedRecording = finalRecording
                 transcriptText = decoded.text
                 transcriptSegments = segments
                 selectedTranscriptionJob = completed
@@ -1288,6 +1818,27 @@ final class AppViewModel: ObservableObject {
         loadTranscriptionJobs()
     }
 
+    private func credentialAvailable(for provider: AIProvider) -> Bool {
+        keyStore.apiKey(for: provider) != nil
+    }
+
+    private func recoverPublishedJobIfPossible(_ job: inout TranscriptionJob) -> Bool {
+        guard let expected = job.transcriptContentSHA256,
+              let recording = recording(for: job),
+              let transcript = try? String(contentsOf: recording.transcriptURL, encoding: .utf8),
+              Self.sha256(transcript) == expected else { return false }
+        job.markCompleted(transcriptFileName: recording.transcriptURL.lastPathComponent)
+        return true
+    }
+
+    private func isDefaultMeetingName(_ name: String) -> Bool {
+        name == "Untitled Meeting" || name.hasPrefix("Meeting ")
+    }
+
+    private static func sha256(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func job(for recordingID: UUID) -> TranscriptionJob? {
         transcriptionJobs.first { $0.recordingID == recordingID }
             ?? transcriptionJobStore().loadIfExists(recordingID: recordingID)
@@ -1318,6 +1869,16 @@ final class AppViewModel: ObservableObject {
         return folder.appendingPathComponent(".in-progress-\(source.rawValue)-\(UUID().uuidString).m4a")
     }
 
+    private func ensureMinimumRecordingSpace() throws {
+        let folder = recordingsFolderURL
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let values = try folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        if let available = values.volumeAvailableCapacityForImportantUsage,
+           available < 256 * 1_024 * 1_024 {
+            throw RecordingSessionError.insufficientDiskSpace(availableBytes: available)
+        }
+    }
+
     private func makeFinalTemporaryAudioURL() throws -> URL {
         let folder = recordingsFolderURL
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1332,8 +1893,8 @@ final class AppViewModel: ObservableObject {
         TranscriptionJobStore(folderURL: recordingsFolderURL)
     }
 
-    private func library() -> RecordingLibrary {
-        RecordingLibrary(folderURL: recordingsFolderURL)
+    private func library() -> any RecordingLibraryServing {
+        libraryFactory(recordingsFolderURL)
     }
 
     private func currentManifestFallback(source: AudioSource, clock: RecordingSessionClock) throws -> RecordingSessionManifest {
@@ -1382,6 +1943,8 @@ final class AppViewModel: ObservableObject {
             transcriptSegments = []
             summaryText = ""
             selectedTranscriptionJob = nil
+            reviewWaveform = []
+            exportPreview = ""
             return
         }
         let recordingLibrary = library()
@@ -1389,6 +1952,21 @@ final class AppViewModel: ObservableObject {
         let savedSegments = recordingLibrary.loadTranscriptSegments(for: selectedRecording)
         transcriptSegments = savedSegments.isEmpty ? TranscriptParser.segments(from: transcriptText) : savedSegments
         summaryText = (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
+        trimStartSeconds = 0
+        trimEndSeconds = selectedRecording.durationSeconds
+        transcriptSaveMessage = ""
+        updateExportPreview()
+        waveformTask?.cancel()
+        let targetID = selectedRecording.id
+        let audioURL = selectedRecording.audioURL
+        waveformTask = Task { [weak self] in
+            guard let self else { return }
+            if let samples = try? await waveformAnalyzer.samples(for: audioURL, bucketCount: 96), !Task.isCancelled {
+                await MainActor.run {
+                    if self.selectedRecording?.id == targetID { self.reviewWaveform = samples }
+                }
+            }
+        }
         selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
         preparePlayback(for: selectedRecording)
     }
@@ -1495,6 +2073,8 @@ final class AppViewModel: ObservableObject {
         stopPlayback()
         do {
             let player = try AVAudioPlayer(contentsOf: recording.audioURL)
+            player.enableRate = true
+            player.rate = Float(settings.playbackSpeed)
             player.prepareToPlay()
             audioPlayer = player
             playbackDuration = player.duration
@@ -1599,7 +2179,17 @@ final class AppViewModel: ObservableObject {
                 await self?.recoverInterruptedRecordings()
             }
         }
-        powerObserverTokens = [willSleep, didWake]
+        let willTerminate = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.flushTranscriptEdits()
+                self?.flushSummaryEdits()
+            }
+        }
+        powerObserverTokens = [willSleep, didWake, willTerminate]
     }
 
     private func beginSleepPrevention() {
@@ -1620,6 +2210,7 @@ final class AppViewModel: ObservableObject {
 private enum RecordingSessionError: LocalizedError {
     case noCapturedSegments
     case missingCapturedSegment(String)
+    case insufficientDiskSpace(availableBytes: Int64)
 
     var errorDescription: String? {
         switch self {
@@ -1627,6 +2218,9 @@ private enum RecordingSessionError: LocalizedError {
             return "No captured audio segments were available to save."
         case let .missingCapturedSegment(fileName):
             return "A recorded audio segment is missing: \(fileName). Recovery will retry on next launch."
+        case let .insufficientDiskSpace(availableBytes):
+            let available = ByteCountFormatter.string(fromByteCount: availableBytes, countStyle: .file)
+            return "Recording needs at least 256 MB of free space. \(available) is available."
         }
     }
 }

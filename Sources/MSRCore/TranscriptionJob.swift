@@ -9,6 +9,7 @@ public enum TranscriptionJobStatus: String, Codable, Equatable, Sendable {
 }
 
 public struct TranscriptionJob: Codable, Equatable, Sendable {
+    public var id: UUID
     public var recordingID: UUID
     public var recordingName: String
     public var audioFileName: String
@@ -16,13 +17,21 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
     public var status: TranscriptionJobStatus
     public var attemptCount: Int
     public var startedAt: Date
+    public var queuedAt: Date
     public var updatedAt: Date
     public var completedAt: Date?
     public var transcriptFileName: String?
     public var errorMessage: String?
     public var replacingExistingTranscript: Bool
+    public var trimStartSeconds: TimeInterval?
+    public var trimEndSeconds: TimeInterval?
+    public var transcriptContentSHA256: String?
+    public var publicationStartedAt: Date?
+    public var usedUncompressedAudioFallback: Bool
+    public var audioPreparationWarning: String?
 
     public init(
+        id: UUID = UUID(),
         recordingID: UUID,
         recordingName: String,
         audioFileName: String,
@@ -30,12 +39,20 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         status: TranscriptionJobStatus,
         attemptCount: Int,
         startedAt: Date,
+        queuedAt: Date? = nil,
         updatedAt: Date,
         completedAt: Date? = nil,
         transcriptFileName: String? = nil,
         errorMessage: String? = nil,
-        replacingExistingTranscript: Bool = false
+        replacingExistingTranscript: Bool = false,
+        trimStartSeconds: TimeInterval? = nil,
+        trimEndSeconds: TimeInterval? = nil,
+        transcriptContentSHA256: String? = nil,
+        publicationStartedAt: Date? = nil,
+        usedUncompressedAudioFallback: Bool = false,
+        audioPreparationWarning: String? = nil
     ) {
+        self.id = id
         self.recordingID = recordingID
         self.recordingName = recordingName
         self.audioFileName = audioFileName
@@ -43,14 +60,22 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         self.status = status
         self.attemptCount = attemptCount
         self.startedAt = startedAt
+        self.queuedAt = queuedAt ?? startedAt
         self.updatedAt = updatedAt
         self.completedAt = completedAt
         self.transcriptFileName = transcriptFileName
         self.errorMessage = errorMessage
         self.replacingExistingTranscript = replacingExistingTranscript
+        self.trimStartSeconds = trimStartSeconds
+        self.trimEndSeconds = trimEndSeconds
+        self.transcriptContentSHA256 = transcriptContentSHA256
+        self.publicationStartedAt = publicationStartedAt
+        self.usedUncompressedAudioFallback = usedUncompressedAudioFallback
+        self.audioPreparationWarning = audioPreparationWarning
     }
 
     enum CodingKeys: String, CodingKey {
+        case id
         case recordingID
         case recordingName
         case audioFileName
@@ -58,27 +83,42 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         case status
         case attemptCount
         case startedAt
+        case queuedAt
         case updatedAt
         case completedAt
         case transcriptFileName
         case errorMessage
         case replacingExistingTranscript
+        case trimStartSeconds
+        case trimEndSeconds
+        case transcriptContentSHA256
+        case publicationStartedAt
+        case usedUncompressedAudioFallback
+        case audioPreparationWarning
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         recordingID = try container.decode(UUID.self, forKey: .recordingID)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? recordingID
         recordingName = try container.decode(String.self, forKey: .recordingName)
         audioFileName = try container.decode(String.self, forKey: .audioFileName)
         provider = try container.decode(AIProvider.self, forKey: .provider)
         status = try container.decode(TranscriptionJobStatus.self, forKey: .status)
         attemptCount = try container.decode(Int.self, forKey: .attemptCount)
         startedAt = try container.decode(Date.self, forKey: .startedAt)
+        queuedAt = try container.decodeIfPresent(Date.self, forKey: .queuedAt) ?? startedAt
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         transcriptFileName = try container.decodeIfPresent(String.self, forKey: .transcriptFileName)
         errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
         replacingExistingTranscript = try container.decodeIfPresent(Bool.self, forKey: .replacingExistingTranscript) ?? false
+        trimStartSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .trimStartSeconds)
+        trimEndSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .trimEndSeconds)
+        transcriptContentSHA256 = try container.decodeIfPresent(String.self, forKey: .transcriptContentSHA256)
+        publicationStartedAt = try container.decodeIfPresent(Date.self, forKey: .publicationStartedAt)
+        usedUncompressedAudioFallback = try container.decodeIfPresent(Bool.self, forKey: .usedUncompressedAudioFallback) ?? false
+        audioPreparationWarning = try container.decodeIfPresent(String.self, forKey: .audioPreparationWarning)
     }
 
     public static func start(
@@ -108,6 +148,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         provider: AIProvider,
         replacingExistingTranscript: Bool = false,
         previousAttemptCount: Int = 0,
+        trimStartSeconds: TimeInterval? = nil,
+        trimEndSeconds: TimeInterval? = nil,
         at date: Date = Date()
     ) -> TranscriptionJob {
         TranscriptionJob(
@@ -119,7 +161,9 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
             attemptCount: previousAttemptCount + 1,
             startedAt: date,
             updatedAt: date,
-            replacingExistingTranscript: replacingExistingTranscript
+            replacingExistingTranscript: replacingExistingTranscript,
+            trimStartSeconds: trimStartSeconds.flatMap { $0 > 0 ? $0 : nil },
+            trimEndSeconds: trimEndSeconds.flatMap { $0 > 0 ? $0 : nil }
         )
     }
 
@@ -129,6 +173,24 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         updatedAt = date
         completedAt = nil
         transcriptFileName = nil
+        transcriptContentSHA256 = nil
+        publicationStartedAt = nil
+        usedUncompressedAudioFallback = false
+        audioPreparationWarning = nil
+        errorMessage = nil
+    }
+
+    public mutating func markPublishing(
+        transcriptFileName: String,
+        contentSHA256: String,
+        at date: Date = Date()
+    ) {
+        status = .running
+        updatedAt = date
+        self.transcriptFileName = transcriptFileName
+        transcriptContentSHA256 = contentSHA256
+        publicationStartedAt = date
+        completedAt = nil
         errorMessage = nil
     }
 
@@ -137,6 +199,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         updatedAt = date
         completedAt = nil
         transcriptFileName = nil
+        transcriptContentSHA256 = nil
+        publicationStartedAt = nil
         errorMessage = message
     }
 
@@ -150,7 +214,12 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
 
     public mutating func markInterruptedIfRunning(at date: Date = Date()) {
         guard status == .running else { return }
-        markFailed("Transcription was interrupted before it finished. Retry transcription to upload the same recording again.", at: date)
+        status = .queued
+        updatedAt = date
+        completedAt = nil
+        usedUncompressedAudioFallback = false
+        audioPreparationWarning = nil
+        errorMessage = "The app closed while this job was running; it was queued again."
     }
 
     public mutating func markCancelled(at date: Date = Date()) {
@@ -158,6 +227,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         updatedAt = date
         completedAt = nil
         transcriptFileName = nil
+        transcriptContentSHA256 = nil
+        publicationStartedAt = nil
         errorMessage = "Transcription was cancelled."
     }
 }
@@ -171,19 +242,26 @@ public final class TranscriptionJobStore {
         self.fileManager = fileManager
     }
 
-    public func url(for recordingID: UUID) -> URL {
-        folderURL.appendingPathComponent(".transcription-\(recordingID.uuidString).json")
+    public func url(for jobID: UUID) -> URL {
+        folderURL.appendingPathComponent(".transcription-\(jobID.uuidString).json")
     }
 
     public func save(_ job: TranscriptionJob) throws {
         try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
         let data = try Self.makeEncoder().encode(job)
-        try data.write(to: url(for: job.recordingID), options: .atomic)
+        try DurableFile.write(data, to: url(for: job.id), fileManager: fileManager)
+    }
+
+    public func load(jobID: UUID) throws -> TranscriptionJob {
+        let data = try Data(contentsOf: url(for: jobID))
+        return try Self.makeDecoder().decode(TranscriptionJob.self, from: data)
     }
 
     public func load(recordingID: UUID) throws -> TranscriptionJob {
-        let data = try Data(contentsOf: url(for: recordingID))
-        return try Self.makeDecoder().decode(TranscriptionJob.self, from: data)
+        guard let job = try loadAll().first(where: { $0.recordingID == recordingID }) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return job
     }
 
     public func loadIfExists(recordingID: UUID) -> TranscriptionJob? {
@@ -197,20 +275,31 @@ public final class TranscriptionJobStore {
             includingPropertiesForKeys: nil,
             options: []
         )
-        return try urls
+        return urls
             .filter { Self.isJobFileName($0.lastPathComponent) }
             .map { url in
-                let data = try Data(contentsOf: url)
-                return try Self.makeDecoder().decode(TranscriptionJob.self, from: data)
+                DurableFile.readRecoveringBackup(
+                    TranscriptionJob.self,
+                    from: url,
+                    decoder: Self.makeDecoder(),
+                    fileManager: fileManager
+                )
             }
+            .compactMap { $0 }
             .sorted { lhs, rhs in
                 lhs.updatedAt > rhs.updatedAt
             }
     }
 
     public func delete(recordingID: UUID) throws {
-        let url = url(for: recordingID)
-        if fileManager.fileExists(atPath: url.path) {
+        for job in try loadAll() where job.recordingID == recordingID {
+            try delete(jobID: job.id)
+        }
+    }
+
+    public func delete(jobID: UUID) throws {
+        for url in [url(for: jobID), DurableFile.backupURL(for: url(for: jobID))]
+        where fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
         }
     }

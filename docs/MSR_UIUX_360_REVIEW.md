@@ -1,5 +1,7 @@
 # MSR Meeting Recorder - 360 UI/UX Review
 
+> Historical baseline review. Its P0/P1 findings informed the v1.0 workbench; referenced line numbers and screenshots describe the pre-parity UI and are not current implementation documentation.
+
 Date: 2026-06-29  
 Goal: keep the app simple, fast to understand, and trustworthy for meeting recording.
 

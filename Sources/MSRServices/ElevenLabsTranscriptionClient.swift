@@ -2,7 +2,8 @@ import Foundation
 import MSRCore
 
 public final class ElevenLabsTranscriptionClient {
-    private static let transcriptionTimeout: TimeInterval = 60 * 60
+    private static let transcriptionTimeout: TimeInterval = 15 * 60
+    private static let maximumResponseBytes = 64 * 1_024 * 1_024
 
     private let endpoint: URL
     private let urlSession: URLSession
@@ -16,25 +17,24 @@ public final class ElevenLabsTranscriptionClient {
     }
 
     public func transcribe(audioURL: URL, apiKey: String) async throws -> TranscribeResponse {
-        let audioData = try Data(contentsOf: audioURL)
-        var multipart = MultipartFormData()
-        multipart.appendField(name: "model_id", value: "scribe_v2")
-        multipart.appendField(name: "diarize", value: "true")
-        multipart.appendFile(
-            name: "file",
-            fileName: audioURL.lastPathComponent,
-            mimeType: "audio/mp4",
-            data: audioData
+        let media = MultipartFileBody.neutralMediaDescriptor(for: audioURL)
+        let multipart = try MultipartFileBody.create(
+            fields: [("model_id", "scribe_v2"), ("diarize", "true")],
+            fileFieldName: "file",
+            neutralFileName: media.fileName,
+            mimeType: media.mimeType,
+            sourceURL: audioURL
         )
+        defer { try? FileManager.default.removeItem(at: multipart.url) }
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = Self.transcriptionTimeout
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
         request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = multipart.finalize()
 
-        let (data, response) = try await urlSession.data(for: request)
+        let (data, response) = try await urlSession.upload(for: request, fromFile: multipart.url)
+        guard data.count <= Self.maximumResponseBytes else { throw ProviderError.responseTooLarge }
         try Self.validate(response: response, data: data)
         let decoded = try JSONDecoder().decode(ElevenLabsTranscriptionResponse.self, from: data)
         return TranscribeResponse(
@@ -50,7 +50,7 @@ public final class ElevenLabsTranscriptionClient {
             throw ProviderError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "No response body"
+            let message = String((String(data: data, encoding: .utf8) ?? "No response body").prefix(500))
             throw ProviderError.providerRejected(http.statusCode, message)
         }
     }
@@ -83,10 +83,11 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
         var speakerLabels: [String: String] = [:]
         var turns: [SpeakerTurn] = []
 
+        var currentSpeakerID = "speaker_unknown"
         for word in words {
-            guard let speakerID = word.speakerID, !word.text.isEmpty else {
-                continue
-            }
+            guard !word.text.isEmpty else { continue }
+            let speakerID = word.speakerID ?? currentSpeakerID
+            currentSpeakerID = speakerID
             let label = speakerLabels[speakerID] ?? {
                 let newLabel = "Speaker \(speakerLabels.count + 1)"
                 speakerLabels[speakerID] = newLabel
@@ -115,10 +116,11 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
         var speakerLabels: [String: String] = [:]
         var turns: [TranscriptSegment] = []
 
+        var currentSpeakerID = "speaker_unknown"
         for word in words {
-            guard let speakerID = word.speakerID, !word.text.isEmpty else {
-                continue
-            }
+            guard !word.text.isEmpty else { continue }
+            let speakerID = word.speakerID ?? currentSpeakerID
+            currentSpeakerID = speakerID
             let label = speakerLabels[speakerID] ?? {
                 let newLabel = "Speaker \(speakerLabels.count + 1)"
                 speakerLabels[speakerID] = newLabel

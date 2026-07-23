@@ -5,12 +5,18 @@ import MSRCore
 public final class APIKeyStore {
     private let serviceName = "MSRMeetingRecorder"
     private let environment: [String: String]
+    private let lock = NSLock()
+    private var sessionValues: [AIProvider: String] = [:]
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.environment = environment
     }
 
     public func apiKey(for provider: AIProvider) -> String? {
+        lock.lock()
+        let sessionValue = sessionValues[provider]
+        lock.unlock()
+        if let sessionValue { return sessionValue }
         if let keychainValue = keychainValue(for: provider),
            let normalized = APIKeyNormalizer.normalized(keychainValue) {
             return normalized
@@ -23,6 +29,23 @@ public final class APIKeyStore {
             envName = "OPENAI_API_KEY"
         }
         return environment[envName].flatMap(APIKeyNormalizer.normalized)
+    }
+
+    public func setSession(apiKey: String, for provider: AIProvider) throws {
+        guard let normalized = APIKeyNormalizer.normalized(apiKey) else { throw KeyStoreError.emptyAPIKey }
+        lock.lock()
+        sessionValues[provider] = normalized
+        lock.unlock()
+    }
+
+    public func forget(_ provider: AIProvider) throws {
+        lock.lock()
+        sessionValues.removeValue(forKey: provider)
+        lock.unlock()
+        let status = SecItemDelete(keychainQuery(for: provider) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeyStoreError.writeFailed(status)
+        }
     }
 
     public func save(apiKey: String, for provider: AIProvider) throws {

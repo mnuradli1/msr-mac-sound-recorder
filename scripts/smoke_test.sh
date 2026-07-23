@@ -2,13 +2,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/Config/version.env"
 APP_PATH="$ROOT_DIR/dist/MSR Meeting Recorder.app"
-APP_ZIP_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.2.6-app.zip"
-DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-0.2.6.dmg"
+APP_ZIP_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-$MSR_VERSION-app.zip"
+DMG_PATH="$ROOT_DIR/dist/MSR-Meeting-Recorder-$MSR_VERSION.dmg"
 
 cd "$ROOT_DIR"
 
 echo "==> Unit/smoke tests"
+swift test
 swift run MSRTestRunner
 
 echo "==> Debug build"
@@ -21,12 +23,16 @@ echo "==> App bundle checks"
 test -x "$APP_PATH/Contents/MacOS/MSRMeetingRecorder"
 plutil -lint "$APP_PATH/Contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+"$ROOT_DIR/scripts/smoke_launch.sh" "$APP_PATH"
 
 echo "==> DMG check"
 test -f "$APP_ZIP_PATH"
 unzip -tq "$APP_ZIP_PATH"
 test -f "$DMG_PATH"
 hdiutil verify "$DMG_PATH"
+shasum -a 256 -c "$ROOT_DIR/dist/SHA256SUMS"
+test -f "$ROOT_DIR/dist/provenance.json"
+test -f "$ROOT_DIR/dist/msr.rb"
 
 echo "==> Secret scan"
 if rg -n 'sk_[A-Za-z0-9]+' --glob '!/.build/**' --glob '!dist/**' . >/tmp/msr-secret-scan.txt; then

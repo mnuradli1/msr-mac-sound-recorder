@@ -20,7 +20,14 @@ public enum AudioSource: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 public struct RecordingMetadata: Codable, Equatable, Sendable {
+    public static let currentSchema = "msr.recording"
+    public static let minimumSupportedSchemaVersion = 1
+    public static let currentSchemaVersion = 2
+
+    public var schema: String
+    public var schemaVersion: Int
     public var id: UUID
+    public var storageKey: String?
     public var displayName: String
     public var source: AudioSource
     public var audioFileName: String
@@ -36,7 +43,10 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
     public var confidenceReport: RecordingConfidenceReport?
 
     public init(
+        schema: String = RecordingMetadata.currentSchema,
+        schemaVersion: Int = RecordingMetadata.currentSchemaVersion,
         id: UUID,
+        storageKey: String? = nil,
         displayName: String,
         source: AudioSource,
         audioFileName: String,
@@ -51,7 +61,10 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         importedAt: Date? = nil,
         confidenceReport: RecordingConfidenceReport? = nil
     ) {
+        self.schema = schema
+        self.schemaVersion = schemaVersion
         self.id = id
+        self.storageKey = storageKey
         self.displayName = displayName
         self.source = source
         self.audioFileName = audioFileName
@@ -66,6 +79,33 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         self.importedAt = importedAt
         self.confidenceReport = confidenceReport
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case schema, schemaVersion, id, storageKey, displayName, source, audioFileName
+        case startedAt, endedAt, durationSeconds, createdAt, updatedAt
+        case recoveredAt, recoveryNote, segmentCount, importedAt, confidenceReport
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? Self.currentSchema
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.minimumSupportedSchemaVersion
+        id = try container.decode(UUID.self, forKey: .id)
+        storageKey = try container.decodeIfPresent(String.self, forKey: .storageKey)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        source = try container.decode(AudioSource.self, forKey: .source)
+        audioFileName = try container.decode(String.self, forKey: .audioFileName)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        endedAt = try container.decode(Date.self, forKey: .endedAt)
+        durationSeconds = try container.decode(TimeInterval.self, forKey: .durationSeconds)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        recoveredAt = try container.decodeIfPresent(Date.self, forKey: .recoveredAt)
+        recoveryNote = try container.decodeIfPresent(String.self, forKey: .recoveryNote)
+        segmentCount = try container.decodeIfPresent(Int.self, forKey: .segmentCount)
+        importedAt = try container.decodeIfPresent(Date.self, forKey: .importedAt)
+        confidenceReport = try container.decodeIfPresent(RecordingConfidenceReport.self, forKey: .confidenceReport)
+    }
 }
 
 public struct RecordingItem: Equatable, Identifiable, Sendable {
@@ -78,25 +118,32 @@ public struct RecordingItem: Equatable, Identifiable, Sendable {
     public var startedAt: Date { metadata.startedAt }
     public var endedAt: Date { metadata.endedAt }
     public var durationSeconds: TimeInterval { metadata.durationSeconds }
+    public var isRecovered: Bool { metadata.recoveredAt != nil }
+    public var isImported: Bool { metadata.importedAt != nil }
+    public var storageBaseName: String {
+        let value = metadata.storageKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? displayName : value
+    }
+    public var usesImmutableStorage: Bool { metadata.storageKey?.isEmpty == false }
 
     public var audioURL: URL {
         folderURL.appendingPathComponent(metadata.audioFileName)
     }
 
     public var metadataURL: URL {
-        folderURL.appendingPathComponent("\(displayName).json")
+        folderURL.appendingPathComponent("\(storageBaseName).json")
     }
 
     public var transcriptURL: URL {
-        folderURL.appendingPathComponent("\(displayName).transcript.txt")
+        folderURL.appendingPathComponent("\(storageBaseName).transcript.txt")
     }
 
     public var summaryURL: URL {
-        folderURL.appendingPathComponent("\(displayName).summary.md")
+        folderURL.appendingPathComponent("\(storageBaseName).summary.md")
     }
 
     public var transcriptSegmentsURL: URL {
-        folderURL.appendingPathComponent("\(displayName).transcript.segments.json")
+        folderURL.appendingPathComponent("\(storageBaseName).transcript.segments.json")
     }
 
     public init(metadata: RecordingMetadata, folderURL: URL) {

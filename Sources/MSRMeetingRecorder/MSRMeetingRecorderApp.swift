@@ -4,6 +4,7 @@ import MSRServices
 
 @main
 struct MSRMeetingRecorderApp: App {
+    @NSApplicationDelegateAdaptor(MSRApplicationDelegate.self) private var applicationDelegate
     @StateObject private var viewModel = AppViewModel()
 
     var body: some Scene {
@@ -14,7 +15,7 @@ struct MSRMeetingRecorderApp: App {
                     await viewModel.bootstrap()
                 }
         }
-        .defaultSize(width: 1280, height: 780)
+        .defaultSize(width: viewModel.settings.windowWidth, height: viewModel.settings.windowHeight)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -50,7 +51,7 @@ struct MSRMeetingRecorderApp: App {
                 Button(viewModel.isPlaying ? "Pause" : "Play") {
                     viewModel.togglePlayback()
                 }
-                .keyboardShortcut(.space, modifiers: [])
+                .keyboardShortcut(.space, modifiers: [.option])
                 .disabled(!viewModel.canPlaySelectedRecording)
 
                 Button("Rename") {
@@ -62,6 +63,7 @@ struct MSRMeetingRecorderApp: App {
                 Button("Transcribe") {
                     Task { await viewModel.transcribeSelected() }
                 }
+                .keyboardShortcut("t", modifiers: [.command])
                 .disabled(!viewModel.canRunPrimaryAction)
 
                 Button("Re-transcribe") {
@@ -84,6 +86,31 @@ struct MSRMeetingRecorderApp: App {
                 }
                 .disabled(!viewModel.hasTranscript)
 
+                Button("Save Notes") { viewModel.flushTranscriptEdits() }
+                    .keyboardShortcut("s", modifiers: [.command])
+                    .disabled(viewModel.selectedRecording == nil)
+
+                Button("Export…") {
+                    viewModel.selectedDetailTab = .export
+                    viewModel.exportSelected()
+                }
+                .keyboardShortcut("e", modifiers: [.command])
+                .disabled(viewModel.selectedRecording == nil)
+
+                Divider()
+
+                Button("Previous Recording") { viewModel.selectAdjacentRecording(offset: -1) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command])
+                Button("Next Recording") { viewModel.selectAdjacentRecording(offset: 1) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command])
+
+                Button("Review Tab") { viewModel.selectedDetailTab = .review }
+                    .keyboardShortcut("1", modifiers: [.command])
+                Button("Notes Tab") { viewModel.selectedDetailTab = .notes }
+                    .keyboardShortcut("2", modifiers: [.command])
+                Button("Export Tab") { viewModel.selectedDetailTab = .export }
+                    .keyboardShortcut("3", modifiers: [.command])
+
                 Divider()
 
                 Button("Show in Finder") {
@@ -95,10 +122,45 @@ struct MSRMeetingRecorderApp: App {
                     viewModel.loadRecordings()
                 }
             }
+
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { viewModel.checkForUpdates() }
+            }
         }
 
         Settings {
             SettingsView(viewModel: viewModel)
+                .preferredColorScheme(preferredColorScheme)
+                .environment(\.locale, preferredLocale)
+        }
+
+        MenuBarExtra(isInserted: .constant(viewModel.settings.showMenuBarControl)) {
+            Button("Show MSR") { viewModel.showMainWindow() }
+            Button(viewModel.isRecording ? "Stop Recording" : "Start Recording") {
+                Task { await viewModel.toggleRecording() }
+            }
+            .disabled(!viewModel.canToggleRecording)
+            Divider()
+            Button("Quit") { NSApp.terminate(nil) }
+        } label: {
+            Image(systemName: viewModel.isRecording ? "record.circle.fill" : "waveform.circle")
+        }
+        .menuBarExtraStyle(.menu)
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        switch viewModel.settings.theme {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    private var preferredLocale: Locale {
+        switch viewModel.settings.language {
+        case .system: .current
+        case .english: Locale(identifier: "en")
+        case .indonesian: Locale(identifier: "id")
         }
     }
 }

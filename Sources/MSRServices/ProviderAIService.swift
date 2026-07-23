@@ -40,6 +40,13 @@ public final class ProviderAIService: AIService, @unchecked Sendable {
         }
         return try await openAI.summarize(transcript: transcript, apiKey: apiKey)
     }
+
+    public func generateTitle(transcript: String) async throws -> String {
+        guard let apiKey = keyStore.apiKey(for: .openAI) else {
+            throw ProviderError.missingAPIKey("OPENAI_API_KEY")
+        }
+        return try await openAI.generateTitle(transcript: transcript, apiKey: apiKey)
+    }
 }
 
 public enum ProviderError: Error, LocalizedError {
@@ -47,6 +54,7 @@ public enum ProviderError: Error, LocalizedError {
     case audioFileMissing(String)
     case invalidResponse
     case providerRejected(Int, String)
+    case responseTooLarge
 
     public var errorDescription: String? {
         switch self {
@@ -58,6 +66,8 @@ public enum ProviderError: Error, LocalizedError {
             return "Provider returned an invalid response."
         case let .providerRejected(status, message):
             return "Provider request failed with HTTP \(status): \(message)"
+        case .responseTooLarge:
+            return "Provider response exceeded the 64 MB safety limit."
         }
     }
 }

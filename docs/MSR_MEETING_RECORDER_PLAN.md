@@ -1,5 +1,7 @@
 # MSR Mac Meeting Recorder - KISS V1 Plan
 
+> Historical pre-1.0 design note. The implemented v1.0 architecture and storage/API contracts are documented in the root README and `WSR_PARITY_MATRIX.md`; display-name storage and the mandatory internal proxy described below are intentionally superseded.
+
 ## Summary
 
 Build a native macOS 14+ desktop meeting recorder. V1 records microphone audio, system audio, or both; keeps a simple history list; lets the user rename recordings after stopping; and optionally transcribes/summarizes through a bundled local API proxy using OpenAI or ElevenLabs.

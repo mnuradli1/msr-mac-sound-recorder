@@ -6,22 +6,52 @@ import MSRCore
 
 public protocol AudioRecording: AnyObject, Sendable {
     var isRecording: Bool { get }
+    var captureArtifacts: RecordingCaptureArtifacts? { get }
     var onLevelUpdate: (@Sendable (Float) -> Void)? { get set }
     var onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? { get set }
     func start(source: AudioSource, outputURL: URL) async throws
     func stop() async throws
+    func setMicrophoneDeviceUID(_ uid: String?)
+}
+
+public struct RecordingCaptureArtifacts: Equatable, Sendable {
+    public var outputFileName: String
+    public var microphoneFileName: String?
+    public var systemFileName: String?
+
+    public init(outputFileName: String, microphoneFileName: String? = nil, systemFileName: String? = nil) {
+        self.outputFileName = outputFileName
+        self.microphoneFileName = microphoneFileName
+        self.systemFileName = systemFileName
+    }
+}
+
+public extension AudioRecording {
+    var captureArtifacts: RecordingCaptureArtifacts? { nil }
+    func setMicrophoneDeviceUID(_ uid: String?) {}
 }
 
 public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
     private var microphoneRecorder: MicrophoneAudioRecorder?
     private var screenRecorder: ScreenCaptureAudioRecorder?
     private var combinedRecorder: CombinedAudioRecorder?
+    private var microphoneDeviceUID: String?
 
     public private(set) var isRecording = false
+    public var captureArtifacts: RecordingCaptureArtifacts? {
+        if let combinedRecorder { return combinedRecorder.captureArtifacts }
+        if let microphoneRecorder { return microphoneRecorder.captureArtifacts }
+        if let screenRecorder { return screenRecorder.captureArtifacts }
+        return nil
+    }
     public var onLevelUpdate: (@Sendable (Float) -> Void)?
     public var onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
 
     public init() {}
+
+    public func setMicrophoneDeviceUID(_ uid: String?) {
+        microphoneDeviceUID = uid
+    }
 
     public func start(source: AudioSource, outputURL: URL) async throws {
         guard !isRecording else {
@@ -33,6 +63,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
         case .microphoneOnly:
             let recorder = MicrophoneAudioRecorder(
                 channel: .microphone,
+                deviceUID: microphoneDeviceUID,
                 onLevelUpdate: onLevelUpdate,
                 onSourceLevelUpdate: onSourceLevelUpdate
             )
@@ -47,6 +78,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
             screenRecorder = recorder
         case .separateMicAndSystemMixdown:
             let recorder = CombinedAudioRecorder(
+                microphoneDeviceUID: microphoneDeviceUID,
                 onLevelUpdate: onLevelUpdate,
                 onSourceLevelUpdate: onSourceLevelUpdate
             )
@@ -99,17 +131,22 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
 private final class MicrophoneAudioRecorder {
     private var recorder: AVAudioRecorder?
     private let channel: AudioSignalChannel
+    private let deviceUID: String?
     private let onLevelUpdate: (@Sendable (Float) -> Void)?
     private let onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
     private var meterTimer: DispatchSourceTimer?
+    private var outputURL: URL?
+    private var previousDefaultDeviceID: AudioDeviceID?
     private let meterQueue = DispatchQueue(label: "app.msr.microphone-meter")
 
     init(
         channel: AudioSignalChannel,
+        deviceUID: String? = nil,
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
         onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? = nil
     ) {
         self.channel = channel
+        self.deviceUID = deviceUID
         self.onLevelUpdate = onLevelUpdate
         self.onSourceLevelUpdate = onSourceLevelUpdate
     }
@@ -118,6 +155,7 @@ private final class MicrophoneAudioRecorder {
         guard await requestMicrophonePermission() else {
             throw RecordingError.microphonePermissionDenied
         }
+        previousDefaultDeviceID = AudioDeviceCatalog.selectInputDevice(uid: deviceUID)
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 48_000,
@@ -130,7 +168,12 @@ private final class MicrophoneAudioRecorder {
             throw RecordingError.couldNotStartRecording
         }
         self.recorder = recorder
+        self.outputURL = outputURL
         startMetering()
+    }
+
+    var captureArtifacts: RecordingCaptureArtifacts? {
+        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, microphoneFileName: $0.lastPathComponent) }
     }
 
     func stop() {
@@ -138,6 +181,8 @@ private final class MicrophoneAudioRecorder {
         meterTimer = nil
         recorder?.stop()
         recorder = nil
+        AudioDeviceCatalog.restoreInputDevice(previousDefaultDeviceID)
+        previousDefaultDeviceID = nil
         onLevelUpdate?(0)
         onSourceLevelUpdate?(channel, 0)
     }
@@ -187,13 +232,26 @@ private final class CombinedAudioRecorder {
     private var outputURL: URL?
     private var microphoneURL: URL?
     private var systemURL: URL?
+    private var microphoneStartedAt: Date?
+    private var systemStartedAt: Date?
+
+    var captureArtifacts: RecordingCaptureArtifacts? {
+        guard let outputURL else { return nil }
+        return RecordingCaptureArtifacts(
+            outputFileName: outputURL.lastPathComponent,
+            microphoneFileName: microphoneURL?.lastPathComponent,
+            systemFileName: systemURL?.lastPathComponent
+        )
+    }
 
     init(
+        microphoneDeviceUID: String? = nil,
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
         onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? = nil
     ) {
         microphoneRecorder = MicrophoneAudioRecorder(
             channel: .microphone,
+            deviceUID: microphoneDeviceUID,
             onLevelUpdate: onLevelUpdate,
             onSourceLevelUpdate: onSourceLevelUpdate
         )
@@ -214,7 +272,9 @@ private final class CombinedAudioRecorder {
 
         do {
             try await systemRecorder.start(source: .system, outputURL: systemURL)
+            systemStartedAt = Date()
             try await microphoneRecorder.start(outputURL: microphoneURL)
+            microphoneStartedAt = Date()
         } catch {
             microphoneRecorder.stop()
             try? await systemRecorder.stop()
@@ -229,7 +289,14 @@ private final class CombinedAudioRecorder {
         guard let outputURL, let microphoneURL, let systemURL else {
             throw RecordingError.writerFailed("Missing temporary recording files.")
         }
-        try await AudioTrackMixer.mixToSingleM4A(inputs: [systemURL, microphoneURL], outputURL: outputURL)
+        let origin = min(systemStartedAt ?? .distantFuture, microphoneStartedAt ?? .distantFuture)
+        try await AudioTrackMixer.mixToSingleM4A(
+            inputs: [
+                TimedAudioInput(url: systemURL, offset: max(0, (systemStartedAt ?? origin).timeIntervalSince(origin))),
+                TimedAudioInput(url: microphoneURL, offset: max(0, (microphoneStartedAt ?? origin).timeIntervalSince(origin)))
+            ],
+            outputURL: outputURL
+        )
         cleanupTemporaryFiles()
     }
 
@@ -275,6 +342,11 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
     private var systemInput: AVAssetWriterInput?
     private var microphoneInput: AVAssetWriterInput?
     private var didStartSession = false
+    private var outputURL: URL?
+
+    var captureArtifacts: RecordingCaptureArtifacts? {
+        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, systemFileName: $0.lastPathComponent) }
+    }
 
     init(
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
@@ -285,6 +357,7 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
     }
 
     func start(source: AudioSource, outputURL: URL) async throws {
+        self.outputURL = outputURL
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)

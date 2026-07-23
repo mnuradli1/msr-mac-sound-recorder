@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag matches version source
+        run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^MSR_VERSION=//p' Config/version.env)"
+      - name: Test
+        run: |
+          swift test
+          swift run MSRTestRunner
+      - name: Import Developer ID certificate
+        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/msr-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/msr-signing.keychain-db"
+          echo "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+      - name: Configure notarization profile
+        if: ${{ secrets.APPLE_ID != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: xcrun notarytool store-credentials msr-ci --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      - name: Package ZIP and DMG
+        env:
+          MSR_BUILD_NUMBER: ${{ github.run_number }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'msr-ci' || '' }}
+        run: scripts/package_app.sh
+      - name: Smoke-launch packaged app
+        run: scripts/smoke_launch.sh
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.dmg
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.dmg
+            dist/SHA256SUMS
+            dist/provenance.json
+            dist/msr.rb
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+      - name: Publish Homebrew cask when configured
+        if: ${{ secrets.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: ${{ secrets.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          gh repo clone "$TAP_REPOSITORY" "$RUNNER_TEMP/homebrew-tap"
+          mkdir -p "$RUNNER_TEMP/homebrew-tap/Casks"
+          cp dist/msr.rb "$RUNNER_TEMP/homebrew-tap/Casks/msr.rb"
+          cd "$RUNNER_TEMP/homebrew-tap"
+          git add Casks/msr.rb
+          git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "msr ${GITHUB_REF_NAME}"
+          git push

@@ -21,6 +21,8 @@ public enum TranscriptionErrorMessage {
             return "Provider returned an invalid transcription response. Retry once, then check provider status if it keeps failing."
         case let .providerRejected(status, message):
             return "Provider rejected the transcription request with HTTP \(status): \(message)"
+        case .responseTooLarge:
+            return "Provider response exceeded the 64 MB safety limit."
         }
     }
 

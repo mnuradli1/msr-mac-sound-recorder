@@ -12,10 +12,13 @@ struct ContentView: View {
             topRecordingBar
             recoveryBanner
             appErrorBanner
+            globalQueueBanner
             mainArea
         }
         .frame(minWidth: 980, minHeight: 640)
-        .background(Color(hex: 0xFBFBFC))
+        .preferredColorScheme(preferredColorScheme)
+        .environment(\.locale, preferredLocale)
+        .background(Color(nsColor: .windowBackgroundColor))
         .background(WindowChromeConfigurator())
         .sheet(isPresented: $viewModel.showingRename) {
             renameSheet
@@ -31,19 +34,69 @@ struct ContentView: View {
             viewModel.clearRecordingSearch()
             recordingSearchFocused = false
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { notification in
+            if let window = notification.object as? NSWindow, window.isMainWindow {
+                viewModel.persistWindowSize(window.frame.size)
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            Task { await viewModel.importRecordings(from: urls) }
+            return !urls.isEmpty
+        }
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        switch viewModel.settings.theme {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    private var preferredLocale: Locale {
+        switch viewModel.settings.language {
+        case .system: .current
+        case .english: Locale(identifier: "en")
+        case .indonesian: Locale(identifier: "id")
+        }
     }
 
     private var mockTitleBar: some View {
-        HStack(spacing: 0) {
-            Text("MSR Meeting Recorder")
-                .font(.system(size: 22, weight: .bold))
-                .foregroundStyle(Color(hex: 0x344054))
-                .padding(.leading, 112)
+        HStack(spacing: 12) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 38, height: 38)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.16), radius: 4, y: 2)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("MSR Meeting Recorder")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x344054))
+
+                Text("Mac-native meeting recorder")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color(hex: 0x667085))
+            }
 
             Spacer()
         }
-        .frame(height: 58)
+        .padding(.leading, 112)
+        .padding(.trailing, 28)
+        .frame(height: 66)
         .background(Color(hex: 0xF7F7F8))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("MSR Meeting Recorder")
     }
 
     private var topRecordingBar: some View {
@@ -78,10 +131,10 @@ struct ContentView: View {
         .padding(.horizontal, 32)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, minHeight: 102)
-        .background(Color.white)
+        .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color(hex: 0xD8DEE8))
+                .fill(Color(nsColor: .separatorColor))
                 .frame(height: 1)
         }
     }
@@ -98,11 +151,25 @@ struct ContentView: View {
 
     private var meterSection: some View {
         HStack(spacing: 18) {
-            SignalMeterView(title: "Mic", level: viewModel.microphoneLevel, isActive: viewModel.isRecording, meterWidth: 150)
+            SignalMeterView(
+                title: "Mic",
+                level: viewModel.microphoneLevel,
+                isActive: viewModel.isRecording && activeCaptureSource != .system,
+                meterWidth: 150
+            )
                 .frame(width: 150)
-            SignalMeterView(title: "System", level: viewModel.systemLevel, isActive: viewModel.isRecording, meterWidth: 150)
+            SignalMeterView(
+                title: "System",
+                level: viewModel.systemLevel,
+                isActive: viewModel.isRecording && activeCaptureSource != .microphone,
+                meterWidth: 150
+            )
                 .frame(width: 150)
         }
+    }
+
+    private var activeCaptureSource: AudioSource {
+        viewModel.workflowState.lockedSource ?? viewModel.selectedSource
     }
 
     private var recordingStatusBlock: some View {
@@ -207,7 +274,7 @@ struct ContentView: View {
 
     private var transcriptionTaskCenter: some View {
         Group {
-            if viewModel.hasVisibleTranscriptionJobs {
+            if !viewModel.transcriptionJobs.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Label("Transcription", systemImage: "text.quote")
@@ -219,18 +286,32 @@ struct ContentView: View {
                     }
                     .foregroundStyle(Color(hex: 0x344054))
 
-                    VStack(spacing: 8) {
-                        ForEach(Array(viewModel.visibleTranscriptionJobs.prefix(3)), id: \.recordingID) { job in
-                            TranscriptionJobRow(
-                                job: job,
-                                onCancel: { viewModel.cancelTranscription(recordingID: job.recordingID) },
-                                onRetry: { viewModel.retryTranscription(recordingID: job.recordingID) }
-                            )
+                    if viewModel.hasVisibleTranscriptionJobs {
+                        VStack(spacing: 8) {
+                            ForEach(Array(viewModel.visibleTranscriptionJobs.prefix(3)), id: \.id) { job in
+                                TranscriptionJobRow(
+                                    job: job,
+                                    onCancel: { viewModel.cancelTranscription(recordingID: job.recordingID) },
+                                    onRetry: { viewModel.retryTranscription(recordingID: job.recordingID) }
+                                )
+                            }
                         }
+                    }
+
+                    if !viewModel.recentTranscriptionHistory.isEmpty {
+                        DisclosureGroup("History") {
+                            VStack(spacing: 8) {
+                                ForEach(viewModel.recentTranscriptionHistory, id: \.id) { job in
+                                    TranscriptionJobRow(job: job, onCancel: {}, onRetry: {})
+                                }
+                            }
+                            .padding(.top, 8)
+                        }
+                        .font(.system(size: 12, weight: .semibold))
                     }
                 }
                 .padding(12)
-                .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
                 .overlay {
                     RoundedRectangle(cornerRadius: 10)
                         .stroke(Color(hex: 0xE4E7EC), lineWidth: 1)
@@ -312,13 +393,11 @@ struct ContentView: View {
     }
 
     private var mainArea: some View {
-        HStack(spacing: 0) {
+        HSplitView {
             historySidebar
-                .frame(width: 310)
-            Rectangle()
-                .fill(Color(hex: 0xD8DEE8))
-                .frame(width: 1)
+                .frame(minWidth: 300, idealWidth: 340, maxWidth: 520)
             detail
+                .frame(minWidth: 600)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxHeight: .infinity)
@@ -363,6 +442,16 @@ struct ContentView: View {
             recordingSearchField
                 .padding(.top, 14)
                 .padding(.horizontal, 20)
+
+            Picker("Sort", selection: $viewModel.settings.sortOrder) {
+                ForEach(RecordingSortOrder.allCases) { order in
+                    Text(LocalizedStringKey(order.displayName)).tag(order)
+                }
+            }
+            .labelsHidden()
+            .padding(.top, 10)
+            .padding(.horizontal, 20)
+            .onChange(of: viewModel.settings.sortOrder) { _, _ in viewModel.saveSettings() }
 
             transcriptionTaskCenter
                 .padding(.top, viewModel.hasVisibleTranscriptionJobs ? 14 : 0)
@@ -429,7 +518,12 @@ struct ContentView: View {
                 .padding(.bottom, 28)
             }
         }
-        .background(Color(hex: 0xF6F8FB))
+        .background(Color(nsColor: .underPageBackgroundColor))
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+        }
     }
 
     private var recordingSearchField: some View {
@@ -445,6 +539,7 @@ struct ContentView: View {
                     .foregroundStyle(Color(hex: 0x111827))
                     .focused($recordingSearchFocused)
                     .disabled(!viewModel.canSelectHistory)
+                    .onChange(of: viewModel.recordingSearchQuery) { _, _ in viewModel.scheduleRecordingSearch() }
 
                 if viewModel.isSearchingRecordings {
                     Button {
@@ -463,10 +558,10 @@ struct ContentView: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 36)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 9))
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
             .overlay {
                 RoundedRectangle(cornerRadius: 9)
-                    .stroke(recordingSearchFocused ? Color(hex: 0xF97316) : Color(hex: 0xD0D5DD), lineWidth: 1)
+                    .stroke(recordingSearchFocused ? Color(hex: 0xF97316) : Color(nsColor: .separatorColor), lineWidth: 1)
             }
 
             if viewModel.isSearchingRecordings {
@@ -512,7 +607,7 @@ struct ContentView: View {
         .padding(.leading, 39)
         .padding(.trailing, 53)
         .padding(.bottom, 40)
-        .background(Color(hex: 0xFBFBFC))
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func recordingDetail(_ recording: RecordingItem) -> some View {
@@ -533,14 +628,23 @@ struct ContentView: View {
             confidencePanel
                 .padding(.top, viewModel.selectedRecordingConfidenceIssues.isEmpty ? 0 : 18)
 
-            playbackStrip
+            actionRow
                 .padding(.top, viewModel.selectedRecordingConfidenceIssues.isEmpty ? 24 : 18)
 
-            actionRow
-                .padding(.top, 25)
+            Picker("Recording detail", selection: $viewModel.selectedDetailTab) {
+                ForEach(RecordingDetailTab.allCases) { tab in Text(LocalizedStringKey(tab.rawValue)).tag(tab) }
+            }
+            .pickerStyle(.segmented)
+            .padding(.top, 24)
 
-            transcriptSummaryArea
-                .padding(.top, 34)
+            Group {
+                switch viewModel.selectedDetailTab {
+                case .review: reviewArea
+                case .notes: transcriptSummaryArea
+                case .export: exportArea
+                }
+            }
+            .padding(.top, 20)
 
             Spacer(minLength: 0)
         }
@@ -594,6 +698,88 @@ struct ContentView: View {
         }
     }
 
+    private var reviewArea: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            playbackStrip
+            ReviewWaveformView(samples: viewModel.reviewWaveform, position: viewModel.playbackDuration > 0 ? viewModel.playbackPosition / viewModel.playbackDuration : 0) { fraction in
+                viewModel.seekPlayback(to: fraction * viewModel.playbackDuration)
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Trim range").font(.headline)
+                    Spacer()
+                    Text("\(formatDuration(viewModel.trimStartSeconds)) – \(formatDuration(viewModel.trimEndSeconds))")
+                        .font(.system(.body, design: .monospaced))
+                }
+                Slider(value: $viewModel.trimStartSeconds, in: 0...max(0.1, viewModel.trimEndSeconds - 0.1))
+                    .accessibilityLabel("Trim start")
+                Slider(value: $viewModel.trimEndSeconds, in: min(viewModel.trimStartSeconds + 0.1, max(0.1, viewModel.playbackDuration))...max(0.1, viewModel.playbackDuration))
+                    .accessibilityLabel("Trim end")
+                HStack {
+                    Button("Reset") { viewModel.resetTrim() }
+                    Button("Preview range") {
+                        viewModel.seekPlayback(to: viewModel.trimStartSeconds)
+                        viewModel.togglePlayback()
+                    }
+                    Button("Transcribe range") { viewModel.transcribeSelectedRange() }
+                    Spacer()
+                    Button("Save trimmed copy…") { Task { await viewModel.saveTrimmedCopy() } }
+                }
+            }
+            .padding(16)
+            .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private var exportArea: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Picker("Format", selection: $viewModel.selectedExportFormat) {
+                    ForEach(TranscriptExportFormat.allCases) { format in
+                        Text(LocalizedStringKey(format.displayName)).tag(format)
+                    }
+                }
+                .onChange(of: viewModel.selectedExportFormat) { _, _ in viewModel.updateExportPreview() }
+                Spacer()
+                Button("Export…") { viewModel.exportSelected() }
+                    .disabled(viewModel.selectedExportFormat == .srt && !TranscriptExporter.canExportSRT(viewModel.transcriptSegments))
+                Button("Reveal Last") { viewModel.revealLastExport() }
+                    .disabled(viewModel.lastExportURL == nil)
+            }
+            ScrollView {
+                Text(viewModel.exportPreview)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(16)
+            }
+            .frame(minHeight: 300)
+            .background(.background, in: RoundedRectangle(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).stroke(.separator) }
+        }
+    }
+
+    private var globalQueueBanner: some View {
+        Group {
+            if viewModel.hasVisibleTranscriptionJobs {
+                HStack(spacing: 10) {
+                    Image(systemName: "tray.full.fill")
+                    Text("\(viewModel.visibleTranscriptionJobs.count) transcription job\(viewModel.visibleTranscriptionJobs.count == 1 ? "" : "s")")
+                        .fontWeight(.semibold)
+                    if let active = viewModel.activeTranscriptionJob {
+                        Text("Working on \(active.recordingName)").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 32)
+                .frame(height: 38)
+                .background(.blue.opacity(0.08))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Transcription queue updated")
+            }
+        }
+    }
+
     private var playbackStrip: some View {
         HStack(spacing: 18) {
             Button {
@@ -630,10 +816,10 @@ struct ContentView: View {
         }
         .padding(.horizontal, 18)
         .frame(height: 68)
-        .background(Color(hex: 0xF8FAFC), in: RoundedRectangle(cornerRadius: 12))
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .overlay {
             RoundedRectangle(cornerRadius: 12)
-                .stroke(Color(hex: 0xE4E7EC), lineWidth: 1)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         }
     }
 
@@ -659,9 +845,9 @@ struct ContentView: View {
             .disabled(!viewModel.canRunPrimaryAction)
 
             Button {
-                viewModel.copyTranscript()
+                viewModel.copyAllNotes()
             } label: {
-                Label("Copy", systemImage: "doc.on.doc")
+                Label("Copy All", systemImage: "doc.on.doc")
                     .font(.system(size: 16, weight: .semibold))
                     .frame(width: 140, height: 44)
             }
@@ -688,24 +874,15 @@ struct ContentView: View {
                 .foregroundStyle(Color(hex: 0x111827))
 
             ZStack(alignment: .topLeading) {
-                if viewModel.transcriptSegments.isEmpty {
-                    TextEditor(text: $viewModel.transcriptText)
-                        .font(.system(size: 16))
-                        .foregroundStyle(Color(hex: 0x344054))
-                        .scrollContentBackground(.hidden)
-                        .background(Color.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 16)
-                        .disabled(viewModel.selectedRecordingIsTranscribing)
-                } else {
-                    TranscriptReaderView(
-                        segments: viewModel.transcriptSegments,
-                        formatDuration: formatDuration,
-                        onJump: { segment in
-                            viewModel.jumpToTranscriptSegment(segment)
-                        }
-                    )
-                }
+                TextEditor(text: $viewModel.transcriptText)
+                    .font(.system(size: 16))
+                    .foregroundStyle(Color(hex: 0x344054))
+                    .scrollContentBackground(.hidden)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 16)
+                    .disabled(viewModel.selectedRecordingIsTranscribing)
+                    .onChange(of: viewModel.transcriptText) { _, _ in viewModel.scheduleTranscriptAutosave() }
 
                 if viewModel.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    !viewModel.selectedRecordingIsTranscribing,
@@ -738,33 +915,41 @@ struct ContentView: View {
                 }
             }
             .frame(height: 228)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color(hex: 0xD0D5DD), lineWidth: 1)
             }
             .contextMenu {
-                Button {
-                    viewModel.copyTranscript()
-                } label: {
+                Button { viewModel.copyTranscript() } label: {
                     Label("Copy Transcript", systemImage: "doc.on.doc")
                 }
-                Button {
-                    Task { await viewModel.retranscribeSelected() }
-                } label: {
+                Button { Task { await viewModel.retranscribeSelected() } } label: {
                     Label("Re-transcribe", systemImage: "arrow.triangle.2.circlepath")
                 }
                 Divider()
-                Button {
-                    viewModel.saveTranscript(format: .text)
-                } label: {
+                Button { viewModel.saveTranscript(format: .text) } label: {
                     Label("Save as .txt", systemImage: "doc.plaintext")
                 }
-                Button {
-                    viewModel.saveTranscript(format: .markdown)
-                } label: {
+                Button { viewModel.saveTranscript(format: .markdown) } label: {
                     Label("Save as .md", systemImage: "doc.richtext")
+                }
+            }
+            HStack {
+                Text(viewModel.transcriptSaveMessage).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Save") { viewModel.flushTranscriptEdits() }
+                    .keyboardShortcut("s", modifiers: .command)
+            }
+            if !viewModel.transcriptSegments.isEmpty {
+                DisclosureGroup("Timestamped speaker segments") {
+                    TranscriptReaderView(
+                        segments: viewModel.transcriptSegments,
+                        formatDuration: formatDuration,
+                        onJump: viewModel.jumpToTranscriptSegment
+                    )
+                    .frame(height: 180)
                 }
             }
         }
@@ -780,9 +965,10 @@ struct ContentView: View {
                     .font(.system(size: 16))
                     .foregroundStyle(Color(hex: 0x344054))
                     .scrollContentBackground(.hidden)
-                    .background(Color.white)
+                    .background(Color(nsColor: .textBackgroundColor))
                     .padding(.horizontal, 16)
                     .padding(.vertical, 16)
+                    .onChange(of: viewModel.summaryText) { _, _ in viewModel.scheduleSummaryAutosave() }
 
                 if viewModel.summaryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
@@ -798,7 +984,7 @@ struct ContentView: View {
                 }
             }
             .frame(height: 228)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay {
                 RoundedRectangle(cornerRadius: 12)
@@ -1043,7 +1229,7 @@ private struct TranscriptionQueuedOverlay: View {
                     .foregroundStyle(Color(hex: 0x667085))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.white.opacity(0.95))
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.95))
         }
     }
 }
@@ -1094,7 +1280,7 @@ private struct TranscriptReaderView: View {
             }
             .padding(14)
         }
-        .background(Color.white)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private func speakerColor(for speaker: String) -> Color {
@@ -1150,7 +1336,7 @@ private struct TranscriptionProgressOverlay: View {
             }
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .background(Color.white.opacity(0.95))
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.95))
         }
     }
 }
@@ -1190,6 +1376,36 @@ private struct TranscriptionShimmerBar: View {
     }
 }
 
+private struct ReviewWaveformView: View {
+    let samples: [Float]
+    let position: Double
+    let onSeek: (Double) -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let values = samples.isEmpty ? Array(repeating: Float(0.08), count: 96) : samples
+            HStack(alignment: .center, spacing: 2) {
+                ForEach(Array(values.enumerated()), id: \.offset) { index, sample in
+                    Capsule()
+                        .fill(Double(index) / Double(max(1, values.count - 1)) <= position ? Color.accentColor : Color.secondary.opacity(0.28))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: max(3, CGFloat(sample) * 72))
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                onSeek(min(1, max(0, value.location.x / max(1, proxy.size.width))))
+            })
+        }
+        .frame(height: 82)
+        .padding(.horizontal, 8)
+        .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        .overlay { RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.2)) }
+        .accessibilityLabel("Recording waveform")
+        .accessibilityValue("Playback \(Int(position * 100)) percent")
+    }
+}
+
 private struct RecordingSection: Identifiable {
     let title: String
     let recordings: [RecordingItem]
@@ -1207,17 +1423,15 @@ private struct WindowChromeConfigurator: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            configure(nsView.window)
-        }
+        configure(nsView.window)
     }
 
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.styleMask.insert(.fullSizeContentView)
-        window.isMovableByWindowBackground = true
+        if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
+        if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+        if !window.styleMask.contains(.fullSizeContentView) { window.styleMask.insert(.fullSizeContentView) }
+        if !window.isMovableByWindowBackground { window.isMovableByWindowBackground = true }
     }
 }
 
@@ -1241,7 +1455,7 @@ private struct SourceSegmentedControl: View {
                 .background {
                     if selection == source {
                         RoundedRectangle(cornerRadius: 9)
-                            .fill(Color.white)
+                            .fill(Color(nsColor: .controlBackgroundColor))
                             .overlay {
                                 RoundedRectangle(cornerRadius: 9)
                                     .stroke(Color(hex: 0x98A2B3), lineWidth: 1)
@@ -1296,6 +1510,20 @@ private struct RecordingRow: View {
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(Color(hex: 0xD97706))
                 }
+
+                Spacer(minLength: 2)
+                if FileManager.default.fileExists(atPath: recording.transcriptURL.path) {
+                    Image(systemName: "text.quote").help("Has transcript")
+                }
+                if FileManager.default.fileExists(atPath: recording.summaryURL.path) {
+                    Image(systemName: "sparkles").help("Has summary")
+                }
+                if recording.isRecovered {
+                    Image(systemName: "lifepreserver.fill").help("Recovered recording")
+                }
+                if recording.isImported {
+                    Image(systemName: "square.and.arrow.down").help("Imported recording")
+                }
             }
 
             HStack(spacing: 8) {
@@ -1319,7 +1547,7 @@ private struct RecordingRow: View {
         .padding(.trailing, 16)
         .frame(height: 78)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.white : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+        .background(isSelected ? Color(nsColor: .controlBackgroundColor) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
         .overlay(alignment: .leading) {
             if isSelected {
                 RoundedRectangle(cornerRadius: 3)
@@ -1350,6 +1578,7 @@ private struct RecordingRow: View {
 }
 
 private struct SignalMeterView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let title: String
     let level: Float
     let isActive: Bool
@@ -1360,14 +1589,7 @@ private struct SignalMeterView: View {
             Text(title)
                 .font(.system(size: 15))
                 .foregroundStyle(Color(hex: 0x667085))
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color(hex: 0xE4E7EC))
-                Capsule()
-                    .fill(fill)
-                    .frame(width: max(8, meterWidth * CGFloat(max(0, min(1, level)))))
-            }
-            .frame(width: meterWidth, height: 12)
+            meter
             Text(statusText)
                 .font(.system(size: 13))
                 .foregroundStyle(statusColor)
@@ -1375,6 +1597,46 @@ private struct SignalMeterView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title) \(statusText)")
         .accessibilityValue("\(Int(level * 100)) percent")
+    }
+
+    private var meter: some View {
+        meterTrack
+    }
+
+    private var meterTrack: some View {
+        ZStack(alignment: .leading) {
+            Capsule()
+                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.20))
+            Capsule()
+                .fill(fill)
+                .frame(width: max(8, meterWidth * CGFloat(visualLevel)))
+                .shadow(color: activeColor.opacity(isActive ? 0.34 : 0), radius: 3)
+
+            HStack(spacing: 0) {
+                ForEach(0..<12, id: \.self) { index in
+                    if index > 0 {
+                        Rectangle()
+                            .fill(Color(nsColor: .windowBackgroundColor).opacity(0.42))
+                            .frame(width: 1, height: 12)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .clipShape(Capsule())
+        }
+        .frame(width: meterWidth, height: 14)
+        .overlay {
+            Capsule().stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        }
+        .animation(reduceMotion ? nil : .linear(duration: 0.08), value: level)
+    }
+
+    private var visualLevel: Float {
+        let signal = max(0, min(1, level))
+        guard isActive, signal > 0.001 else { return 0.04 }
+        // RMS values are naturally small, so boost their display curve while
+        // preserving a direct, monotonic relationship with the captured audio.
+        return min(1, Float(pow(Double(signal), 0.55)))
     }
 
     private var statusText: String {
@@ -1401,6 +1663,10 @@ private struct SignalMeterView: View {
             endPoint: .trailing
         )
     }
+
+    private var activeColor: Color {
+        title == "System" ? Color(hex: 0x3B82F6) : Color(hex: 0x22C55E)
+    }
 }
 
 private struct PillButtonStyle: ButtonStyle {
@@ -1421,7 +1687,7 @@ private struct OutlineButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(Color(hex: 0x344054))
-            .background(Color.white.opacity(configuration.isPressed ? 0.72 : 1), in: RoundedRectangle(cornerRadius: cornerRadius))
+            .background(Color(nsColor: .controlBackgroundColor).opacity(configuration.isPressed ? 0.72 : 1), in: RoundedRectangle(cornerRadius: cornerRadius))
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius)
                     .stroke(Color(hex: 0xD0D5DD), lineWidth: 1)
@@ -1433,7 +1699,7 @@ private struct CircleButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(Color(hex: 0x111827))
-            .background(Color.white.opacity(configuration.isPressed ? 0.72 : 1), in: Circle())
+            .background(Color(nsColor: .controlBackgroundColor).opacity(configuration.isPressed ? 0.72 : 1), in: Circle())
             .overlay {
                 Circle()
                     .stroke(Color(hex: 0xD0D5DD), lineWidth: 1)
@@ -1512,6 +1778,33 @@ private extension Color {
         let red = Double((hex >> 16) & 0xff) / 255
         let green = Double((hex >> 8) & 0xff) / 255
         let blue = Double(hex & 0xff) / 255
-        self.init(.sRGB, red: red, green: green, blue: blue, opacity: opacity)
+        let color = NSColor(name: nil) { appearance in
+            let match = appearance.bestMatch(from: [.accessibilityHighContrastDarkAqua, .darkAqua, .accessibilityHighContrastAqua, .aqua])
+            let isDark = match == .darkAqua || match == .accessibilityHighContrastDarkAqua
+            let highContrast = match == .accessibilityHighContrastDarkAqua || match == .accessibilityHighContrastAqua
+            guard isDark else { return NSColor(srgbRed: red, green: green, blue: blue, alpha: opacity) }
+            let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+            if abs(red - green) < 0.08, abs(green - blue) < 0.08 {
+                let value: Double
+                if luminance > 0.7 {
+                    let base = highContrast ? 0.055 : 0.085
+                    let scale = highContrast ? 2.15 : 1.65
+                    value = min(highContrast ? 0.40 : 0.34, base + (1 - luminance) * scale)
+                } else {
+                    let base = highContrast ? 0.80 : 0.70
+                    let scale = highContrast ? 0.42 : 0.46
+                    value = min(highContrast ? 0.98 : 0.92, base + max(0, 0.48 - luminance) * scale)
+                }
+                return NSColor(srgbRed: value, green: value, blue: value, alpha: opacity)
+            }
+            let lift = luminance < 0.45 ? 0.28 : 0
+            return NSColor(
+                srgbRed: min(1, red + lift),
+                green: min(1, green + lift),
+                blue: min(1, blue + lift),
+                alpha: opacity
+            )
+        }
+        self.init(nsColor: color)
     }
 }

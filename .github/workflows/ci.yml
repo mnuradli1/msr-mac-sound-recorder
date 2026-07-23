@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve dependencies
+        run: swift package resolve
+      - name: Build debug and release
+        run: |
+          swift build
+          swift build -c release
+      - name: SwiftPM tests
+        run: swift test
+      - name: E2E fake-provider and storage harness
+        run: swift run MSRTestRunner
+      - name: Validate package metadata
+        run: |
+          plutil -lint Config/MSRMeetingRecorder-Info.plist
+          plutil -lint Config/MSRMeetingRecorder.entitlements
+      - name: Package and smoke-launch unsigned artifacts
+        env:
+          MSR_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          scripts/package_app.sh
+          scripts/smoke_launch.sh
+          shasum -a 256 -c dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msr-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/SHA256SUMS
+            dist/provenance.json
+            dist/msr.rb

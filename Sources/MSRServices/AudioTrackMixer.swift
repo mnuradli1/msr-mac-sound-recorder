@@ -1,8 +1,21 @@
 import AVFoundation
 import Foundation
 
+public struct TimedAudioInput: Sendable {
+    public var url: URL
+    public var offset: TimeInterval
+    public init(url: URL, offset: TimeInterval = 0) {
+        self.url = url
+        self.offset = max(0, offset)
+    }
+}
+
 public enum AudioTrackMixer {
     public static func mixToSingleM4A(inputs: [URL], outputURL: URL) async throws {
+        try await mixToSingleM4A(inputs: inputs.map { TimedAudioInput(url: $0) }, outputURL: outputURL)
+    }
+
+    public static func mixToSingleM4A(inputs: [TimedAudioInput], outputURL: URL) async throws {
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
@@ -12,8 +25,9 @@ public enum AudioTrackMixer {
         var inputParameters: [AVMutableAudioMixInputParameters] = []
         var insertedAnyTrack = false
 
-        for input in inputs where FileManager.default.fileExists(atPath: input.path) {
-            let asset = AVURLAsset(url: input)
+        let headroom = Float(1 / sqrt(Double(max(1, inputs.count))))
+        for input in inputs where FileManager.default.fileExists(atPath: input.url.path) {
+            let asset = AVURLAsset(url: input.url)
             let tracks = try await asset.loadTracks(withMediaType: .audio)
             let duration = try await asset.load(.duration)
 
@@ -27,10 +41,10 @@ public enum AudioTrackMixer {
                 try compositionTrack.insertTimeRange(
                     CMTimeRange(start: .zero, duration: duration),
                     of: track,
-                    at: .zero
+                    at: CMTime(seconds: input.offset, preferredTimescale: 48_000)
                 )
                 let parameters = AVMutableAudioMixInputParameters(track: compositionTrack)
-                parameters.setVolume(1.0, at: .zero)
+                parameters.setVolume(headroom, at: .zero)
                 inputParameters.append(parameters)
                 insertedAnyTrack = true
             }
