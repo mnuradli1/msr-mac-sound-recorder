@@ -12,6 +12,10 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    env:
+      HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+      HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+      HAS_HOMEBREW_TAP: ${{ secrets.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,7 +27,7 @@ jobs:
           swift test
           swift run MSRTestRunner
       - name: Import Developer ID certificate
-        if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+        if: ${{ env.HAS_APPLE_CERTIFICATE == 'true' }}
         env:
           CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -39,7 +43,7 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
       - name: Configure notarization profile
-        if: ${{ secrets.APPLE_ID != '' }}
+        if: ${{ env.HAS_APPLE_ID == 'true' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -49,7 +53,7 @@ jobs:
         env:
           MSR_BUILD_NUMBER: ${{ github.run_number }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_NOTARY_PROFILE: ${{ secrets.APPLE_ID != '' && 'msr-ci' || '' }}
+          APPLE_NOTARY_PROFILE: ${{ env.HAS_APPLE_ID == 'true' && 'msr-ci' || '' }}
         run: scripts/package_app.sh
       - name: Smoke-launch packaged app
         run: scripts/smoke_launch.sh
@@ -69,7 +73,7 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
       - name: Publish Homebrew cask when configured
-        if: ${{ secrets.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HAS_HOMEBREW_TAP == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPOSITORY: ${{ secrets.HOMEBREW_TAP_REPOSITORY }}
