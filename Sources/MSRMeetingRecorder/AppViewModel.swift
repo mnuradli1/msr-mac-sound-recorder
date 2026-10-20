@@ -2,7 +2,6 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import Combine
-import CryptoKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -85,6 +84,13 @@ final class AppViewModel: ObservableObject {
     @Published var localAPIStatusMessage = ""
     @Published var recoveryMessage = ""
     @Published var recoveryNoticeSeverity: AppNoticeSeverity = .info
+    /// Set when auto-transcribe is on but could not run for the recording that
+    /// just finished (for example no API key for the provider). Cleared when the
+    /// next recording starts, when settings or keys change, or by
+    /// `clearAutoTranscribeNotice()`.
+    @Published var autoTranscribeNotice: String?
+    /// Set when auto-title renamed a recording, e.g. `Titled “Launch date and onboarding owner”`.
+    @Published var lastAutoTitleNotice: String?
     @Published private var recordingSearchDocuments: [RecordingSearchDocument] = []
     @Published private var filteredRecordingIDs: [UUID]?
 
@@ -123,15 +129,30 @@ final class AppViewModel: ObservableObject {
     private let searchIndexer = RecordingSearchIndexer(capacity: 64)
     private var searchIndexTask: Task<Void, Never>?
     private var watchedFolderPath: String?
+    private var didBootstrap = false
+    /// The settings whose side effects (hotkey, watcher, health, local API) were
+    /// last applied; `saveSettings()` only re-runs a side effect when its inputs change.
+    private var lastAppliedSettings: AppSettings
+    private var settingsSaveTask: Task<Void, Never>?
+    /// The folder the running local API server was started for.
+    private var localAPIApprovedFolder: URL?
+    /// Dev/scenario hook: when `true`, settings changes stay in memory and are
+    /// never written to `UserDefaults`.
+    var settingsPersistenceSuspended = false
 
+    /// - Parameter recorder: the capture engine. `nil` uses `MeetingAudioRecorder`,
+    ///   or, for development, `FileReplayRecorder` when the environment variable
+    ///   `MSR_FAKE_RECORDER_CLIP` names an existing audio file (each "recording"
+    ///   then becomes a copy of that clip; no microphone or screen permission needed).
     init(
-        recorder: AudioRecording = MeetingAudioRecorder(),
+        recorder: AudioRecording? = nil,
         libraryFactory: @escaping (URL) -> any RecordingLibraryServing = { RecordingLibrary(folderURL: $0) }
     ) {
         let loadedSettings = settingsStore.load()
         settings = loadedSettings
+        lastAppliedSettings = loadedSettings
         presentation = PresentationCoordinator(settings: loadedSettings)
-        self.recorder = recorder
+        self.recorder = recorder ?? Self.makeDefaultRecorder()
         self.libraryFactory = libraryFactory
         aiService = ProviderAIService(keyStore: keyStore)
         selectedSource = settings.preferredSource
@@ -162,7 +183,16 @@ final class AppViewModel: ObservableObject {
                 self?.updateSourceLevel(channel, level)
             }
         }
+        lastAppliedSettings = settings
         bindPresentationModels()
+    }
+
+    private static func makeDefaultRecorder() -> AudioRecording {
+        if let path = ProcessInfo.processInfo.environment["MSR_FAKE_RECORDER_CLIP"], !path.isEmpty,
+           FileManager.default.fileExists(atPath: path) {
+            return FileReplayRecorder(clipURL: URL(fileURLWithPath: path))
+        }
+        return MeetingAudioRecorder()
     }
 
     private func bindPresentationModels() {
@@ -430,6 +460,38 @@ final class AppViewModel: ObservableObject {
         settings.provider.displayName
     }
 
+    // MARK: - Auto-transcribe / auto-title state for the UI
+
+    /// Who chose the selected recording's title (`nil` when nothing is selected).
+    var selectedRecordingTitleSource: RecordingTitleSource? {
+        selectedRecording?.effectiveTitleSource
+    }
+
+    /// "Auto" when the recording's latest transcription job was queued by
+    /// auto-transcribe; `nil` otherwise.
+    func transcriptionOriginLabel(for recording: RecordingItem) -> String? {
+        // In-memory only: this is evaluated per row while rendering.
+        transcriptionJobs.first { $0.recordingID == recording.id }?.origin == .automatic ? "Auto" : nil
+    }
+
+    /// Auto-transcribe is switched on AND the current provider has an API key.
+    var autoTranscribeIsEffective: Bool {
+        settings.autoTranscribe && credentialAvailable(for: settings.provider)
+    }
+
+    func clearAutoTranscribeNotice() {
+        autoTranscribeNotice = nil
+    }
+
+    func clearAutoTitleNotice() {
+        lastAutoTitleNotice = nil
+    }
+
+    /// Whether an API key for `provider` is available (session, Keychain or environment).
+    func credentialAvailable(for provider: AIProvider) -> Bool {
+        keyStore.apiKey(for: provider) != nil
+    }
+
     func startLocalAPI() {
         guard settings.localAPIEnabled else {
             localAPIStatusMessage = "Local API disabled"
@@ -444,6 +506,7 @@ final class AppViewModel: ObservableObject {
         do {
             try server.start()
             localServer = server
+            localAPIApprovedFolder = approvedFolder
             localAPIStatusMessage = "Local API running on 127.0.0.1:\(server.port) · token \(server.bearerToken)"
             if statusMessage.hasPrefix("Local API") {
                 statusMessage = "Ready"
@@ -457,10 +520,24 @@ final class AppViewModel: ObservableObject {
     func stopLocalAPI() {
         localServer?.stop()
         localServer = nil
+        localAPIApprovedFolder = nil
         localAPIStatusMessage = "Local API disabled"
     }
 
+    /// The local API only serves files inside the folder it was started for;
+    /// restart a running server when the recordings folder changes.
+    private func restartLocalAPIIfFolderChanged() {
+        guard localServer != nil,
+              localAPIApprovedFolder != recordingsFolderURL.standardizedFileURL else { return }
+        stopLocalAPI()
+        startLocalAPI()
+    }
+
+    /// Runs once per process: recreating the window re-runs the view's `.task`,
+    /// which must not re-mark running jobs as interrupted or re-run recovery.
     func bootstrap() async {
+        guard !didBootstrap else { return }
+        didBootstrap = true
         installPowerObservers()
         microphoneDevices = AudioDeviceCatalog.microphones()
         globalHotkeyService.configure(enabled: settings.globalShortcutEnabled) { [weak self] in
@@ -572,8 +649,13 @@ final class AppViewModel: ObservableObject {
         windowSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(600))
             guard !Task.isCancelled, let self else { return }
-            self.settingsStore.save(self.settings)
+            self.persistSettings()
         }
+    }
+
+    private func persistSettings() {
+        guard !settingsPersistenceSuspended else { return }
+        settingsStore.save(settings)
     }
 
     func openSettingsWindow() {
@@ -618,6 +700,7 @@ final class AppViewModel: ObservableObject {
                 settings.recordingsFolderPath = url.path
                 settings.recordingsFolderBookmark = bookmark
                 saveSettings()
+                restartLocalAPIIfFolderChanged()
                 loadRecordings()
             } catch {
                 if gainedScope { url.stopAccessingSecurityScopedResource() }
@@ -792,6 +875,7 @@ final class AppViewModel: ObservableObject {
         statusMessage = "Starting \(source.displayName)"
         recoveryMessage = ""
         recoveryNoticeSeverity = .info
+        autoTranscribeNotice = nil
         resetSignalLevels()
         microphonePeakDuringRecording = 0
         systemPeakDuringRecording = 0
@@ -1056,6 +1140,7 @@ final class AppViewModel: ObservableObject {
             preparePlayback(for: recording)
             workflowState = .saved
             statusMessage = segmentURLs.count > 1 ? "Recording saved from \(segmentURLs.count) segments" : "Recording saved"
+            autoTranscribeIfEnabled(recording: selectedRecording ?? recording, confidenceReport: confidenceReport)
         } catch {
             endSleepPrevention()
             if var manifest = currentSessionManifest {
@@ -1070,6 +1155,31 @@ final class AppViewModel: ObservableObject {
             recoveryNoticeSeverity = .error
             resetSignalLevels()
             statusMessage = error.localizedDescription
+        }
+    }
+
+    /// Queues a transcription for a recording that was just captured (never for
+    /// recovered or imported recordings) when auto-transcribe is on.
+    private func autoTranscribeIfEnabled(recording: RecordingItem, confidenceReport: RecordingConfidenceReport?) {
+        guard settings.autoTranscribe else { return }
+        let provider = settings.provider
+        guard credentialAvailable(for: provider) else {
+            let notice = "Recording saved · auto-transcribe skipped: add a \(provider.displayName) API key in Settings"
+            autoTranscribeNotice = notice
+            statusMessage = notice
+            return
+        }
+        guard RecordingInteractionPolicy.shouldAutoTranscribe(report: confidenceReport) else {
+            statusMessage = "Recording saved · auto-transcribe skipped (audio too short or empty)"
+            return
+        }
+        if enqueueTranscription(
+            recording: recording,
+            replacingExistingTranscript: false,
+            origin: .automatic,
+            autoTitleRequested: settings.autoTitle
+        ) {
+            statusMessage = "Recording saved · transcription queued"
         }
     }
 
@@ -1463,21 +1573,65 @@ final class AppViewModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([lastExportURL])
     }
 
+    /// Debounced `saveSettings()` (600 ms) for controls that change continuously
+    /// (sliders, text fields, toggles bound directly to `settings`).
+    func scheduleSettingsSave() {
+        settingsSaveTask?.cancel()
+        settingsSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.saveSettings()
+        }
+    }
+
+    /// Persists `settings` and applies side effects. Expensive side effects
+    /// (hotkey registration, folder watcher, setup health, local API restart)
+    /// only run when the settings they depend on changed since the last apply.
     func saveSettings() {
-        settingsStore.save(settings)
-        selectedSource = settings.preferredSource
-        recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
+        settingsSaveTask?.cancel()
+        settingsSaveTask = nil
+        persistSettings()
+        let previous = lastAppliedSettings
+        lastAppliedSettings = settings
+
+        if previous.preferredSource != settings.preferredSource {
+            selectedSource = settings.preferredSource
+        }
+        if previous.microphoneDeviceID != settings.microphoneDeviceID {
+            recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
+        }
         audioPlayer?.rate = Float(settings.playbackSpeed)
+
+        let folderChanged = previous.recordingsFolderPath != settings.recordingsFolderPath
+            || previous.recordingsFolderBookmark != settings.recordingsFolderBookmark
         if settings.localAPIEnabled {
             startLocalAPI()
-        } else {
+            if folderChanged { restartLocalAPIIfFolderChanged() }
+        } else if localServer != nil {
             stopLocalAPI()
         }
-        globalHotkeyService.configure(enabled: settings.globalShortcutEnabled) { [weak self] in
-            Task { await self?.toggleRecording() }
+        if previous.globalShortcutEnabled != settings.globalShortcutEnabled {
+            globalHotkeyService.configure(enabled: settings.globalShortcutEnabled) { [weak self] in
+                Task { await self?.toggleRecording() }
+            }
         }
-        startLibraryWatcher()
-        refreshSetupHealth()
+        if folderChanged {
+            startLibraryWatcher()
+            refreshSetupHealth()
+        }
+        if Self.userFacingSettingsDiffer(previous, settings) {
+            autoTranscribeNotice = nil
+        }
+        // A provider switch can make queued jobs runnable.
+        processTranscriptionQueueIfNeeded()
+    }
+
+    /// Ignores window geometry, which is saved on its own as the window resizes.
+    private static func userFacingSettingsDiffer(_ lhs: AppSettings, _ rhs: AppSettings) -> Bool {
+        var lhs = lhs
+        lhs.windowWidth = rhs.windowWidth
+        lhs.windowHeight = rhs.windowHeight
+        return lhs != rhs
     }
 
     func showMainWindow() {
@@ -1515,7 +1669,11 @@ final class AppViewModel: ObservableObject {
                 }
                 openAIKeyDraft = ""
             }
+            autoTranscribeNotice = nil
             saveSettings()
+            refreshSetupHealth()
+            // A newly added key can make waiting jobs runnable.
+            processTranscriptionQueueIfNeeded()
             statusMessage = "Settings saved"
         } catch {
             workflowState = .failed(error.localizedDescription)
@@ -1643,15 +1801,28 @@ final class AppViewModel: ObservableObject {
         setupHealthItems = [microphoneItem, screenItem, elevenLabsItem, openAIItem, folderItem]
     }
 
+    /// Queues a transcription with the current provider. Refuses (and says why
+    /// in `statusMessage`) when a job is already pending or the provider has no
+    /// API key, so the queue never holds jobs it cannot run.
+    /// - Parameter autoTitleRequested: defaults to `settings.autoTitle`.
+    /// - Returns: whether a job was queued.
+    @discardableResult
     private func enqueueTranscription(
         recording: RecordingItem,
         replacingExistingTranscript: Bool,
-        trimRange: AudioTrimRange? = nil
-    ) {
-        guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return }
+        trimRange: AudioTrimRange? = nil,
+        origin: TranscriptionJobOrigin = .manual,
+        autoTitleRequested: Bool? = nil
+    ) -> Bool {
+        guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return false }
         guard !hasPendingTranscription(for: recording.id) else {
             statusMessage = "Transcription already queued"
-            return
+            return false
+        }
+        let provider = settings.provider
+        guard credentialAvailable(for: provider) else {
+            statusMessage = "Add a \(provider.displayName) API key in Settings to transcribe."
+            return false
         }
 
         let store = transcriptionJobStore()
@@ -1660,11 +1831,13 @@ final class AppViewModel: ObservableObject {
             recordingID: recording.id,
             recordingName: recording.displayName,
             audioFileName: recording.audioURL.lastPathComponent,
-            provider: settings.provider,
+            provider: provider,
             replacingExistingTranscript: replacingExistingTranscript,
             previousAttemptCount: previousAttemptCount,
             trimStartSeconds: trimRange?.startSeconds,
-            trimEndSeconds: trimRange?.endSeconds
+            trimEndSeconds: trimRange?.endSeconds,
+            origin: origin,
+            autoTitleRequested: autoTitleRequested ?? settings.autoTitle
         )
 
         do {
@@ -1672,14 +1845,26 @@ final class AppViewModel: ObservableObject {
             loadTranscriptionJobs()
             statusMessage = replacingExistingTranscript ? "Re-transcription queued" : "Transcription queued"
             processTranscriptionQueueIfNeeded()
+            return true
         } catch {
             statusMessage = error.localizedDescription
+            return false
         }
     }
 
+    /// The oldest queued job whose provider currently has an API key.
+    private func nextRunnableQueuedJob() -> TranscriptionJob? {
+        transcriptionJobs
+            .filter { $0.status == .queued && credentialAvailable(for: $0.provider) }
+            .min { $0.queuedAt < $1.queuedAt }
+    }
+
+    /// Starts the queue worker when a runnable job exists. Jobs whose provider
+    /// has no key stay queued until a key is added (`saveAPIKeys`/`saveSettings`
+    /// call this again).
     private func processTranscriptionQueueIfNeeded() {
         guard transcriptionQueueTask == nil else { return }
-        guard transcriptionJobs.contains(where: { $0.status == .queued }) else { return }
+        guard nextRunnableQueuedJob() != nil else { return }
         transcriptionQueueTask = Task { [weak self] in
             await self?.runTranscriptionQueue()
         }
@@ -1689,19 +1874,16 @@ final class AppViewModel: ObservableObject {
         defer {
             transcriptionQueueTask = nil
             transcriptionStartedAt = nil
-            if transcriptionJobs.contains(where: { $0.status == .queued }) {
+            // Re-arm only for jobs that can actually run; re-arming for a job
+            // without a credential would spin forever.
+            if nextRunnableQueuedJob() != nil {
                 processTranscriptionQueueIfNeeded()
             }
         }
 
         while !Task.isCancelled {
             loadTranscriptionJobs()
-            guard var job = transcriptionJobs
-                .filter({ $0.status == .queued && credentialAvailable(for: $0.provider) })
-                .sorted(by: { $0.queuedAt < $1.queuedAt })
-                .first else {
-                break
-            }
+            guard var job = nextRunnableQueuedJob() else { break }
 
             if recoverPublishedJobIfPossible(&job) {
                 saveTranscriptionJob(job)
@@ -1724,8 +1906,10 @@ final class AppViewModel: ObservableObject {
             return
         }
 
+        var running = job
         do {
-            let stableRecording = try library().rename(recording, to: recording.displayName)
+            let recordingLibrary = library()
+            let stableRecording = try recordingLibrary.migrateIfNeeded(recording)
             let trimRange: AudioTrimRange? = {
                 guard let end = job.trimEndSeconds else { return nil }
                 return AudioTrimRange(startSeconds: job.trimStartSeconds ?? 0, endSeconds: end)
@@ -1737,56 +1921,48 @@ final class AppViewModel: ObservableObject {
                 compressionEnabled: settings.compressUploads
             )
             defer { prepared.cleanUp() }
-            var running = job
             running.usedUncompressedAudioFallback = prepared.usedUncompressedFallback
             running.audioPreparationWarning = prepared.warning
             saveTranscriptionJob(running)
 
             let decoded = try await aiService.transcribe(audioURL: prepared.url, provider: job.provider)
             try Task.checkCancellation()
-            let segments = decoded.segments.isEmpty
-                ? TranscriptParser.segments(from: decoded.text)
-                : decoded.segments
-            let hash = Self.sha256(decoded.text)
-            running.markPublishing(
-                transcriptFileName: stableRecording.transcriptURL.lastPathComponent,
-                contentSHA256: hash
-            )
-            saveTranscriptionJob(running)
-            let publishedRecording = try library().writeTranscriptBundle(decoded.text, segments: segments, for: stableRecording)
-            if job.replacingExistingTranscript {
-                _ = try library().clearSummary(for: publishedRecording)
-            }
-            var finalRecording = publishedRecording
-            if settings.autoTitle,
-               job.provider == .openAI,
-               isDefaultMeetingName(finalRecording.displayName),
-               let generatedTitle = try? await aiService.generateTitle(transcript: decoded.text),
-               !generatedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                finalRecording = try library().rename(finalRecording, to: generatedTitle)
-            }
-            loadRecordings()
-            refreshSearchDocument(for: finalRecording)
 
-            var completed = running
-            completed.markCompleted(transcriptFileName: finalRecording.transcriptURL.lastPathComponent)
-            saveTranscriptionJob(completed)
-            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: finalRecording.id, selectedID: selectedRecording?.id) {
-                selectedRecording = finalRecording
-                transcriptText = decoded.text
-                transcriptSegments = segments
-                selectedTranscriptionJob = completed
-                if job.replacingExistingTranscript {
-                    summaryText = ""
-                }
+            let service = aiService
+            var titleGenerator: TranscriptPublisher.TitleGenerator?
+            if service.canGenerateTitlesRemotely {
+                titleGenerator = { transcript -> String? in try await service.generateTitle(transcript: transcript) }
             }
+            let result = try await TranscriptPublisher.publish(
+                job: running,
+                recording: stableRecording,
+                decoded: decoded,
+                autoTitleRequested: job.autoTitleRequested,
+                library: recordingLibrary,
+                titleGenerator: titleGenerator,
+                checkpoint: { [weak self] checkpointed in
+                    running = checkpointed
+                    self?.saveTranscriptionJob(checkpointed)
+                }
+            )
+            applyPublishedTranscript(result, transcript: decoded.text, replacedExisting: job.replacingExistingTranscript)
             statusMessage = job.replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
+            if let title = result.generatedTitle {
+                statusMessage += " · titled \u{201C}\(title)\u{201D}"
+            }
         } catch is CancellationError {
             var cancelled = job
             cancelled.markCancelled()
             saveTranscriptionJob(cancelled)
             statusMessage = "Transcription cancelled"
         } catch {
+            // A failure after the job was checkpointed as completed (e.g. a
+            // summary-clear error) must not flip it back to failed.
+            if running.status == .completed {
+                loadRecordings()
+                statusMessage = error.localizedDescription
+                return
+            }
             let message = TranscriptionErrorMessage.message(for: error)
             var failed = job
             failed.markFailed(message)
@@ -1795,6 +1971,27 @@ final class AppViewModel: ObservableObject {
                 selectedTranscriptionJob = failed
             }
             statusMessage = message
+        }
+    }
+
+    /// Refreshes the library and, when the published recording is still
+    /// selected, the transcript pane, after `TranscriptPublisher` finished.
+    private func applyPublishedTranscript(_ result: TranscriptPublishResult, transcript: String, replacedExisting: Bool) {
+        let finalRecording = result.recording
+        loadRecordings()
+        refreshSearchDocument(for: finalRecording)
+        if let title = result.generatedTitle {
+            lastAutoTitleNotice = "Titled \u{201C}\(title)\u{201D}"
+        }
+        if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: finalRecording.id, selectedID: selectedRecording?.id) {
+            selectedRecording = recordings.first(where: { $0.id == finalRecording.id }) ?? finalRecording
+            transcriptText = transcript
+            transcriptSegments = result.segments
+            selectedTranscriptionJob = job(for: finalRecording.id) ?? result.job
+            if replacedExisting {
+                summaryText = ""
+            }
+            updateExportPreview()
         }
     }
 
@@ -1823,25 +2020,17 @@ final class AppViewModel: ObservableObject {
         loadTranscriptionJobs()
     }
 
-    private func credentialAvailable(for provider: AIProvider) -> Bool {
-        keyStore.apiKey(for: provider) != nil
-    }
-
+    /// Completes a job whose transcript was already written before the app
+    /// stopped (SHA-256 checkpoint), including the skipped side effects.
     private func recoverPublishedJobIfPossible(_ job: inout TranscriptionJob) -> Bool {
-        guard let expected = job.transcriptContentSHA256,
+        guard job.transcriptContentSHA256 != nil,
               let recording = recording(for: job),
-              let transcript = try? String(contentsOf: recording.transcriptURL, encoding: .utf8),
-              Self.sha256(transcript) == expected else { return false }
-        job.markCompleted(transcriptFileName: recording.transcriptURL.lastPathComponent)
+              let result = TranscriptPublisher.recoverIfPublished(job: job, recording: recording, library: library())
+        else { return false }
+        job = result.job
+        let transcript = readTextIfExists(at: result.recording.transcriptURL)
+        applyPublishedTranscript(result, transcript: transcript, replacedExisting: job.replacingExistingTranscript)
         return true
-    }
-
-    private func isDefaultMeetingName(_ name: String) -> Bool {
-        name == "Untitled Meeting" || name.hasPrefix("Meeting ")
-    }
-
-    private static func sha256(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func job(for recordingID: UUID) -> TranscriptionJob? {
