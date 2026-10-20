@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
+import os
 
 public struct MicrophoneDevice: Identifiable, Equatable, Sendable {
     public var id: String
@@ -15,6 +16,8 @@ public struct MicrophoneDevice: Identifiable, Equatable, Sendable {
 }
 
 public enum AudioDeviceCatalog {
+    private static let logger = Logger(subsystem: "app.msr.MSRMeetingRecorder", category: "audio-devices")
+
     public static func microphones() -> [MicrophoneDevice] {
         let defaultID = defaultInputDeviceID()
         return allDeviceIDs().compactMap { deviceID in
@@ -44,7 +47,11 @@ public enum AudioDeviceCatalog {
             UInt32(MemoryLayout<AudioDeviceID>.size),
             &mutableTarget
         )
-        return status == noErr ? previous : nil
+        guard status == noErr else {
+            logger.error("Could not switch default input device (OSStatus \(status, privacy: .public)); recording uses the current default.")
+            return nil
+        }
+        return previous
     }
 
     static func restoreInputDevice(_ deviceID: AudioDeviceID?) {
@@ -54,7 +61,7 @@ public enum AudioDeviceCatalog {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        AudioObjectSetPropertyData(
+        let status = AudioObjectSetPropertyData(
             AudioObjectID(kAudioObjectSystemObject),
             &address,
             0,
@@ -62,6 +69,10 @@ public enum AudioDeviceCatalog {
             UInt32(MemoryLayout<AudioDeviceID>.size),
             &deviceID
         )
+        // Best effort (the device may have been unplugged); never fail a stop over it, but leave a trace.
+        if status != noErr {
+            logger.error("Could not restore default input device \(deviceID, privacy: .public) (OSStatus \(status, privacy: .public)).")
+        }
     }
 
     private static func allDeviceIDs() -> [AudioDeviceID] {
@@ -97,7 +108,8 @@ public enum AudioDeviceCatalog {
         var value: Unmanaged<CFString>?
         var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return nil }
-        return value?.takeUnretainedValue() as String?
+        // CoreAudio returns CFString properties at +1 ("the caller is responsible for releasing"), so balance it.
+        return value?.takeRetainedValue() as String?
     }
 
     private static func inputChannelCount(_ deviceID: AudioDeviceID) -> Int {

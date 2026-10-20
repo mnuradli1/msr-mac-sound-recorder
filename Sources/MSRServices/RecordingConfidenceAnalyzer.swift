@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 import MSRCore
@@ -78,22 +79,32 @@ public enum RecordingConfidenceAnalyzer {
         var peak: Float = 0
         var sumSquares = 0.0
         var sampleCount = 0
+        // AVAudioFile's processing format is deinterleaved Float32, so each channel is a contiguous float run.
+        var clipped = [Float](repeating: 0, count: Int(frameCapacity))
+        var lowerBound: Float = -1
+        var upperBound: Float = 1
 
         while file.framePosition < file.length {
+            try Task.checkCancellation()
             try file.read(into: buffer)
             let frames = Int(buffer.frameLength)
             guard frames > 0 else { break }
 
             if let channels = buffer.floatChannelData {
                 let channelCount = Int(format.channelCount)
+                let length = vDSP_Length(frames)
                 for channelIndex in 0..<channelCount {
-                    let samples = UnsafeBufferPointer(start: channels[channelIndex], count: frames)
-                    for sample in samples {
-                        let clamped = min(1, max(-1, sample))
-                        peak = max(peak, abs(clamped))
-                        sumSquares += Double(clamped * clamped)
-                        sampleCount += 1
+                    var channelPeak: Float = 0
+                    var channelRMS: Float = 0
+                    clipped.withUnsafeMutableBufferPointer { scratch in
+                        guard let scratch = scratch.baseAddress else { return }
+                        vDSP_vclip(channels[channelIndex], 1, &lowerBound, &upperBound, scratch, 1, length)
+                        vDSP_maxmgv(scratch, 1, &channelPeak, length)
+                        vDSP_rmsqv(scratch, 1, &channelRMS, length)
                     }
+                    peak = max(peak, channelPeak)
+                    sumSquares += Double(channelRMS) * Double(channelRMS) * Double(frames)
+                    sampleCount += frames
                 }
             }
         }

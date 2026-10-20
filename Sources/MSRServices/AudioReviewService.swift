@@ -61,6 +61,8 @@ public enum TranscriptionAudioPreparer {
             return PreparedTranscriptionAudio(url: output, isTemporary: true)
         } catch {
             try? FileManager.default.removeItem(at: output)
+            // A cancelled job must stop here rather than fall back to uploading the original audio.
+            if error is CancellationError || Task.isCancelled { throw CancellationError() }
             if needsTrim { throw error }
             return PreparedTranscriptionAudio(
                 url: sourceURL,
@@ -111,20 +113,26 @@ public enum TranscriptionAudioPreparer {
                 duration: CMTime(seconds: trimRange.duration, preferredTimescale: 600)
             )
         }
+        let formatDescriptions = try await track.load(.formatDescriptions)
+        let stream = formatDescriptions.first.flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
+        // The AAC encoder rejects 96 kbps below ~44.1 kHz ("Cannot Encode Media"), so low-rate sources
+        // (16/22.05 kHz phone or conferencing exports) are resampled by the reader before encoding.
+        let sourceRate = stream?.mSampleRate ?? 44_100
+        let sampleRate = sourceRate < 44_100 ? 44_100 : min(48_000, sourceRate)
+        let channels = max(1, min(2, Int(stream?.mChannelsPerFrame ?? 1)))
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channels,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false
         ])
         guard reader.canAdd(output) else { throw AudioReviewError.exportUnavailable }
         reader.add(output)
 
         let writer = try AVAssetWriter(outputURL: destinationURL, fileType: .m4a)
-        let formatDescriptions = try await track.load(.formatDescriptions)
-        let stream = formatDescriptions.first.flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
-        let sampleRate = max(8_000, min(48_000, stream?.mSampleRate ?? 44_100))
-        let channels = max(1, min(2, Int(stream?.mChannelsPerFrame ?? 1)))
         let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: sampleRate,
@@ -142,33 +150,48 @@ public enum TranscriptionAudioPreparer {
         do {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    session.install(continuation)
                     let queue = DispatchQueue(label: "app.msr.audio-compression")
                     session.input.requestMediaDataWhenReady(on: queue) {
-                        while session.input.isReadyForMoreMediaData {
+                        while session.input.isReadyForMoreMediaData, !session.isFinished {
                             if let sample = session.output.copyNextSampleBuffer() {
                                 if !session.input.append(sample) {
-                                    session.reader.cancelReading()
-                                    session.writer.cancelWriting()
-                                    continuation.resume(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? "Could not encode audio"))
+                                    session.cancelReaderAndWriter()
+                                    session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? "Could not encode audio"))
                                     return
                                 }
-                            } else {
+                                continue
+                            }
+                            // `nil` means end of data *or* a reader failure/cancellation; only the former may be published.
+                            switch session.reader.status {
+                            case .failed:
+                                session.cancelReaderAndWriter()
+                                session.finish(throwing: session.reader.error ?? CocoaError(.fileReadCorruptFile))
+                            case .cancelled:
+                                session.cancelReaderAndWriter()
+                                session.finish(throwing: CancellationError())
+                            default:
+                                guard session.writer.status == .writing else {
+                                    session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? "Audio preparation was cancelled"))
+                                    return
+                                }
                                 session.input.markAsFinished()
                                 session.writer.finishWriting {
                                     if session.writer.status == .completed {
-                                        continuation.resume()
+                                        session.finish(throwing: nil)
                                     } else {
-                                        continuation.resume(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? session.reader.error?.localizedDescription ?? "Audio preparation did not complete"))
+                                        session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? session.reader.error?.localizedDescription ?? "Audio preparation did not complete"))
                                     }
                                 }
-                                return
                             }
+                            return
                         }
                     }
                 }
             } onCancel: {
-                session.reader.cancelReading()
-                session.writer.cancelWriting()
+                session.cancelReaderAndWriter()
+                // A cancelled writer may never ask for more data again, so resume the waiter here.
+                session.finish(throwing: CancellationError())
             }
         } catch {
             try? FileManager.default.removeItem(at: destinationURL)
@@ -182,12 +205,49 @@ private final class AudioCompressionSession: @unchecked Sendable {
     let writer: AVAssetWriter
     let input: AVAssetWriterInput
     let output: AVAssetReaderTrackOutput
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var finished = false
 
     init(reader: AVAssetReader, writer: AVAssetWriter, input: AVAssetWriterInput, output: AVAssetReaderTrackOutput) {
         self.reader = reader
         self.writer = writer
         self.input = input
         self.output = output
+    }
+
+    var isFinished: Bool { lock.withLock { finished } }
+
+    /// Cancels whichever side is still active; never touches a writer that already completed or failed.
+    func cancelReaderAndWriter() {
+        if reader.status == .reading { reader.cancelReading() }
+        if writer.status == .writing { writer.cancelWriting() }
+    }
+
+    func install(_ continuation: CheckedContinuation<Void, Error>) {
+        let alreadyFinished = lock.withLock {
+            self.continuation = continuation
+            return finished
+        }
+        // Cancellation can win the race before the continuation exists.
+        if alreadyFinished { finish(throwing: CancellationError(), force: true) }
+    }
+
+    /// Resumes the waiter exactly once; later calls are ignored.
+    func finish(throwing error: Error?, force: Bool = false) {
+        let waiter: CheckedContinuation<Void, Error>? = lock.withLock {
+            guard force || !finished else { return nil }
+            finished = true
+            let waiter = continuation
+            continuation = nil
+            return waiter
+        }
+        guard let waiter else { return }
+        if let error {
+            waiter.resume(throwing: error)
+        } else {
+            waiter.resume()
+        }
     }
 }
 
