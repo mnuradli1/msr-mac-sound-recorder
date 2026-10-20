@@ -20,11 +20,14 @@ public enum LocalHTTPServerError: Error, LocalizedError, Equatable {
 
 public final class LocalHTTPServer: @unchecked Sendable {
     private static let startTimeout: TimeInterval = 2
+    private static let stopTimeout: TimeInterval = 2
 
     private let proxy: LocalAPIProxy
     private let queue = DispatchQueue(label: "app.msr.local-http")
     private let lock = NSLock()
     private var listener: NWListener?
+    /// Signalled when `listener` reaches `.cancelled` (its port is released).
+    private var listenerShutdown: ListenerShutdown?
     private var listening = false
     private var boundPort: UInt16
 
@@ -56,6 +59,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
             throw LocalHTTPServerError.startFailed(error.localizedDescription)
         }
         let startup = ListenerStartup()
+        let shutdown = ListenerShutdown()
         listener.stateUpdateHandler = { [weak self, weak listener] state in
             switch state {
             case .ready:
@@ -70,6 +74,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
             case .cancelled:
                 self?.listenerStopped(listener)
                 startup.finish(.cancelled)
+                shutdown.finish()
             default:
                 break
             }
@@ -77,7 +82,10 @@ public final class LocalHTTPServer: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection: connection)
         }
-        lock.withLock { self.listener = listener }
+        lock.withLock {
+            self.listener = listener
+            listenerShutdown = shutdown
+        }
         listener.start(queue: queue)
 
         switch startup.wait(timeout: Self.startTimeout) {
@@ -98,14 +106,22 @@ public final class LocalHTTPServer: @unchecked Sendable {
         }
     }
 
+    /// Cancels the listener and blocks for up to ~2 s until it reports
+    /// `.cancelled`, so a `start()` right after (e.g. a restart for a new
+    /// recordings folder) can rebind the same port. Must not be called on the
+    /// server's own queue.
     public func stop() {
-        let current: NWListener? = lock.withLock {
+        let (current, shutdown): (NWListener?, ListenerShutdown?) = lock.withLock {
             let current = listener
+            let shutdown = listenerShutdown
             listener = nil
+            listenerShutdown = nil
             listening = false
-            return current
+            return (current, shutdown)
         }
-        current?.cancel()
+        guard let current else { return }
+        current.cancel()
+        shutdown?.wait(timeout: Self.stopTimeout)
     }
 
     private func stop(_ candidate: NWListener) {
@@ -124,6 +140,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
         lock.withLock {
             guard let candidate, listener === candidate else { return }
             listener = nil
+            listenerShutdown = nil
             listening = false
         }
     }
@@ -430,6 +447,19 @@ enum HTTPResponseWriter {
         case 502: return "Bad Gateway"
         default: return "Error"
         }
+    }
+}
+
+/// One-shot signal for a listener reaching `.cancelled`.
+private final class ListenerShutdown: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func finish() {
+        semaphore.signal()
+    }
+
+    func wait(timeout: TimeInterval) {
+        _ = semaphore.wait(timeout: .now() + timeout)
     }
 }
 

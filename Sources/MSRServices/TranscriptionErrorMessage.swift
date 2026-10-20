@@ -41,7 +41,7 @@ public enum TranscriptionErrorMessage {
         case 413:
             return "Provider rejected the upload because the audio file is too large (HTTP 413). Trim the recording or turn on upload compression, then retry."
         case 429:
-            return "Provider rate limited the transcription request (HTTP 429); it was retried automatically but is still limited. Wait a minute, then retry."
+            return "Provider rate limited the transcription request (HTTP 429). Wait a minute, then retry."
         case 500...599:
             return "Transcription provider outage (HTTP \(status)); try again later."
         default:

@@ -46,7 +46,7 @@ struct ElevenLabsTranscriptionHardeningTests {
     }
 
     @Test func backoffJitterStaysWithinTwentyFivePercent() async throws {
-        let fixture = try StubFixture([.status(502), .status(504), .status(200, body: Self.successBody)])
+        let fixture = try StubFixture([.status(502), .status(503), .status(200, body: Self.successBody)])
         let client = fixture.client(policy: ElevenLabsTranscriptionClient.RetryPolicy())
         _ = try await client.transcribe(audioURL: fixture.audioURL, apiKey: "test-key")
 
@@ -84,12 +84,38 @@ struct ElevenLabsTranscriptionHardeningTests {
         #expect(fixture.delays.values == [.seconds(2), .seconds(6)])
     }
 
-    @Test func transientNetworkErrorIsRetried() async throws {
-        let fixture = try StubFixture([.failure(.networkConnectionLost), .status(200, body: Self.successBody)])
+    @Test(arguments: [URLError.Code.cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .notConnectedToInternet])
+    func connectionNeverOpenedIsRetried(code: URLError.Code) async throws {
+        let fixture = try StubFixture([.failure(code), .status(200, body: Self.successBody)])
         let response = try await fixture.client().transcribe(audioURL: fixture.audioURL, apiKey: "test-key")
 
         #expect(response.text == "done")
         #expect(fixture.script.requestCount == 2)
+    }
+
+    /// The upload may already have been received and billed: never send it twice.
+    @Test(arguments: [URLError.Code.timedOut, .networkConnectionLost])
+    func possiblyDeliveredUploadIsNotRetried(code: URLError.Code) async throws {
+        let fixture = try StubFixture([.failure(code), .status(200, body: Self.successBody)])
+        let error = await captureError { _ = try await fixture.client().transcribe(audioURL: fixture.audioURL, apiKey: "test-key") }
+
+        #expect((error as? URLError)?.code == code)
+        #expect(fixture.script.requestCount == 1)
+        #expect(fixture.delays.values.isEmpty)
+    }
+
+    @Test(arguments: [500, 504])
+    func possiblyProcessedServerErrorIsNotRetried(status: Int) async throws {
+        let fixture = try StubFixture([.status(status, body: Data("late".utf8)), .status(200, body: Self.successBody)])
+        let error = await captureError { _ = try await fixture.client().transcribe(audioURL: fixture.audioURL, apiKey: "test-key") }
+
+        guard case let .providerRejected(code, _)? = error as? ProviderError else {
+            Issue.record("expected providerRejected, got \(String(describing: error))")
+            return
+        }
+        #expect(code == status)
+        #expect(fixture.script.requestCount == 1)
+        #expect(fixture.delays.values.isEmpty)
     }
 
     @Test func nonTransientNetworkErrorIsNotRetried() async throws {
@@ -213,7 +239,10 @@ struct TranscriptionErrorMessageHardeningTests {
     @Test func rateLimited() {
         let message = TranscriptionErrorMessage.message(for: ProviderError.providerRejected(429, ""))
         #expect(message.contains("rate limited"))
-        #expect(message.contains("retried automatically"))
+        #expect(message.contains("HTTP 429"))
+        #expect(message.contains("Wait a minute"))
+        // Provider-neutral: OpenAI uploads are not retried, so do not claim a retry happened.
+        #expect(!message.contains("retried"))
     }
 
     @Test(arguments: [500, 502, 503, 504, 599])
@@ -391,6 +420,23 @@ struct LocalHTTPServerHardeningTests {
         #expect(first.isListening)
     }
 
+    /// `stop()` waits for the listener to release its port, so an immediate
+    /// restart on the same port (recordings-folder change) cannot collide.
+    @Test(.timeLimit(.minutes(1)))
+    func immediateRestartRebindsTheSamePort() throws {
+        let first = LocalHTTPServer(proxy: LocalAPIProxy(aiService: HardeningFakeAIService()), port: 0)
+        try first.start()
+        let port = first.port
+        first.stop()
+        #expect(!first.isListening)
+
+        let second = LocalHTTPServer(proxy: LocalAPIProxy(aiService: HardeningFakeAIService()), port: port)
+        defer { second.stop() }
+        try second.start()
+        #expect(second.isListening)
+        #expect(second.port == port)
+    }
+
     private func makeServer(service: HardeningFakeAIService = HardeningFakeAIService(), token: String = "token") -> LocalHTTPServer {
         LocalHTTPServer(proxy: LocalAPIProxy(aiService: service), port: 0, bearerToken: token)
     }
@@ -418,15 +464,27 @@ struct APIKeyStoreHardeningTests {
         #expect(store.apiKey(for: .elevenLabs) == "env-key")
         #expect(store.apiKey(for: .openAI) == nil)
 
-        // An exported key wins over the Keychain so developer runs never
-        // trigger a Keychain access prompt.
-        try store.save(apiKey: "keychain-key", for: .elevenLabs)
+        // On a fresh launch an exported key wins over the Keychain so developer
+        // runs never trigger a Keychain access prompt.
+        try keychain.write("keychain-key", service: "MSRMeetingRecorder", account: AIProvider.elevenLabs.rawValue)
         #expect(store.apiKey(for: .elevenLabs) == "env-key")
-        try store.save(apiKey: "openai-keychain-key", for: .openAI)
-        #expect(store.apiKey(for: .openAI) == "openai-keychain-key")
 
         try store.setSession(apiKey: "session-key", for: .elevenLabs)
         #expect(store.apiKey(for: .elevenLabs) == "session-key")
+    }
+
+    @Test func savedKeyWinsOverExportedKeyForThisRun() throws {
+        let keychain = InMemoryKeychain()
+        let store = APIKeyStore(environment: ["ELEVENLABS_API_KEY": "env-key"], keychain: keychain)
+        try store.save(apiKey: " just-entered ", for: .elevenLabs)
+        #expect(store.apiKey(for: .elevenLabs) == "just-entered")
+        #expect(keychain.value(account: AIProvider.elevenLabs.rawValue) == "just-entered")
+
+        // Next launch: the session is gone and the exported key applies again.
+        let relaunched = APIKeyStore(environment: ["ELEVENLABS_API_KEY": "env-key"], keychain: keychain)
+        #expect(relaunched.apiKey(for: .elevenLabs) == "env-key")
+        try store.save(apiKey: "openai-keychain-key", for: .openAI)
+        #expect(relaunched.apiKey(for: .openAI) == "openai-keychain-key")
     }
 
     @Test func saveReplacesAStaleSessionValue() throws {

@@ -178,13 +178,18 @@ private struct TranscriptionSettingsTab: View {
             } header: {
                 Text("Transcription")
             } footer: {
-                Text(viewModel.settings.autoTranscribe
-                    ? (viewModel.autoTranscribeIsEffective
-                        ? "Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself."
-                        : "Auto-transcribe is on, but no API key is saved for the selected provider. Add one below.")
-                    : "Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(viewModel.settings.autoTranscribe
+                        ? (viewModel.autoTranscribeIsEffective
+                            ? "Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself."
+                            : "Auto-transcribe is on, but no API key is saved for the selected provider. Add one below.")
+                        : "Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically.")
+                    if viewModel.settings.autoTitle {
+                        Text("With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac.")
+                    }
+                }
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
 
             Section {

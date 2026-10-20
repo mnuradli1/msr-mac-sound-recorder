@@ -9,7 +9,11 @@ protocol KeychainStoring: Sendable {
     func delete(service: String, account: String) throws
 }
 
-/// Resolves provider API keys with precedence: session value > Keychain > environment variable.
+/// Resolves provider API keys with precedence: session value > environment
+/// variable > Keychain. A key entered in Settings (saved or session-only) is
+/// also held as the session value, so it wins over an exported variable for the
+/// rest of this run; on the next launch an exported variable wins over the
+/// Keychain again.
 public final class APIKeyStore: @unchecked Sendable {
     private let serviceName = "MSRMeetingRecorder"
     private let environment: [String: String]
@@ -49,19 +53,23 @@ public final class APIKeyStore: @unchecked Sendable {
         lock.withLock { sessionValues[provider] = normalized }
     }
 
-    /// Removes the session value and the Keychain item for `provider`.
+    /// Removes the session value and the Keychain item for `provider`. An
+    /// exported environment variable (`ELEVENLABS_API_KEY`, `OPENAI_API_KEY`)
+    /// still applies afterwards; it can only be removed from the environment.
     public func forget(_ provider: AIProvider) throws {
         lock.withLock { _ = sessionValues.removeValue(forKey: provider) }
         try keychain.delete(service: serviceName, account: provider.rawValue)
     }
 
-    /// Persists `apiKey` in the Keychain and drops any session value so the saved key takes effect immediately.
+    /// Persists `apiKey` in the Keychain and also makes it the session value, so
+    /// the key the user just entered takes effect immediately, even over an
+    /// exported environment variable. A failed Keychain write changes nothing.
     public func save(apiKey: String, for provider: AIProvider) throws {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else {
             throw KeyStoreError.emptyAPIKey
         }
         try keychain.write(normalized, service: serviceName, account: provider.rawValue)
-        lock.withLock { _ = sessionValues.removeValue(forKey: provider) }
+        lock.withLock { sessionValues[provider] = normalized }
     }
 
     static func environmentVariableName(for provider: AIProvider) -> String {

@@ -264,3 +264,7 @@
 "This title was generated from the transcript. Rename the recording to keep your own title." = "This title was generated from the transcript. Rename the recording to keep your own title.";
 "Dismiss" = "Dismiss";
 "Dismiss notice" = "Dismiss notice";
+"Showing your edited text; timestamps come from the original transcript." = "Showing your edited text; timestamps come from the original transcript.";
+"Auto" = "Auto";
+"Queued automatically by auto-transcribe" = "Queued automatically by auto-transcribe";
+"With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac." = "With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac.";

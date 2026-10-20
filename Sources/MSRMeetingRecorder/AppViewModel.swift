@@ -139,6 +139,14 @@ final class AppViewModel: ObservableObject {
     /// Dev/scenario hook: when `true`, settings changes stay in memory and are
     /// never written to `UserDefaults`.
     var settingsPersistenceSuspended = false
+    /// What `loadSelectedSidecars()` last loaded; `loadRecordings()` only reloads
+    /// the selection's sidecars (and so resets trims and unsaved edits) when this changes.
+    private var lastLoadedSidecarStamp: SidecarStamp?
+    /// A capture failure reported while the session was still `.starting`;
+    /// handled as soon as the session reaches `.recording`.
+    private var pendingCaptureFailure: Error?
+    /// `recoveryMessage` currently describes a capture failure (see `handleCaptureFailure`).
+    private var recoveryMessageIsCaptureFailure = false
 
     /// - Parameter recorder: the capture engine. `nil` uses `MeetingAudioRecorder`,
     ///   or, for development, `FileReplayRecorder` when the environment variable
@@ -472,11 +480,10 @@ final class AppViewModel: ObservableObject {
         selectedRecording?.effectiveTitleSource
     }
 
-    /// "Auto" when the recording's latest transcription job was queued by
-    /// auto-transcribe; `nil` otherwise.
-    func transcriptionOriginLabel(for recording: RecordingItem) -> String? {
+    /// Whether the recording's latest transcription job was queued by auto-transcribe.
+    func isAutomaticTranscription(for recording: RecordingItem) -> Bool {
         // In-memory only: this is evaluated per row while rendering.
-        transcriptionJobs.first { $0.recordingID == recording.id }?.origin == .automatic ? "Auto" : nil
+        transcriptionJobs.first { $0.recordingID == recording.id }?.origin == .automatic
     }
 
     /// Auto-transcribe is switched on AND the current provider has an API key.
@@ -576,11 +583,19 @@ final class AppViewModel: ObservableObject {
                 selectedRecording = recordings.first
             }
             loadTranscriptionJobs()
-            loadSelectedSidecars()
+            // A background refresh (folder watcher, finished job) must not stop
+            // playback or drop trims/unsaved edits of an unchanged selection.
+            let sidecarsUnchanged = selectedRecording.map { sidecarStamp(for: $0) == lastLoadedSidecarStamp } ?? false
+            if !sidecarsUnchanged {
+                loadSelectedSidecars()
+            }
             refreshSetupHealth()
         } catch {
             statusMessage = error.localizedDescription
-            workflowState = .failed(error.localizedDescription)
+            // Never knock a live or paused recording session out of its state.
+            if !isRecording, !workflowState.isPaused, !workflowState.isBusy {
+                workflowState = .failed(error.localizedDescription)
+            }
         }
     }
 
@@ -807,10 +822,32 @@ final class AppViewModel: ObservableObject {
     /// encoder error). Save whatever was captured instead of showing a live
     /// "Recording" state that is no longer true.
     private func handleCaptureFailure(_ error: Error) async {
+        if case .starting = workflowState {
+            // `startNewRecordingSession`/`resumeRecordingSession` re-deliver it
+            // once the session is `.recording`, so the failure is not dropped.
+            pendingCaptureFailure = error
+            return
+        }
         guard isRecording else { return }
         recoveryMessage = "\(error.localizedDescription) The audio captured so far is being saved."
         recoveryNoticeSeverity = .error
+        recoveryMessageIsCaptureFailure = true
         await stopRecording()
+    }
+
+    /// Hands a capture failure that arrived during `.starting` to
+    /// `handleCaptureFailure` now that the session is `.recording`. Runs once
+    /// the start action has returned, so its `stopRecording()` is not
+    /// swallowed by `performRecordingAction`'s in-flight guard.
+    private func deliverPendingCaptureFailure() {
+        guard let error = pendingCaptureFailure else { return }
+        pendingCaptureFailure = nil
+        Task { @MainActor [weak self] in
+            while self?.recordingActionInFlight == true {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            await self?.handleCaptureFailure(error)
+        }
     }
 
     func stopRecording() async {
@@ -890,6 +927,8 @@ final class AppViewModel: ObservableObject {
         statusMessage = "Starting \(source.displayName)"
         recoveryMessage = ""
         recoveryNoticeSeverity = .info
+        recoveryMessageIsCaptureFailure = false
+        pendingCaptureFailure = nil
         autoTranscribeNotice = nil
         resetSignalLevels()
         microphonePeakDuringRecording = 0
@@ -933,7 +972,9 @@ final class AppViewModel: ObservableObject {
             startRecordingTimer()
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
+            deliverPendingCaptureFailure()
         } catch {
+            pendingCaptureFailure = nil
             if recorder.isRecording {
                 try? await recorder.stop()
             }
@@ -963,6 +1004,7 @@ final class AppViewModel: ObservableObject {
 
         workflowState = .starting(source: source)
         statusMessage = "Resuming \(source.displayName)"
+        pendingCaptureFailure = nil
         resetSignalLevels()
 
         do {
@@ -990,7 +1032,9 @@ final class AppViewModel: ObservableObject {
             startRecordingTimer()
             beginSleepPrevention()
             statusMessage = "Recording \(source.displayName)"
+            deliverPendingCaptureFailure()
         } catch {
+            pendingCaptureFailure = nil
             if recorder.isRecording {
                 try? await recorder.stop()
             }
@@ -1072,7 +1116,14 @@ final class AppViewModel: ObservableObject {
             try manifestStore().save(finalizingManifest)
             currentSessionManifest = finalizingManifest
             if wasRecording, let temporaryAudioURL = activeTemporaryAudioURL {
-                try await recorder.stop()
+                do {
+                    try await recorder.stop()
+                } catch where recoveryMessageIsCaptureFailure
+                    && FileManager.default.fileExists(atPath: temporaryAudioURL.path) {
+                    // The capture already stopped on its own; closing it again can
+                    // fail, but the audio written so far is still saved (and checked
+                    // and auto-transcribed) like any other recording.
+                }
                 let stoppedAt = Date()
                 finalizedClock.pause(at: stoppedAt, reason: .manual)
                 var manifest = try currentManifestFallback(source: source, clock: finalizedClock)
@@ -1155,6 +1206,12 @@ final class AppViewModel: ObservableObject {
             preparePlayback(for: recording)
             workflowState = .saved
             statusMessage = segmentURLs.count > 1 ? "Recording saved from \(segmentURLs.count) segments" : "Recording saved"
+            if recoveryMessageIsCaptureFailure {
+                // The "…is being saved" banner is no longer true; cleared when the next recording starts.
+                recoveryMessage = "Saved after the capture stopped unexpectedly."
+                recoveryNoticeSeverity = .warning
+                recoveryMessageIsCaptureFailure = false
+            }
             autoTranscribeIfEnabled(recording: selectedRecording ?? recording, confidenceReport: confidenceReport)
         } catch {
             endSleepPrevention()
@@ -1168,6 +1225,7 @@ final class AppViewModel: ObservableObject {
             workflowState = .failed(error.localizedDescription)
             recoveryMessage = "Could not finalize cleanly. Recovery will retry on next launch."
             recoveryNoticeSeverity = .error
+            recoveryMessageIsCaptureFailure = false
             resetSignalLevels()
             statusMessage = error.localizedDescription
         }
@@ -1220,6 +1278,11 @@ final class AppViewModel: ObservableObject {
     }
 
     func applyRename() {
+        guard canMutateRecordingLibrary else {
+            statusMessage = "Finish the current recording task first."
+            showingRename = false
+            return
+        }
         guard let selectedRecording else { return }
         do {
             let renamed = try library().rename(selectedRecording, to: renameDraft)
@@ -1228,7 +1291,12 @@ final class AppViewModel: ObservableObject {
             self.selectedRecording = renamed
             loadSelectedSidecars()
             preparePlayback(for: renamed)
-            workflowState = .saved
+            switch workflowState {
+            case .ready, .saved, .failed:
+                workflowState = .saved
+            default:
+                break
+            }
             statusMessage = "Renamed to \(renamed.displayName)"
         } catch {
             workflowState = .failed(error.localizedDescription)
@@ -1526,6 +1594,10 @@ final class AppViewModel: ObservableObject {
         do {
             let updated = try library().writeTranscript(transcriptText, for: recording)
             selectedRecording = updated
+            // Our own write: the next library refresh must not reload over it.
+            if lastLoadedSidecarStamp?.recordingID == updated.id {
+                lastLoadedSidecarStamp = sidecarStamp(for: updated)
+            }
             transcriptSaveMessage = "Saved"
         } catch {
             transcriptSaveMessage = "Save failed"
@@ -1553,8 +1625,12 @@ final class AppViewModel: ObservableObject {
         guard let recording = selectedRecording else { return }
         if summaryText.isEmpty, !FileManager.default.fileExists(atPath: recording.summaryURL.path) { return }
         if (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) == summaryText { return }
-        do { _ = try library().writeSummary(summaryText, for: recording) }
-        catch { statusMessage = error.localizedDescription }
+        do {
+            _ = try library().writeSummary(summaryText, for: recording)
+            if lastLoadedSidecarStamp?.recordingID == recording.id {
+                lastLoadedSidecarStamp = sidecarStamp(for: recording)
+            }
+        } catch { statusMessage = error.localizedDescription }
     }
 
     func updateExportPreview() {
@@ -1965,7 +2041,8 @@ final class AppViewModel: ObservableObject {
             if let title = result.generatedTitle {
                 statusMessage += " · titled \u{201C}\(title)\u{201D}"
             }
-        } catch is CancellationError {
+        } catch let error where error is CancellationError || (error as? URLError)?.code == .cancelled {
+            // A cancelled task surfaces from URLSession as `URLError(.cancelled)`.
             var cancelled = job
             cancelled.markCancelled()
             saveTranscriptionJob(cancelled)
@@ -2154,6 +2231,7 @@ final class AppViewModel: ObservableObject {
             selectedTranscriptionJob = nil
             reviewWaveform = []
             exportPreview = ""
+            lastLoadedSidecarStamp = nil
             return
         }
         let recordingLibrary = library()
@@ -2177,7 +2255,34 @@ final class AppViewModel: ObservableObject {
             }
         }
         selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
-        preparePlayback(for: selectedRecording)
+        // Keep an already-loaded player (and its position) for the same file.
+        if audioPlayer?.url != selectedRecording.audioURL {
+            preparePlayback(for: selectedRecording)
+        }
+        lastLoadedSidecarStamp = sidecarStamp(for: selectedRecording)
+    }
+
+    /// Identity plus sidecar modification dates of a recording, so a library
+    /// refresh can tell whether the selection's transcript/summary/segments changed.
+    private struct SidecarStamp: Equatable {
+        let recordingID: UUID
+        let audioURL: URL
+        let transcriptModified: Date?
+        let summaryModified: Date?
+        let segmentsModified: Date?
+    }
+
+    private func sidecarStamp(for recording: RecordingItem) -> SidecarStamp {
+        func modified(_ url: URL) -> Date? {
+            (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        }
+        return SidecarStamp(
+            recordingID: recording.id,
+            audioURL: recording.audioURL,
+            transcriptModified: modified(recording.transcriptURL),
+            summaryModified: modified(recording.summaryURL),
+            segmentsModified: modified(recording.transcriptSegmentsURL)
+        )
     }
 
     private func makeSearchDocuments(for recordings: [RecordingItem]) -> [RecordingSearchDocument] {
@@ -2355,6 +2460,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func clearRecordingSession() {
+        pendingCaptureFailure = nil
         recordingSessionClock = nil
         temporaryAudioURL = nil
         completedSegmentURLs = []

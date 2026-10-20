@@ -24,7 +24,7 @@ Settings → Transcription & AI has two switches:
 - **Auto-transcribe new recordings** (off by default): every recording you stop is queued for transcription immediately, using the selected provider's saved key. Recordings that are empty or shorter than three seconds are skipped, and the status bar says why. Imported and recovered recordings are never auto-transcribed.
 - **Auto-title recordings from the transcript** (on by default): when a transcript arrives for a recording that still has its default `Meeting yyyy-MM-dd HH.mm` name, the title is replaced with one derived from the transcript. With an OpenAI key the title comes from the model; without one a local heuristic picks the first substantive sentence (English and Indonesian filler is skipped). A title you typed yourself is never overwritten, even if you rename while transcription is running. Auto-titled recordings show an "Auto-titled" badge; renaming keeps your title from then on.
 
-Both switches work with ElevenLabs or OpenAI as the transcription provider.
+Both switches work with ElevenLabs or OpenAI as the transcription provider. With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac.
 
 ## Run
 
@@ -46,7 +46,7 @@ The script creates `dist/MSR-Meeting-Recorder-1.0A-app.zip`, `dist/MSR-Meeting-R
 
 ## API Keys
 
-Keys are never stored in source. New keys are session-only by default; enable “Remember credentials” to use the existing Keychain identifiers. Environment variables remain supported:
+Keys are never stored in source. New keys are session-only by default; enable “Remember credentials” to use the existing Keychain identifiers. Environment variables remain supported. Lookup order is: a key entered in Settings during this run, then an exported environment variable, then the Keychain. “Forget” clears the session value and the Keychain item; an exported variable still applies until you unset it.
 
 ```bash
 export ELEVENLABS_API_KEY="..."
@@ -64,7 +64,7 @@ bash scripts/check_localization.sh
 codegraph status . --json
 ```
 
-With `ELEVENLABS_API_KEY` exported, `MSR_LIVE_E2E=1 swift run MSRTestRunner` also transcribes a real speech clip through ElevenLabs and checks that the recording is auto-titled (billable, one short request).
+With `ELEVENLABS_API_KEY` exported, `MSR_LIVE_E2E=1 swift run MSRTestRunner` also transcribes a real speech clip (`Tests/Fixtures/meeting-en.m4a`, synthetic `say` speech; override with `MSR_LIVE_E2E_CLIP`) through ElevenLabs and checks that the recording is auto-titled (billable, one short request).
 
 ### Developer hooks
 
@@ -77,7 +77,7 @@ The app reads a few environment variables for scripted verification; none of the
 | `MSR_UI_SCENARIO=auto-transcribe` | Record for `MSR_UI_SCENARIO_SECONDS`, stop, wait for the automatic transcription, print a JSON result line to stderr, and exit non-zero on failure. |
 | `MSR_UI_SNAPSHOT_PATH` | Render the main (or `MSR_UI_SNAPSHOT_WINDOW=settings`) window to a PNG and quit; see `scripts/ui_snapshots.sh` for the state variables (`TAB`, `SELECT`, `APPEARANCE`, `SIZE`, …). |
 
-`scripts/make_ui_fixture.sh` builds a synthetic library (speech from `say`) for snapshots. An exported API key is used before the Keychain, so these runs never trigger a Keychain prompt.
+`scripts/make_ui_fixture.sh` builds a synthetic library (speech from `say`) for snapshots, by default in `${TMPDIR:-/tmp}/msr-ui-fixture`; `scripts/ui_snapshots.sh` writes PNGs to `artifacts/` (override with `MSR_UI_FIXTURE` / `MSR_UI_OUT_DIR`). An exported API key is used before the Keychain, so these runs never trigger a Keychain prompt.
 
 For the broader package/release smoke test:
 

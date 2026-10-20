@@ -264,3 +264,7 @@
 "This title was generated from the transcript. Rename the recording to keep your own title." = "Judul ini dibuat dari transkrip. Ganti nama rekaman untuk memakai judul Anda sendiri.";
 "Dismiss" = "Tutup";
 "Dismiss notice" = "Tutup pemberitahuan";
+"Showing your edited text; timestamps come from the original transcript." = "Menampilkan teks yang Anda edit; stempel waktu berasal dari transkrip asli.";
+"Auto" = "Otomatis";
+"Queued automatically by auto-transcribe" = "Diantrekan otomatis oleh transkripsi otomatis";
+"With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac." = "Jika kunci OpenAI tersimpan, bagian awal setiap transkrip dikirim ke OpenAI untuk menamai rekaman; tanpa kunci, judul dibuat di Mac ini.";

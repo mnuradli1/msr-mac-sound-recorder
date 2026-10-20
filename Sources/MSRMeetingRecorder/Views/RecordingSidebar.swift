@@ -273,7 +273,7 @@ struct RecordingRow: View {
     let recording: RecordingItem
     let sourceLabel: String
     let badges: [RecordingBadge]
-    let jobChip: (title: String, tone: Tone)?
+    let jobChip: (title: String, tone: Tone, isAutomatic: Bool)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -295,6 +295,10 @@ struct RecordingRow: View {
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 if let jobChip {
+                    if jobChip.isAutomatic {
+                        StatusChip(title: "Auto", tone: .info, compact: true)
+                            .help("Queued automatically by auto-transcribe")
+                    }
                     StatusChip(title: jobChip.title, tone: jobChip.tone, compact: true)
                 }
                 RecordingRowBadges(badges: badges)

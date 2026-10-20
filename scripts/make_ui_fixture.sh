@@ -10,7 +10,8 @@
 # so snapshots never touch the user's real recordings.
 set -euo pipefail
 
-DEFAULT_FOLDER="/private/tmp/claude-501/-Users-nra8mac-Documents-GH-msr-mac-sound-recorder/36daa6ab-dcfd-4b8c-97ed-8976cfa86df3/scratchpad/ui-fixture"
+TMP_ROOT="${TMPDIR:-/tmp}"
+DEFAULT_FOLDER="${TMP_ROOT%/}/msr-ui-fixture"
 FOLDER="${1:-$DEFAULT_FOLDER}"
 
 case "$FOLDER" in

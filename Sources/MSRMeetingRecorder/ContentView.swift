@@ -201,7 +201,6 @@ struct ContentView: View {
 extension Notification.Name {
     static let focusRecordingSearch = Notification.Name("MSRFocusRecordingSearch")
     static let clearRecordingSearch = Notification.Name("MSRClearRecordingSearch")
-    static let beginInlineRename = Notification.Name("MSRBeginInlineRename")
     static let requestDeleteRecording = Notification.Name("MSRRequestDeleteRecording")
 }
 

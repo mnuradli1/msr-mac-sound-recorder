@@ -18,7 +18,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${1:?usage: scripts/ui_snapshots.sh <prefix> [shot ...]}"
 shift || true
 
-DEFAULT_FIXTURE="/private/tmp/claude-501/-Users-nra8mac-Documents-GH-msr-mac-sound-recorder/36daa6ab-dcfd-4b8c-97ed-8976cfa86df3/scratchpad/ui-fixture"
+TMP_ROOT="${TMPDIR:-/tmp}"
+DEFAULT_FIXTURE="${TMP_ROOT%/}/msr-ui-fixture"
 FIXTURE="${MSR_UI_FIXTURE:-$DEFAULT_FIXTURE}"
 EMPTY_FIXTURE="${FIXTURE%/}-empty"
 OUT_DIR="${MSR_UI_OUT_DIR:-$ROOT_DIR/artifacts}"

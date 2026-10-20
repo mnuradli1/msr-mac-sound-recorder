@@ -52,6 +52,8 @@ enum UISnapshotCapture {
     /// the Keychain.
     static func prepareIfRequested(viewModel: AppViewModel) {
         guard isRequested else { return }
+        // Snapshot state (and the placeholder keys below) must never reach UserDefaults.
+        viewModel.settingsPersistenceSuspended = true
         viewModel.settings.rememberCredentials = false
         viewModel.settings.localAPIEnabled = false
         // A key exported in the environment is real and already wins over the

@@ -114,10 +114,22 @@ struct TranscriptPanel: View {
     private var content: some View {
         switch effectiveMode {
         case .read:
-            TranscriptReaderView(
-                segments: viewModel.transcriptSegments,
-                onJump: viewModel.jumpToTranscriptSegment
-            )
+            let readable = viewModel.readModeTranscript
+            VStack(alignment: .leading, spacing: 0) {
+                if readable.isEdited {
+                    Label("Showing your edited text; timestamps come from the original transcript.", systemImage: "pencil")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
+                }
+                TranscriptReaderView(
+                    segments: readable.segments,
+                    onJump: viewModel.jumpToTranscriptSegment
+                )
+            }
         case .edit:
             TextEditor(text: $viewModel.transcriptText)
                 .font(.system(size: 14))
@@ -180,22 +192,24 @@ struct TranscriptReaderView: View {
             LazyVStack(alignment: .leading, spacing: 14) {
                 ForEach(segments) { segment in
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text(segment.speaker)
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(Theme.speakerColor(for: segment.speaker))
-                            if let startTime = segment.startTime {
-                                Button {
-                                    onJump(segment)
-                                } label: {
-                                    Label(formatClock(startTime), systemImage: "play.fill")
-                                        .labelStyle(.titleAndIcon)
-                                        .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                        if !segment.speaker.isEmpty || segment.startTime != nil {
+                            HStack(spacing: 8) {
+                                Text(segment.speaker)
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(Theme.speakerColor(for: segment.speaker))
+                                if let startTime = segment.startTime {
+                                    Button {
+                                        onJump(segment)
+                                    } label: {
+                                        Label(formatClock(startTime), systemImage: "play.fill")
+                                            .labelStyle(.titleAndIcon)
+                                            .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .help("Jump to audio")
+                                    .accessibilityLabel(Text("Jump to audio \(formatClock(startTime))"))
                                 }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(Theme.textSecondary)
-                                .help("Jump to audio")
-                                .accessibilityLabel(Text("Jump to audio \(formatClock(startTime))"))
                             }
                         }
                         Text(segment.text)

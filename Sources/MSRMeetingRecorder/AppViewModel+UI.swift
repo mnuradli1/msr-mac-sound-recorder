@@ -74,12 +74,12 @@ extension AppViewModel {
     }
 
     /// Transcription job chip for a sidebar row (single `jobStatusText` path).
-    /// Automatic jobs are marked so the user can tell them from ones they started.
-    func jobChip(for recording: RecordingItem) -> (title: String, tone: Tone)? {
+    /// `isAutomatic` marks jobs queued by auto-transcribe; the row draws a
+    /// separate "Auto" chip so each title stays one localizable key.
+    func jobChip(for recording: RecordingItem) -> (title: String, tone: Tone, isAutomatic: Bool)? {
         guard let text = transcriptionStatusText(for: recording) else { return nil }
         let status = transcriptionJobs.first { $0.recordingID == recording.id }?.status
-        let title = transcriptionOriginLabel(for: recording).map { "\($0) · \(text)" } ?? text
-        return (title, status == .failed ? .warning : .progress)
+        return (text, status == .failed ? .warning : .progress, isAutomaticTranscription(for: recording))
     }
 
     func jobStatusText(for job: TranscriptionJob) -> String {
@@ -109,6 +109,17 @@ extension AppViewModel {
     /// True while the selected recording's primary action is running or waiting.
     var isPrimaryActionBusy: Bool {
         selectedRecordingIsTranscribing || selectedRecordingIsQueuedForTranscription || workflowState.isSummarizing
+    }
+
+    /// What Read mode shows: the saved (timed) segments while they still match
+    /// the transcript text, otherwise speaker blocks rebuilt from the edited
+    /// text. The segments file is left alone; it keeps the SRT timestamps.
+    var readModeTranscript: ReadableTranscript {
+        TranscriptParser.readableTranscript(saved: transcriptSegments, transcript: transcriptText)
+    }
+
+    var readModeSegments: [TranscriptSegment] {
+        readModeTranscript.segments
     }
 
     var hasSummary: Bool {

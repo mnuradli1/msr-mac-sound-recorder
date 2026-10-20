@@ -53,8 +53,10 @@ struct MSRTestRunner {
             try await testAudioTrackMixerExportsSingleTrack()
             try await testTranscriptPublisherAutoTitlesDefaultRecording()
             try await testLiveElevenLabsAutoTranscribeAndTitle()
+            TemporaryFolder.removeAll()
             print("MSRTestRunner: all tests passed")
         } catch {
+            TemporaryFolder.removeAll()
             fputs("MSRTestRunner failed: \(error)\n", stderr)
             Foundation.exit(1)
         }
@@ -1224,8 +1226,13 @@ private func testLiveElevenLabsAutoTranscribeAndTitle() async throws {
         print("live E2E skipped: ELEVENLABS_API_KEY is not set")
         return
     }
-    let clip = URL(fileURLWithPath: environment["MSR_LIVE_E2E_CLIP"]
-        ?? "/private/tmp/claude-501/-Users-nra8mac-Documents-GH-msr-mac-sound-recorder/36daa6ab-dcfd-4b8c-97ed-8976cfa86df3/scratchpad/live/meeting-en.m4a")
+    // Default: the synthetic `say` clip checked in at Tests/Fixtures/meeting-en.m4a.
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // MSRTestRunner
+        .deletingLastPathComponent() // Sources
+        .deletingLastPathComponent()
+    let clip = environment["MSR_LIVE_E2E_CLIP"].map { URL(fileURLWithPath: $0) }
+        ?? packageRoot.appendingPathComponent("Tests/Fixtures/meeting-en.m4a")
     guard FileManager.default.fileExists(atPath: clip.path) else {
         print("live E2E skipped: clip not found at \(clip.path)")
         return
@@ -1245,9 +1252,9 @@ private func testLiveElevenLabsAutoTranscribeAndTitle() async throws {
     )
     let titleBefore = recording.displayName
 
-    // Seed session values from the environment: `APIKeyStore` checks the
-    // Keychain before the environment, and a Keychain read from this unsigned
-    // CLI binary blocks on a macOS authorization prompt.
+    // Seed session values from the environment so the run uses exactly these
+    // keys and never reaches the Keychain (a Keychain read from this unsigned
+    // CLI binary blocks on a macOS authorization prompt).
     let keyStore = APIKeyStore()
     try keyStore.setSession(apiKey: key, for: .elevenLabs)
     let remoteTitles: Bool
@@ -1361,13 +1368,30 @@ private struct TestFailure: Error, CustomStringConvertible {
     }
 }
 
+/// A `msr-tests-*` folder in the temporary directory. Every folder created
+/// during a run is removed by `removeAll()` when the runner exits.
 private struct TemporaryFolder {
     let url: URL
+
+    nonisolated(unsafe) private static var created: [URL] = []
+    private static let lock = NSLock()
 
     init() throws {
         url = FileManager.default.temporaryDirectory
             .appendingPathComponent("msr-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let url = url
+        Self.lock.withLock { Self.created.append(url) }
+    }
+
+    static func removeAll() {
+        let urls = lock.withLock {
+            defer { created = [] }
+            return created
+        }
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }
 

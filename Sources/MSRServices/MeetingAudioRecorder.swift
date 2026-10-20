@@ -523,23 +523,38 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
             }
         }
         // Detach the writer on the sample queue so no sample handler can touch it concurrently.
-        let writer: AVAssetWriter? = queue.sync {
+        // Only a writer that is still `.writing` may be finished; calling
+        // `startSession`/`markAsFinished`/`finishWriting` on a failed one raises.
+        let detached: (writer: AVAssetWriter?, failure: Error?) = queue.sync {
             acceptingSamples = false
             let current = self.writer
-            if let current, !didStartSession {
-                current.startSession(atSourceTime: .zero)
-                didStartSession = true
+            var failure: Error?
+            if let current {
+                if current.status == .writing {
+                    if !didStartSession {
+                        current.startSession(atSourceTime: .zero)
+                        didStartSession = true
+                    }
+                    systemInput?.markAsFinished()
+                } else {
+                    failure = RecordingError.writerFailed(
+                        current.error?.localizedDescription ?? "System audio writer stopped before the recording finished."
+                    )
+                }
             }
-            systemInput?.markAsFinished()
             self.writer = nil
             systemInput = nil
             didStartSession = false
-            return current
+            return (failure == nil ? current : nil, failure)
         }
-        do {
-            try await Self.finish(writer)
-        } catch {
-            stopError = stopError ?? error
+        if let failure = detached.failure {
+            stopError = failure
+        } else {
+            do {
+                try await Self.finish(detached.writer)
+            } catch {
+                stopError = stopError ?? error
+            }
         }
         if let stopError {
             throw stopError

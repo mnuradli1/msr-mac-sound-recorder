@@ -2,7 +2,8 @@ import Foundation
 import MSRCore
 
 public final class ElevenLabsTranscriptionClient: Sendable {
-    /// Retry behaviour for transient upload failures (rate limits, provider outages, dropped connections).
+    /// Retry behaviour for failures where the upload was certainly not processed
+    /// (rate limits, gateway/unavailable responses, connections that never opened).
     public struct RetryPolicy: Sendable, Equatable {
         /// Total attempts including the first request. Values below 1 are treated as 1.
         public var maxAttempts: Int
@@ -29,10 +30,14 @@ public final class ElevenLabsTranscriptionClient: Sendable {
         public static let none = RetryPolicy(maxAttempts: 1)
     }
 
-    static let retryableStatusCodes: Set<Int> = [429, 500, 502, 503, 504]
+    /// Statuses where the provider did not run the transcription. 500 and 504
+    /// are excluded: the upload may already have been received (and billed).
+    static let retryableStatusCodes: Set<Int> = [429, 502, 503]
+    /// Errors raised before the request reached the provider. `.timedOut` and
+    /// `.networkConnectionLost` are excluded: the upload may already have been
+    /// received (and billed), so a retry could charge twice.
     static let retryableURLErrorCodes: Set<URLError.Code> = [
-        .timedOut, .networkConnectionLost, .notConnectedToInternet,
-        .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed
+        .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed
     ]
 
     private static let transcriptionTimeout: TimeInterval = 15 * 60
@@ -60,8 +65,11 @@ public final class ElevenLabsTranscriptionClient: Sendable {
 
     /// Uploads `audioURL` to ElevenLabs Scribe.
     ///
-    /// HTTP 429/500/502/503/504 and dropped-connection `URLError`s are retried per `retryPolicy`
-    /// (honoring `Retry-After`); every other failure, and any cancellation, is thrown immediately.
+    /// HTTP 429/502/503 and `URLError`s raised before a connection opened (no internet,
+    /// cannot find/connect to host, DNS failure) are retried per `retryPolicy` (honoring
+    /// `Retry-After`). Everything else, including 500, 504, `.timedOut`,
+    /// `.networkConnectionLost` (the upload may already have been billed) and any
+    /// cancellation, is thrown immediately.
     /// - Parameter languageCode: Optional ISO-639 hint sent as the `language_code` field. Blank or
     ///   malformed values are ignored so the provider keeps auto-detecting the language.
     public func transcribe(audioURL: URL, apiKey: String, languageCode: String? = nil) async throws -> TranscribeResponse {

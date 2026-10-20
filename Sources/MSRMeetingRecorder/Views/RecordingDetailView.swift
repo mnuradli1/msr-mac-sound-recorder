@@ -41,7 +41,10 @@ struct RecordingDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .onChange(of: recording.id) { _, _ in cancelTitleEdit() }
-        .onReceive(NotificationCenter.default.publisher(for: .beginInlineRename)) { _ in beginTitleEdit() }
+        // A recording session locks the library; drop a half-typed rename.
+        .onChange(of: viewModel.isRecording || viewModel.workflowState.isBusy) { _, locked in
+            if locked { cancelTitleEdit() }
+        }
     }
 
     // MARK: Header
