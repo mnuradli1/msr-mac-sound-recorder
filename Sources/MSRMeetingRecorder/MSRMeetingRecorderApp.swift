@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MSRCore
 import MSRServices
@@ -11,13 +12,15 @@ struct MSRMeetingRecorderApp: App {
         WindowGroup {
             ContentView(viewModel: viewModel)
                 .task {
+                    UISnapshotCapture.prepareIfRequested(viewModel: viewModel)
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
-                    await UISnapshotCapture.runIfRequested()
+                    await UISnapshotCapture.runIfRequested(viewModel: viewModel)
                 }
         }
         .defaultSize(width: viewModel.settings.windowWidth, height: viewModel.settings.windowHeight)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button(viewModel.isRecording ? "Stop Recording" : "Start Recording") {
@@ -87,6 +90,12 @@ struct MSRMeetingRecorderApp: App {
                 }
                 .disabled(!viewModel.hasTranscript)
 
+                Button("Copy Transcript") { viewModel.copyTranscript() }
+                    .disabled(!viewModel.hasTranscript)
+
+                Button("Copy Summary") { viewModel.copySummary() }
+                    .disabled(!viewModel.hasSummary)
+
                 Button("Save Notes") { viewModel.flushTranscriptEdits() }
                     .keyboardShortcut("s", modifiers: [.command])
                     .disabled(viewModel.selectedRecording == nil)
@@ -122,6 +131,21 @@ struct MSRMeetingRecorderApp: App {
                 Button("Refresh History") {
                     viewModel.loadRecordings()
                 }
+
+                Divider()
+
+                Button("Delete Recording…") {
+                    // ⌘⌫ means "delete to line start" while editing text; keep
+                    // that behavior instead of deleting the recording.
+                    if let textView = NSApp.keyWindow?.firstResponder as? NSTextView, textView.isEditable {
+                        textView.deleteToBeginningOfLine(nil)
+                        return
+                    }
+                    // ContentView confirms, then calls `viewModel.delete(_:)`.
+                    NotificationCenter.default.post(name: .requestDeleteRecording, object: nil)
+                }
+                .keyboardShortcut(.delete, modifiers: [.command])
+                .disabled(viewModel.selectedRecording == nil || !viewModel.canMutateRecordingLibrary)
             }
 
             CommandGroup(after: .appInfo) {
