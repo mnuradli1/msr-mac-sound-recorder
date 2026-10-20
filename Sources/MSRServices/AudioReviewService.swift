@@ -151,55 +151,10 @@ public enum TranscriptionAudioPreparer {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     session.install(continuation)
-                    // `onCancel` can run before this closure when the task is already
-                    // cancelled; asking a cancelled writer input for media data throws
-                    // an NSException, so stop here instead.
-                    guard !session.isFinished, session.writer.status == .writing else {
-                        session.cancelReaderAndWriter()
-                        session.finish(throwing: CancellationError())
-                        return
-                    }
-                    let queue = DispatchQueue(label: "app.msr.audio-compression")
-                    session.input.requestMediaDataWhenReady(on: queue) {
-                        while session.input.isReadyForMoreMediaData, !session.isFinished {
-                            if let sample = session.output.copyNextSampleBuffer() {
-                                if !session.input.append(sample) {
-                                    session.cancelReaderAndWriter()
-                                    session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? "Could not encode audio"))
-                                    return
-                                }
-                                continue
-                            }
-                            // `nil` means end of data *or* a reader failure/cancellation; only the former may be published.
-                            switch session.reader.status {
-                            case .failed:
-                                session.cancelReaderAndWriter()
-                                session.finish(throwing: session.reader.error ?? CocoaError(.fileReadCorruptFile))
-                            case .cancelled:
-                                session.cancelReaderAndWriter()
-                                session.finish(throwing: CancellationError())
-                            default:
-                                guard session.writer.status == .writing else {
-                                    session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? "Audio preparation was cancelled"))
-                                    return
-                                }
-                                session.input.markAsFinished()
-                                session.writer.finishWriting {
-                                    if session.writer.status == .completed {
-                                        session.finish(throwing: nil)
-                                    } else {
-                                        session.finish(throwing: AudioReviewError.exportFailed(session.writer.error?.localizedDescription ?? session.reader.error?.localizedDescription ?? "Audio preparation did not complete"))
-                                    }
-                                }
-                            }
-                            return
-                        }
-                    }
+                    session.start()
                 }
             } onCancel: {
-                session.cancelReaderAndWriter()
-                // A cancelled writer may never ask for more data again, so resume the waiter here.
-                session.finish(throwing: CancellationError())
+                session.cancel()
             }
         } catch {
             try? FileManager.default.removeItem(at: destinationURL)
@@ -208,14 +163,23 @@ public enum TranscriptionAudioPreparer {
     }
 }
 
+/// Drives one reader → writer transcode. Once writing has started, every call on the
+/// reader, writer and input happens on `queue`: AVAssetWriter must not be cancelled
+/// concurrently with `append`/`markAsFinished`/`finishWriting` (doing so crashes inside
+/// MediaToolbox or raises an NSException), so cancellation is queued behind the pump,
+/// and the waiter is only resumed once the queue has stopped touching the writer.
 private final class AudioCompressionSession: @unchecked Sendable {
     let reader: AVAssetReader
     let writer: AVAssetWriter
     let input: AVAssetWriterInput
     let output: AVAssetReaderTrackOutput
+    private let queue = DispatchQueue(label: "app.msr.audio-compression")
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
     private var finished = false
+    private var cancelRequested = false
+    /// `finishWriting` was called; only its completion handler may resume the waiter. Confined to `queue`.
+    private var finishingWrite = false
 
     init(reader: AVAssetReader, writer: AVAssetWriter, input: AVAssetWriterInput, output: AVAssetReaderTrackOutput) {
         self.reader = reader
@@ -225,9 +189,78 @@ private final class AudioCompressionSession: @unchecked Sendable {
     }
 
     var isFinished: Bool { lock.withLock { finished } }
+    private var isCancelled: Bool { lock.withLock { cancelRequested } }
+
+    /// Starts pulling samples on `queue`. Call after `install(_:)`.
+    func start() {
+        queue.async { [self] in
+            guard !isFinished else { return }
+            // `onCancel` can run before the operation when the task is already cancelled;
+            // asking a cancelled writer input for media data throws an NSException.
+            guard !isCancelled else { return stopForCancellation() }
+            guard writer.status == .writing else {
+                cancelReaderAndWriter()
+                return finish(throwing: AudioReviewError.exportFailed(writer.error?.localizedDescription ?? "Audio preparation could not start"))
+            }
+            input.requestMediaDataWhenReady(on: queue) { [self] in pump() }
+        }
+    }
+
+    /// Safe from any thread (the task-cancellation handler); the actual cancel joins `queue`.
+    func cancel() {
+        lock.withLock { cancelRequested = true }
+        queue.async { [self] in stopForCancellation() }
+    }
+
+    /// Must run on `queue`.
+    private func stopForCancellation() {
+        guard !finishingWrite else { return }
+        cancelReaderAndWriter()
+        finish(throwing: CancellationError())
+    }
+
+    /// Must run on `queue`.
+    private func pump() {
+        while input.isReadyForMoreMediaData, !isFinished {
+            if isCancelled { return stopForCancellation() }
+            if let sample = output.copyNextSampleBuffer() {
+                if !input.append(sample) {
+                    cancelReaderAndWriter()
+                    finish(throwing: AudioReviewError.exportFailed(writer.error?.localizedDescription ?? "Could not encode audio"))
+                    return
+                }
+                continue
+            }
+            // `nil` means end of data *or* a reader failure/cancellation; only the former may be published.
+            switch reader.status {
+            case .failed:
+                cancelReaderAndWriter()
+                finish(throwing: reader.error ?? CocoaError(.fileReadCorruptFile))
+            case .cancelled:
+                cancelReaderAndWriter()
+                finish(throwing: CancellationError())
+            default:
+                guard writer.status == .writing else {
+                    finish(throwing: AudioReviewError.exportFailed(writer.error?.localizedDescription ?? "Audio preparation was cancelled"))
+                    return
+                }
+                finishingWrite = true
+                input.markAsFinished()
+                writer.finishWriting { [self] in
+                    if writer.status == .completed {
+                        finish(throwing: nil)
+                    } else {
+                        finish(throwing: AudioReviewError.exportFailed(writer.error?.localizedDescription ?? reader.error?.localizedDescription ?? "Audio preparation did not complete"))
+                    }
+                }
+            }
+            return
+        }
+    }
 
     /// Cancels whichever side is still active; never touches a writer that already completed or failed.
-    func cancelReaderAndWriter() {
+    /// Must run on `queue`.
+    private func cancelReaderAndWriter() {
         if reader.status == .reading { reader.cancelReading() }
         if writer.status == .writing { writer.cancelWriting() }
     }
@@ -242,7 +275,7 @@ private final class AudioCompressionSession: @unchecked Sendable {
     }
 
     /// Resumes the waiter exactly once; later calls are ignored.
-    func finish(throwing error: Error?, force: Bool = false) {
+    private func finish(throwing error: Error?, force: Bool = false) {
         let waiter: CheckedContinuation<Void, Error>? = lock.withLock {
             guard force || !finished else { return nil }
             finished = true

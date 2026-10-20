@@ -3,8 +3,10 @@ import Foundation
 
 @MainActor
 final class GlobalHotkeyService {
-    private var hotKey: EventHotKeyRef?
-    private var eventHandler: EventHandlerRef?
+    // `nonisolated(unsafe)` only so the nonisolated `deinit` can release them; they are
+    // otherwise touched on the main actor only.
+    private nonisolated(unsafe) var hotKey: EventHotKeyRef?
+    private nonisolated(unsafe) var eventHandler: EventHandlerRef?
     private var action: (() -> Void)?
     private let identifier = EventHotKeyID(signature: 0x4D535231, id: 1) // MSR1
 
@@ -14,6 +16,13 @@ final class GlobalHotkeyService {
     }
 
     func unregister() {
+        releaseRegistration()
+    }
+
+    /// The Carbon handler holds an unretained pointer to `self`; remove it before that pointer dangles.
+    deinit { releaseRegistration() }
+
+    private nonisolated func releaseRegistration() {
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
         hotKey = nil
