@@ -173,7 +173,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func installCaptureFailureHandler(sessionID: UUID, segmentFileName: String) {
-        recorder.onCaptureFailure = { [weak self] message in
+        recorder.onCaptureFailure = { @Sendable [weak self] message in
             Task { @MainActor in
                 guard let self else { return }
                 await self.recordingActions.waitUntilIdle()
