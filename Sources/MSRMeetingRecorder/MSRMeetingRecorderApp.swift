@@ -13,6 +13,7 @@ struct MSRMeetingRecorderApp: App {
                 .task {
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
+                    await UISnapshotCapture.runIfRequested()
                 }
         }
         .defaultSize(width: viewModel.settings.windowWidth, height: viewModel.settings.windowHeight)

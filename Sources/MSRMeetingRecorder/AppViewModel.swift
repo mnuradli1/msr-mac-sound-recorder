@@ -412,6 +412,11 @@ final class AppViewModel: ObservableObject {
     }
 
     var recordingsFolderURL: URL {
+        // Developer override so snapshot/UI runs can use a fixture library
+        // instead of the user's real recordings.
+        if let override = ProcessInfo.processInfo.environment["MSR_RECORDINGS_FOLDER"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
         if let securityScopedFolderURL { return securityScopedFolderURL }
         if let path = settings.recordingsFolderPath, !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
