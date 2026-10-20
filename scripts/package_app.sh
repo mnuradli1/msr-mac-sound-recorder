@@ -99,8 +99,11 @@ sed \
   -e "s|__URL__|${MSR_RELEASE_URL:-https://github.com/mnuradli1/msr-mac-sound-recorder/releases/download/v$VERSION/MSR-Meeting-Recorder-$VERSION.dmg}|g" \
   "$ROOT_DIR/packaging/msr.rb.template" > "$DIST_DIR/msr.rb"
 
-printf '{"version":"%s","build":"%s","commit":"%s","artifacts":["%s","%s"]}\n' \
-  "$VERSION" "$BUILD_NUMBER" "$(git rev-parse HEAD)" "$(basename "$APP_ZIP_PATH")" "$(basename "$DMG_PATH")" \
+WORKTREE_DIRTY=false
+if [[ -n "$(git status --porcelain)" ]]; then WORKTREE_DIRTY=true; fi
+EXECUTABLE_SHA="$(shasum -a 256 "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME" | awk '{print $1}')"
+printf '{"version":"%s","build":"%s","commit":"%s","dirtyWorktree":%s,"executableSHA256":"%s","artifacts":["%s","%s"]}\n' \
+  "$VERSION" "$BUILD_NUMBER" "$(git rev-parse HEAD)" "$WORKTREE_DIRTY" "$EXECUTABLE_SHA" "$(basename "$APP_ZIP_PATH")" "$(basename "$DMG_PATH")" \
   > "$DIST_DIR/provenance.json"
 
 echo "App: $APP_PATH"

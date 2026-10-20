@@ -132,11 +132,15 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
         }
 
         microphoneRecorder?.stop()
+        if let microphoneRecorder {
+            // Mic capture is PCM CAF; export the M4A segment. The CAF stays until publication.
+            do { try await microphoneRecorder.publish() } catch { stopError = error }
+        }
         if let screenRecorder {
             do {
                 try await screenRecorder.stop()
             } catch {
-                stopError = error
+                stopError = stopError ?? error
             }
         }
         if let combinedRecorder {
@@ -178,6 +182,8 @@ private final class MicrophoneAudioRecorder: NSObject, AVAudioRecorderDelegate, 
     private let onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
     private let onCaptureFailure: (@Sendable (Error) -> Void)?
     private var outputURL: URL?
+    /// Durable PCM CAF actually being recorded; `outputURL` is the M4A exported on `publish()`.
+    private var rawURL: URL?
     private var previousDefaultDeviceID: AudioDeviceID?
     private let meterQueue = DispatchQueue(label: "app.msr.microphone-meter")
 
@@ -202,13 +208,19 @@ private final class MicrophoneAudioRecorder: NSObject, AVAudioRecorderDelegate, 
         }
         let previousDefault = AudioDeviceCatalog.selectInputDevice(uid: deviceUID)
         do {
+            // Uncompressed PCM CAF does not depend on an end-of-session movie index (sleep safety).
             let settings: [String: Any] = [
-                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVFormatIDKey: Int(kAudioFormatLinearPCM),
                 AVSampleRateKey: 48_000,
                 AVNumberOfChannelsKey: 1,
-                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: false
             ]
-            let recorder = try AVAudioRecorder(url: outputURL, settings: settings)
+            let rawURL = outputURL.pathExtension == "caf"
+                ? outputURL
+                : DurableCaptureFiles.rawURL(for: outputURL, channel: .microphone)
+            let recorder = try AVAudioRecorder(url: rawURL, settings: settings)
             recorder.delegate = self
             recorder.isMeteringEnabled = true
             guard recorder.record() else {
@@ -216,6 +228,7 @@ private final class MicrophoneAudioRecorder: NSObject, AVAudioRecorderDelegate, 
             }
             previousDefaultDeviceID = previousDefault
             self.outputURL = outputURL
+            self.rawURL = rawURL
             meterQueue.sync { self.recorder = recorder }
             startMetering()
         } catch {
@@ -226,7 +239,13 @@ private final class MicrophoneAudioRecorder: NSObject, AVAudioRecorderDelegate, 
     }
 
     var captureArtifacts: RecordingCaptureArtifacts? {
-        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, microphoneFileName: $0.lastPathComponent) }
+        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, microphoneFileName: rawURL?.lastPathComponent) }
+    }
+
+    /// Exports the retained PCM to the M4A output. Call after `stop()`.
+    func publish() async throws {
+        guard let outputURL, let rawURL, outputURL != rawURL else { return }
+        try await AudioTrackMixer.mixToSingleM4A(inputs: [rawURL], outputURL: outputURL)
     }
 
     func stop() {
@@ -339,10 +358,10 @@ private final class CombinedAudioRecorder {
     }
 
     func start(outputURL: URL) async throws {
-        let base = outputURL.deletingPathExtension().lastPathComponent
-        let folder = outputURL.deletingLastPathComponent()
-        let microphoneURL = folder.appendingPathComponent(".\(base)-mic-\(UUID().uuidString).m4a")
-        let systemURL = folder.appendingPathComponent(".\(base)-system-\(UUID().uuidString).m4a")
+        // Deterministic names (persisted in the session manifest before capture starts)
+        // let recovery find the PCM even if start never returned.
+        let microphoneURL = DurableCaptureFiles.rawURL(for: outputURL, channel: .microphone)
+        let systemURL = DurableCaptureFiles.rawURL(for: outputURL, channel: .system)
         self.outputURL = outputURL
         self.microphoneURL = microphoneURL
         self.systemURL = systemURL
@@ -355,7 +374,7 @@ private final class CombinedAudioRecorder {
         } catch {
             microphoneRecorder.stop()
             try? await systemRecorder.stop()
-            cleanupTemporaryFiles()
+            // Preserve any PCM already captured, even if the other source failed.
             throw error
         }
     }
@@ -374,13 +393,7 @@ private final class CombinedAudioRecorder {
             ],
             outputURL: outputURL
         )
-        cleanupTemporaryFiles()
-    }
-
-    private func cleanupTemporaryFiles() {
-        for url in [microphoneURL, systemURL].compactMap({ $0 }) {
-            try? FileManager.default.removeItem(at: url)
-        }
+        // Raw tracks remain until the session publication/checkpoint succeeds.
     }
 }
 
@@ -421,17 +434,22 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
     private let onCaptureFailure: (@Sendable (Error) -> Void)?
     private var stream: SCStream?
     private var outputURL: URL?
-    // Writer state below is only read or written on `queue` (the sample-handler queue).
-    private var writer: AVAssetWriter?
-    private var systemInput: AVAssetWriterInput?
-    private var didStartSession = false
+    // Sink state below is only read or written on `queue` (the sample-handler queue),
+    // including PCM writer teardown.
+    private var sink: DurableSystemAudioSink?
+    private var captureError: Error?
     private var acceptingSamples = false
     private var isStopping = false
     private var streamStoppedUnexpectedly = false
     private var failureReported = false
 
     var captureArtifacts: RecordingCaptureArtifacts? {
-        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, systemFileName: $0.lastPathComponent) }
+        outputURL.map {
+            RecordingCaptureArtifacts(
+                outputFileName: $0.lastPathComponent,
+                systemFileName: Self.rawURL(for: $0).lastPathComponent
+            )
+        }
     }
 
     init(
@@ -465,20 +483,10 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
-        let systemInput = makeAudioInput()
-        guard writer.canAdd(systemInput) else {
-            throw RecordingError.writerFailed("System audio input could not be added.")
-        }
-        writer.add(systemInput)
-
-        guard writer.startWriting() else {
-            throw RecordingError.writerFailed(writer.error?.localizedDescription ?? "Writer failed to start.")
-        }
+        let rawURL = Self.rawURL(for: outputURL)
         queue.sync {
-            self.writer = writer
-            self.systemInput = systemInput
-            didStartSession = false
+            self.sink = DurableSystemAudioSink(url: rawURL)
+            captureError = nil
             acceptingSamples = true
             isStopping = false
             streamStoppedUnexpectedly = false
@@ -492,12 +500,13 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
             try await stream.startCapture()
         } catch {
             self.stream = nil
+            // Close (never delete) the PCM: anything captured stays available for recovery.
             queue.sync {
                 acceptingSamples = false
                 isStopping = true
-                self.writer?.cancelWriting()
-                self.writer = nil
-                self.systemInput = nil
+                sink?.close()
+                sink = nil
+                captureError = nil
             }
             throw error
         }
@@ -511,53 +520,41 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
             onSourceLevelUpdate?(.system, 0)
         }
 
-        let streamAlreadyStopped = queue.sync {
+        // Close PCM on the sample queue before invoking ScreenCaptureKit, whose stop callback can
+        // stall on sleep; its bounded wait then never holds the only audio file open.
+        let detached: (rawURL: URL?, captureError: Error?, streamAlreadyStopped: Bool) = queue.sync {
             isStopping = true
-            return streamStoppedUnexpectedly
-        }
-        if let stream, !streamAlreadyStopped {
-            do {
-                try await stream.stopCapture()
-            } catch {
-                stopError = error
-            }
-        }
-        // Detach the writer on the sample queue so no sample handler can touch it concurrently.
-        // Only a writer that is still `.writing` may be finished; calling
-        // `startSession`/`markAsFinished`/`finishWriting` on a failed one raises.
-        let detached: (writer: AVAssetWriter?, failure: Error?) = queue.sync {
             acceptingSamples = false
-            let current = self.writer
-            var failure: Error?
-            if let current {
-                if current.status == .writing {
-                    if !didStartSession {
-                        current.startSession(atSourceTime: .zero)
-                        didStartSession = true
-                    }
-                    systemInput?.markAsFinished()
-                } else {
-                    failure = RecordingError.writerFailed(
-                        current.error?.localizedDescription ?? "System audio writer stopped before the recording finished."
-                    )
-                }
-            }
-            self.writer = nil
-            systemInput = nil
-            didStartSession = false
-            return (failure == nil ? current : nil, failure)
+            sink?.close()
+            let result = (sink?.url, captureError, streamStoppedUnexpectedly)
+            sink = nil
+            captureError = nil
+            return result
         }
-        if let failure = detached.failure {
-            stopError = failure
-        } else {
-            do {
-                try await Self.finish(detached.writer)
-            } catch {
-                stopError = stopError ?? error
+        if let stream, !detached.streamAlreadyStopped {
+            stopError = await stopStreamWithDeadline(stream)
+        }
+        if let error = detached.captureError { throw error }
+        if let rawURL = detached.rawURL, let outputURL,
+           FileManager.default.fileExists(atPath: rawURL.path) {
+            if outputURL != rawURL {
+                try await AudioTrackMixer.mixToSingleM4A(inputs: [rawURL], outputURL: outputURL)
             }
+            // An already-stopped SCStream is benign once the PCM was closed successfully.
+            stopError = nil
         }
         if let stopError {
             throw stopError
+        }
+    }
+
+    private func stopStreamWithDeadline(_ stream: SCStream) async -> Error? {
+        await withCheckedContinuation { continuation in
+            let completion = StreamStopCompletion(continuation)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                completion.finish(RecordingError.writerFailed("System capture stop timed out; PCM was preserved."))
+            }
+            stream.stopCapture { error in completion.finish(error) }
         }
     }
 
@@ -565,25 +562,18 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
         guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else {
             return
         }
-        guard type == .audio, acceptingSamples, let writer, let input = systemInput else {
+        guard type == .audio, acceptingSamples, let sink else {
             return
         }
-        if writer.status == .failed {
-            writerDidFail(writer)
-            return
-        }
-        if !didStartSession {
-            writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
-            didStartSession = true
-        }
-        if input.isReadyForMoreMediaData {
-            if input.append(sampleBuffer) {
-                let level = AudioSampleLevelMeter.normalizedLevel(from: sampleBuffer)
-                onLevelUpdate?(level)
-                onSourceLevelUpdate?(.system, level)
-            } else if writer.status == .failed {
-                writerDidFail(writer)
-            }
+        do {
+            try sink.append(sampleBuffer)
+            let level = AudioSampleLevelMeter.normalizedLevel(from: sampleBuffer)
+            onLevelUpdate?(level)
+            onSourceLevelUpdate?(.system, level)
+        } catch {
+            captureError = captureError ?? error
+            acceptingSamples = false
+            reportFailure(RecordingError.captureInterrupted("System audio could not be written (\(error.localizedDescription))."))
         }
     }
 
@@ -596,40 +586,28 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
     }
 
     /// Must run on `queue`.
-    private func writerDidFail(_ writer: AVAssetWriter) {
-        acceptingSamples = false
-        let reason = writer.error?.localizedDescription ?? "the writer failed"
-        reportFailure(RecordingError.captureInterrupted("System audio could not be written (\(reason))."))
-    }
-
-    /// Must run on `queue`.
     private func reportFailure(_ error: Error) {
         guard !isStopping, !failureReported else { return }
         failureReported = true
         onCaptureFailure?(error)
     }
 
-    private func makeAudioInput() -> AVAssetWriterInput {
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 48_000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 128_000
-        ]
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-        input.expectsMediaDataInRealTime = true
-        return input
+    private static func rawURL(for outputURL: URL) -> URL {
+        outputURL.pathExtension == "caf" ? outputURL : DurableCaptureFiles.rawURL(for: outputURL, channel: .system)
     }
+}
 
-    private static func finish(_ writer: AVAssetWriter?) async throws {
-        guard let writer else { return }
-        await withCheckedContinuation { continuation in
-            writer.finishWriting {
-                continuation.resume()
-            }
+/// Exactly-once bridge between `SCStream.stopCapture`'s callback and its deadline.
+private final class StreamStopCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Error?, Never>?
+    init(_ continuation: CheckedContinuation<Error?, Never>) { self.continuation = continuation }
+    func finish(_ error: Error?) {
+        let waiter = lock.withLock {
+            let waiter = continuation
+            continuation = nil
+            return waiter
         }
-        if writer.status == .failed {
-            throw RecordingError.writerFailed(writer.error?.localizedDescription ?? "Writer failed.")
-        }
+        waiter?.resume(returning: error)
     }
 }
