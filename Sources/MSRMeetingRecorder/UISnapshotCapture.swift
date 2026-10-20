@@ -54,8 +54,14 @@ enum UISnapshotCapture {
         guard isRequested else { return }
         viewModel.settings.rememberCredentials = false
         viewModel.settings.localAPIEnabled = false
-        viewModel.elevenLabsKeyDraft = "snapshot-placeholder-key"
-        viewModel.openAIKeyDraft = "snapshot-placeholder-key"
+        // A key exported in the environment is real and already wins over the
+        // Keychain, so only providers without one get a placeholder.
+        if environment["ELEVENLABS_API_KEY"]?.isEmpty != false {
+            viewModel.elevenLabsKeyDraft = "snapshot-placeholder-key"
+        }
+        if environment["OPENAI_API_KEY"]?.isEmpty != false {
+            viewModel.openAIKeyDraft = "snapshot-placeholder-key"
+        }
         viewModel.saveAPIKeys()
         viewModel.statusMessage = "Ready"
     }
