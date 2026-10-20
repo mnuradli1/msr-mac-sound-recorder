@@ -30,11 +30,17 @@ public final class APIKeyStore: @unchecked Sendable {
         if let sessionValue = lock.withLock({ sessionValues[provider] }) {
             return sessionValue
         }
+        // Environment before Keychain: an exported key never triggers a Keychain
+        // access prompt (which blocks unsigned developer builds), and a shell
+        // that exports a key means to use it.
+        if let environmentValue = environment[Self.environmentVariableName(for: provider)].flatMap(APIKeyNormalizer.normalized) {
+            return environmentValue
+        }
         if let keychainValue = keychain.read(service: serviceName, account: provider.rawValue),
            let normalized = APIKeyNormalizer.normalized(keychainValue) {
             return normalized
         }
-        return environment[Self.environmentVariableName(for: provider)].flatMap(APIKeyNormalizer.normalized)
+        return nil
     }
 
     /// Uses `apiKey` for this app run only (not persisted).

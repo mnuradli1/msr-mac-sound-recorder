@@ -183,6 +183,11 @@ final class AppViewModel: ObservableObject {
                 self?.updateSourceLevel(channel, level)
             }
         }
+        self.recorder.onCaptureFailure = { [weak self] error in
+            Task { @MainActor in
+                await self?.handleCaptureFailure(error)
+            }
+        }
         lastAppliedSettings = settings
         bindPresentationModels()
     }
@@ -796,6 +801,16 @@ final class AppViewModel: ObservableObject {
         await performRecordingAction {
             await self.startNewRecordingSession()
         }
+    }
+
+    /// The capture pipeline reported that it stopped on its own (stream ended,
+    /// encoder error). Save whatever was captured instead of showing a live
+    /// "Recording" state that is no longer true.
+    private func handleCaptureFailure(_ error: Error) async {
+        guard isRecording else { return }
+        recoveryMessage = "\(error.localizedDescription) The audio captured so far is being saved."
+        recoveryNoticeSeverity = .error
+        await stopRecording()
     }
 
     func stopRecording() async {

@@ -164,6 +164,10 @@ struct TitleBadge: View {
             if recording.isImported {
                 StatusChip(title: "Imported", tone: .neutral, systemImage: "square.and.arrow.down", compact: true)
             }
+            if recording.effectiveTitleSource == .generated {
+                StatusChip(title: "Auto-titled", tone: .info, systemImage: "wand.and.stars", compact: true)
+                    .help("This title was generated from the transcript. Rename the recording to keep your own title.")
+            }
         }
     }
 }

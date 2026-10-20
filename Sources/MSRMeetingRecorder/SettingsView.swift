@@ -66,7 +66,7 @@ struct SettingsView: View {
         .frame(width: 560, height: 560)
         .environment(\.locale, preferredLocale)
         .background(SettingsWindowAppearance(theme: viewModel.settings.theme))
-        .onChange(of: viewModel.settings) { _, _ in viewModel.saveSettings() }
+        .onChange(of: viewModel.settings) { _, _ in viewModel.scheduleSettingsSave() }
     }
 
     private var preferredLocale: Locale {
@@ -166,7 +166,7 @@ private struct TranscriptionSettingsTab: View {
 
     var body: some View {
         Form {
-            Section("Transcription") {
+            Section {
                 Picker("Provider", selection: $viewModel.settings.provider) {
                     ForEach(AIProvider.allCases) { provider in
                         Text(LocalizedStringKey(provider.displayName)).tag(provider)
@@ -174,9 +174,17 @@ private struct TranscriptionSettingsTab: View {
                 }
                 Toggle("Compress large/uncompressed uploads", isOn: $viewModel.settings.compressUploads)
                 Toggle("Auto-title recordings from the transcript", isOn: $viewModel.settings.autoTitle)
-                // Slot: the "Auto-transcribe new recordings" toggle
-                // (bound to `settings.autoTranscribe`) goes here, directly
-                // below auto-title, once the model layer provides it.
+                Toggle("Auto-transcribe new recordings", isOn: $viewModel.settings.autoTranscribe)
+            } header: {
+                Text("Transcription")
+            } footer: {
+                Text(viewModel.settings.autoTranscribe
+                    ? (viewModel.autoTranscribeIsEffective
+                        ? "Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself."
+                        : "Auto-transcribe is on, but no API key is saved for the selected provider. Add one below.")
+                    : "Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

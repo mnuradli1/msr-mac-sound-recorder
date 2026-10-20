@@ -253,3 +253,14 @@
 "Menu Bar & Shortcuts" = "Bilah Menu & Pintasan";
 "Local API" = "API Lokal";
 "Lets local automation on this Mac request transcriptions with a per-run token. Off by default." = "Mengizinkan otomatisasi lokal di Mac ini meminta transkripsi dengan token per sesi. Nonaktif secara bawaan.";
+
+// MARK: - Auto-transcribe & auto-title
+"Auto-transcribe new recordings" = "Transkripsi otomatis rekaman baru";
+"Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself." = "Setiap rekaman yang selesai langsung dimasukkan ke antrean transkripsi. Jika judul otomatis aktif, rekaman diberi nama dari transkripnya kecuali Anda mengganti namanya sendiri.";
+"Auto-transcribe is on, but no API key is saved for the selected provider. Add one below." = "Transkripsi otomatis aktif, tetapi belum ada kunci API untuk penyedia yang dipilih. Tambahkan di bawah.";
+"Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically." = "Transkripsi dimulai saat Anda menekan Transkripsi. Aktifkan untuk mengantrekan setiap rekaman yang selesai secara otomatis.";
+"Title generated from the transcript" = "Judul dibuat dari transkrip";
+"Auto-titled" = "Judul otomatis";
+"This title was generated from the transcript. Rename the recording to keep your own title." = "Judul ini dibuat dari transkrip. Ganti nama rekaman untuk memakai judul Anda sendiri.";
+"Dismiss" = "Tutup";
+"Dismiss notice" = "Tutup pemberitahuan";

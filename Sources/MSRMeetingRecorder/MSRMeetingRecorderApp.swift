@@ -15,6 +15,7 @@ struct MSRMeetingRecorderApp: App {
                     UISnapshotCapture.prepareIfRequested(viewModel: viewModel)
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
+                    await UIScenarioRunner.runIfRequested(viewModel: viewModel)
                     await UISnapshotCapture.runIfRequested(viewModel: viewModel)
                 }
         }

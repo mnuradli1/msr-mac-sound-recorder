@@ -253,3 +253,14 @@
 "Menu Bar & Shortcuts" = "Menu Bar & Shortcuts";
 "Local API" = "Local API";
 "Lets local automation on this Mac request transcriptions with a per-run token. Off by default." = "Lets local automation on this Mac request transcriptions with a per-run token. Off by default.";
+
+// MARK: - Auto-transcribe & auto-title
+"Auto-transcribe new recordings" = "Auto-transcribe new recordings";
+"Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself." = "Each finished recording is queued for transcription right away. With auto-title on, the recording is renamed from its transcript unless you rename it yourself.";
+"Auto-transcribe is on, but no API key is saved for the selected provider. Add one below." = "Auto-transcribe is on, but no API key is saved for the selected provider. Add one below.";
+"Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically." = "Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically.";
+"Title generated from the transcript" = "Title generated from the transcript";
+"Auto-titled" = "Auto-titled";
+"This title was generated from the transcript. Rename the recording to keep your own title." = "This title was generated from the transcript. Rename the recording to keep your own title.";
+"Dismiss" = "Dismiss";
+"Dismiss notice" = "Dismiss notice";

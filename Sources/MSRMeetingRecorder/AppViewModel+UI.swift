@@ -69,14 +69,17 @@ extension AppViewModel {
         if FileManager.default.fileExists(atPath: recording.summaryURL.path) { badges.append(.summary) }
         if recording.isRecovered { badges.append(.recovered) }
         if recording.isImported { badges.append(.imported) }
+        if recording.effectiveTitleSource == .generated { badges.append(.autoTitled) }
         return badges
     }
 
     /// Transcription job chip for a sidebar row (single `jobStatusText` path).
+    /// Automatic jobs are marked so the user can tell them from ones they started.
     func jobChip(for recording: RecordingItem) -> (title: String, tone: Tone)? {
         guard let text = transcriptionStatusText(for: recording) else { return nil }
         let status = transcriptionJobs.first { $0.recordingID == recording.id }?.status
-        return (text, status == .failed ? .warning : .progress)
+        let title = transcriptionOriginLabel(for: recording).map { "\($0) · \(text)" } ?? text
+        return (title, status == .failed ? .warning : .progress)
     }
 
     func jobStatusText(for job: TranscriptionJob) -> String {

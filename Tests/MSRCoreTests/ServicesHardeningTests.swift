@@ -412,14 +412,18 @@ struct LocalHTTPServerHardeningTests {
 
 @Suite("API key store precedence")
 struct APIKeyStoreHardeningTests {
-    @Test func precedenceIsSessionThenKeychainThenEnvironment() throws {
+    @Test func precedenceIsSessionThenEnvironmentThenKeychain() throws {
         let keychain = InMemoryKeychain()
         let store = APIKeyStore(environment: ["ELEVENLABS_API_KEY": " env-key "], keychain: keychain)
         #expect(store.apiKey(for: .elevenLabs) == "env-key")
         #expect(store.apiKey(for: .openAI) == nil)
 
+        // An exported key wins over the Keychain so developer runs never
+        // trigger a Keychain access prompt.
         try store.save(apiKey: "keychain-key", for: .elevenLabs)
-        #expect(store.apiKey(for: .elevenLabs) == "keychain-key")
+        #expect(store.apiKey(for: .elevenLabs) == "env-key")
+        try store.save(apiKey: "openai-keychain-key", for: .openAI)
+        #expect(store.apiKey(for: .openAI) == "openai-keychain-key")
 
         try store.setSession(apiKey: "session-key", for: .elevenLabs)
         #expect(store.apiKey(for: .elevenLabs) == "session-key")

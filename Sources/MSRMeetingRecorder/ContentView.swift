@@ -101,7 +101,27 @@ struct ContentView: View {
             NoticeBanner(message: viewModel.recoveryMessage, severity: viewModel.recoveryNoticeSeverity)
         } else if let errorMessage = viewModel.workflowErrorMessage {
             NoticeBanner(message: errorMessage, severity: .error)
+        } else if let notice = viewModel.autoTranscribeNotice {
+            dismissibleNotice(notice, severity: .warning) { viewModel.clearAutoTranscribeNotice() }
+        } else if let notice = viewModel.lastAutoTitleNotice {
+            dismissibleNotice(notice, severity: .info) { viewModel.clearAutoTitleNotice() }
         }
+    }
+
+    private func dismissibleNotice(_ message: String, severity: AppNoticeSeverity, onDismiss: @escaping () -> Void) -> some View {
+        NoticeBanner(message: message, severity: severity)
+            .overlay(alignment: .trailing) {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.trailing, Theme.gutter)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss notice")
+            }
     }
 
     private var mainArea: some View {

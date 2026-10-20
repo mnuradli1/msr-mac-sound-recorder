@@ -15,6 +15,7 @@ enum RecordingBadge: Hashable, Identifiable {
     case summary
     case recovered
     case imported
+    case autoTitled
 
     var id: Self { self }
 
@@ -25,6 +26,7 @@ enum RecordingBadge: Hashable, Identifiable {
         case .summary: "sparkles"
         case .recovered: "lifepreserver"
         case .imported: "square.and.arrow.down"
+        case .autoTitled: "wand.and.stars"
         }
     }
 
@@ -35,6 +37,7 @@ enum RecordingBadge: Hashable, Identifiable {
         case .summary: "Has summary"
         case .recovered: "Recovered recording"
         case .imported: "Imported recording"
+        case .autoTitled: "Title generated from the transcript"
         }
     }
 
