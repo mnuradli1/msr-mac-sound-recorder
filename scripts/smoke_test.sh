@@ -35,11 +35,22 @@ test -f "$ROOT_DIR/dist/provenance.json"
 test -f "$ROOT_DIR/dist/msr.rb"
 
 echo "==> Secret scan"
-if rg -n 'sk_[A-Za-z0-9]+' --glob '!/.build/**' --glob '!dist/**' . >/tmp/msr-secret-scan.txt; then
+SECRET_SCAN_OUTPUT="$(mktemp -t msr-secret-scan)"
+# ElevenLabs keys start with sk_, OpenAI keys with sk-; both are long and have no spaces.
+SECRET_PATTERN='sk[_-][A-Za-z0-9_-]{20,}'
+if command -v rg >/dev/null 2>&1; then
+  rg -n "$SECRET_PATTERN" --glob '!.build/**' --glob '!dist/**' --glob '!.codegraph/**' --glob '!.claude/**' . >"$SECRET_SCAN_OUTPUT" || true
+else
+  grep -rnE "$SECRET_PATTERN" --exclude-dir=.build --exclude-dir=dist --exclude-dir=.git --exclude-dir=.codegraph --exclude-dir=.claude . >"$SECRET_SCAN_OUTPUT" || true
+fi
+if [[ -s "$SECRET_SCAN_OUTPUT" ]]; then
   echo "Potential secret strings found:" >&2
-  sed -n '1,20p' /tmp/msr-secret-scan.txt >&2
+  sed -n '1,20p' "$SECRET_SCAN_OUTPUT" >&2
+  rm -f "$SECRET_SCAN_OUTPUT"
   exit 1
 fi
+rm -f "$SECRET_SCAN_OUTPUT"
+echo "Secret scan: clean"
 
 echo "==> Optional live provider checks"
 if [[ -n "${ELEVENLABS_API_KEY:-}" ]]; then
