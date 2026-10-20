@@ -9,6 +9,7 @@ public protocol AudioRecording: AnyObject, Sendable {
     var captureArtifacts: RecordingCaptureArtifacts? { get }
     var onLevelUpdate: (@Sendable (Float) -> Void)? { get set }
     var onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? { get set }
+    var onCaptureFailure: (@Sendable (String) -> Void)? { get set }
     func start(source: AudioSource, outputURL: URL) async throws
     func stop() async throws
     func setMicrophoneDeviceUID(_ uid: String?)
@@ -27,6 +28,7 @@ public struct RecordingCaptureArtifacts: Equatable, Sendable {
 }
 
 public extension AudioRecording {
+    var onCaptureFailure: (@Sendable (String) -> Void)? { get { nil } set {} }
     var captureArtifacts: RecordingCaptureArtifacts? { nil }
     func setMicrophoneDeviceUID(_ uid: String?) {}
 }
@@ -46,6 +48,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
     }
     public var onLevelUpdate: (@Sendable (Float) -> Void)?
     public var onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
+    public var onCaptureFailure: (@Sendable (String) -> Void)?
 
     public init() {}
 
@@ -62,6 +65,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
         switch RecordingCaptureStrategy.strategy(for: source) {
         case .microphoneOnly:
             let recorder = MicrophoneAudioRecorder(
+                onCaptureFailure: onCaptureFailure,
                 channel: .microphone,
                 deviceUID: microphoneDeviceUID,
                 onLevelUpdate: onLevelUpdate,
@@ -71,6 +75,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
             microphoneRecorder = recorder
         case .systemOnly:
             let recorder = ScreenCaptureAudioRecorder(
+                onCaptureFailure: onCaptureFailure,
                 onLevelUpdate: onLevelUpdate,
                 onSourceLevelUpdate: onSourceLevelUpdate
             )
@@ -78,6 +83,7 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
             screenRecorder = recorder
         case .separateMicAndSystemMixdown:
             let recorder = CombinedAudioRecorder(
+                onCaptureFailure: onCaptureFailure,
                 microphoneDeviceUID: microphoneDeviceUID,
                 onLevelUpdate: onLevelUpdate,
                 onSourceLevelUpdate: onSourceLevelUpdate
@@ -102,6 +108,9 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
         }
 
         microphoneRecorder?.stop()
+        if let microphoneRecorder {
+            do { try await microphoneRecorder.publish() } catch { stopError = error }
+        }
         if let screenRecorder {
             do {
                 try await screenRecorder.stop()
@@ -128,7 +137,8 @@ public final class MeetingAudioRecorder: AudioRecording, @unchecked Sendable {
     }
 }
 
-private final class MicrophoneAudioRecorder {
+private final class MicrophoneAudioRecorder: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
+    private let onCaptureFailure: (@Sendable (String) -> Void)?
     private var recorder: AVAudioRecorder?
     private let channel: AudioSignalChannel
     private let deviceUID: String?
@@ -136,19 +146,24 @@ private final class MicrophoneAudioRecorder {
     private let onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
     private var meterTimer: DispatchSourceTimer?
     private var outputURL: URL?
+    private var rawURL: URL?
+
     private var previousDefaultDeviceID: AudioDeviceID?
     private let meterQueue = DispatchQueue(label: "app.msr.microphone-meter")
 
     init(
+        onCaptureFailure: (@Sendable (String) -> Void)? = nil,
         channel: AudioSignalChannel,
         deviceUID: String? = nil,
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
         onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? = nil
     ) {
+        self.onCaptureFailure = onCaptureFailure
         self.channel = channel
         self.deviceUID = deviceUID
         self.onLevelUpdate = onLevelUpdate
         self.onSourceLevelUpdate = onSourceLevelUpdate
+        super.init()
     }
 
     func start(outputURL: URL) async throws {
@@ -157,23 +172,41 @@ private final class MicrophoneAudioRecorder {
         }
         previousDefaultDeviceID = AudioDeviceCatalog.selectInputDevice(uid: deviceUID)
         let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 48_000,
             AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false
         ]
-        let recorder = try AVAudioRecorder(url: outputURL, settings: settings)
+        let rawURL = outputURL.pathExtension == "caf" ? outputURL : DurableCaptureFiles.rawURL(for: outputURL, channel: .microphone)
+        let recorder = try AVAudioRecorder(url: rawURL, settings: settings)
+        recorder.delegate = self
         recorder.isMeteringEnabled = true
         guard recorder.record() else {
             throw RecordingError.couldNotStartRecording
         }
         self.recorder = recorder
         self.outputURL = outputURL
+        self.rawURL = rawURL
         startMetering()
     }
 
     var captureArtifacts: RecordingCaptureArtifacts? {
-        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, microphoneFileName: $0.lastPathComponent) }
+        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, microphoneFileName: rawURL?.lastPathComponent) }
+    }
+
+    func publish() async throws {
+        guard let outputURL, let rawURL, outputURL != rawURL else { return }
+        try await AudioTrackMixer.mixToSingleM4A(inputs: [rawURL], outputURL: outputURL)
+    }
+
+    func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
+        onCaptureFailure?(error?.localizedDescription ?? "Microphone audio could not be written.")
+    }
+
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        if !flag { onCaptureFailure?("Microphone audio stopped unexpectedly.") }
     }
 
     func stop() {
@@ -245,27 +278,28 @@ private final class CombinedAudioRecorder {
     }
 
     init(
+        onCaptureFailure: (@Sendable (String) -> Void)? = nil,
         microphoneDeviceUID: String? = nil,
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
         onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? = nil
     ) {
         microphoneRecorder = MicrophoneAudioRecorder(
+            onCaptureFailure: onCaptureFailure,
             channel: .microphone,
             deviceUID: microphoneDeviceUID,
             onLevelUpdate: onLevelUpdate,
             onSourceLevelUpdate: onSourceLevelUpdate
         )
         systemRecorder = ScreenCaptureAudioRecorder(
+            onCaptureFailure: onCaptureFailure,
             onLevelUpdate: onLevelUpdate,
             onSourceLevelUpdate: onSourceLevelUpdate
         )
     }
 
     func start(outputURL: URL) async throws {
-        let base = outputURL.deletingPathExtension().lastPathComponent
-        let folder = outputURL.deletingLastPathComponent()
-        let microphoneURL = folder.appendingPathComponent(".\(base)-mic-\(UUID().uuidString).m4a")
-        let systemURL = folder.appendingPathComponent(".\(base)-system-\(UUID().uuidString).m4a")
+        let microphoneURL = DurableCaptureFiles.rawURL(for: outputURL, channel: .microphone)
+        let systemURL = DurableCaptureFiles.rawURL(for: outputURL, channel: .system)
         self.outputURL = outputURL
         self.microphoneURL = microphoneURL
         self.systemURL = systemURL
@@ -278,7 +312,7 @@ private final class CombinedAudioRecorder {
         } catch {
             microphoneRecorder.stop()
             try? await systemRecorder.stop()
-            cleanupTemporaryFiles()
+            // Preserve any PCM already captured, even if the other source failed.
             throw error
         }
     }
@@ -297,14 +331,9 @@ private final class CombinedAudioRecorder {
             ],
             outputURL: outputURL
         )
-        cleanupTemporaryFiles()
+        // Raw tracks remain until the session publication/checkpoint succeeds.
     }
 
-    private func cleanupTemporaryFiles() {
-        for url in [microphoneURL, systemURL].compactMap({ $0 }) {
-            try? FileManager.default.removeItem(at: url)
-        }
-    }
 }
 
 public enum RecordingError: Error, LocalizedError {
@@ -334,23 +363,28 @@ public enum RecordingError: Error, LocalizedError {
 }
 
 final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
+    private let onCaptureFailure: (@Sendable (String) -> Void)?
+    // Accessed exclusively on the sample queue, including writer teardown.
+    private var acceptingSamples = false
     private let queue = DispatchQueue(label: "app.msr.screen-audio")
     private let onLevelUpdate: (@Sendable (Float) -> Void)?
     private let onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
     private var stream: SCStream?
-    private var writer: AVAssetWriter?
-    private var systemInput: AVAssetWriterInput?
-    private var didStartSession = false
+    private var sink: DurableSystemAudioSink?
+    private var captureError: Error?
     private var outputURL: URL?
 
     var captureArtifacts: RecordingCaptureArtifacts? {
-        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent, systemFileName: $0.lastPathComponent) }
+        outputURL.map { RecordingCaptureArtifacts(outputFileName: $0.lastPathComponent,
+            systemFileName: ($0.pathExtension == "caf" ? $0 : DurableCaptureFiles.rawURL(for: $0, channel: .system)).lastPathComponent) }
     }
 
     init(
+        onCaptureFailure: (@Sendable (String) -> Void)? = nil,
         onLevelUpdate: (@Sendable (Float) -> Void)? = nil,
         onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)? = nil
     ) {
+        self.onCaptureFailure = onCaptureFailure
         self.onLevelUpdate = onLevelUpdate
         self.onSourceLevelUpdate = onSourceLevelUpdate
     }
@@ -376,55 +410,65 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
-        let systemInput = makeAudioInput()
-        guard writer.canAdd(systemInput) else {
-            throw RecordingError.writerFailed("System audio input could not be added.")
+        let rawURL = outputURL.pathExtension == "caf" ? outputURL : DurableCaptureFiles.rawURL(for: outputURL, channel: .system)
+        queue.sync {
+            self.sink = DurableSystemAudioSink(url: rawURL)
+            self.captureError = nil
+            self.acceptingSamples = true
         }
-        writer.add(systemInput)
-        self.systemInput = systemInput
-
-        guard writer.startWriting() else {
-            throw RecordingError.writerFailed(writer.error?.localizedDescription ?? "Writer failed to start.")
-        }
-        self.writer = writer
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
         self.stream = stream
-        try await stream.startCapture()
+        do {
+            try await stream.startCapture()
+        } catch {
+            // A partially started stream still owns a writer; close it before losing the handle.
+            try? await stop()
+            throw error
+        }
     }
 
     func stop() async throws {
         var stopError: Error?
         defer {
             stream = nil
-            writer = nil
-            systemInput = nil
-            didStartSession = false
             onLevelUpdate?(0)
             onSourceLevelUpdate?(.system, 0)
         }
 
-        if let stream {
-            do {
-                try await stream.stopCapture()
-            } catch {
-                stopError = error
+        let result: (URL?, Error?) = queue.sync {
+            acceptingSamples = false
+            sink?.close()
+            let result = (sink?.url, captureError)
+            sink = nil
+            captureError = nil
+            return result
+        }
+        // Close PCM before invoking ScreenCaptureKit, whose stop callback can
+        // stall on sleep. Its bounded wait never holds the only audio file open.
+        if let stream { stopError = await stopStreamWithDeadline(stream) }
+        if let error = result.1 { throw error }
+        if let rawURL = result.0, let outputURL,
+           FileManager.default.fileExists(atPath: rawURL.path) {
+            if outputURL != rawURL {
+                try await AudioTrackMixer.mixToSingleM4A(inputs: [rawURL], outputURL: outputURL)
             }
-        }
-        if let writer, !didStartSession {
-            writer.startSession(atSourceTime: .zero)
-            didStartSession = true
-        }
-        systemInput?.markAsFinished()
-        do {
-            try await finishWriter()
-        } catch {
-            stopError = stopError ?? error
+            // Already-stopped SCStream is benign only after PCM was closed successfully.
+            stopError = nil
         }
         if let stopError {
             throw stopError
+        }
+    }
+
+    private func stopStreamWithDeadline(_ stream: SCStream) async -> Error? {
+        await withCheckedContinuation { continuation in
+            let completion = StreamStopCompletion(continuation)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                completion.finish(RecordingError.writerFailed("System capture stop timed out; PCM was preserved."))
+            }
+            stream.stopCapture { error in completion.finish(error) }
         }
     }
 
@@ -432,42 +476,32 @@ final class ScreenCaptureAudioRecorder: NSObject, SCStreamOutput, @unchecked Sen
         guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else {
             return
         }
-        guard type == .audio, let writer, let input = systemInput else {
+        guard acceptingSamples, type == .audio, let sink else {
             return
         }
-        if !didStartSession {
-            writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
-            didStartSession = true
-        }
-        if input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
+        do {
+            try sink.append(sampleBuffer)
             let level = AudioSampleLevelMeter.normalizedLevel(from: sampleBuffer)
             onLevelUpdate?(level)
             onSourceLevelUpdate?(.system, level)
+        } catch {
+            captureError = captureError ?? error
+            acceptingSamples = false
+            onCaptureFailure?(error.localizedDescription)
         }
     }
+}
 
-    private func makeAudioInput() -> AVAssetWriterInput {
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 48_000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 128_000
-        ]
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-        input.expectsMediaDataInRealTime = true
-        return input
-    }
-
-    private func finishWriter() async throws {
-        guard let writer else { return }
-        await withCheckedContinuation { continuation in
-            writer.finishWriting {
-                continuation.resume()
-            }
+private final class StreamStopCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Error?, Never>?
+    init(_ continuation: CheckedContinuation<Error?, Never>) { self.continuation = continuation }
+    func finish(_ error: Error?) {
+        let waiter = lock.withLock {
+            let waiter = continuation
+            continuation = nil
+            return waiter
         }
-        if writer.status == .failed {
-            throw RecordingError.writerFailed(writer.error?.localizedDescription ?? "Writer failed.")
-        }
+        waiter?.resume(returning: error)
     }
 }

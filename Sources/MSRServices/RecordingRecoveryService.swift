@@ -15,19 +15,22 @@ public struct RecordingRecoveryResult: Equatable, Sendable {
     public let message: String
     public let recoveredFiles: [String]
     public let failedFiles: [String]
+    public let warnings: [String]
 
     public init(
         status: RecordingRecoveryStatus,
         recording: RecordingItem?,
         message: String,
         recoveredFiles: [String],
-        failedFiles: [String]
+        failedFiles: [String],
+        warnings: [String] = []
     ) {
         self.status = status
         self.recording = recording
         self.message = message
         self.recoveredFiles = recoveredFiles
         self.failedFiles = failedFiles
+        self.warnings = warnings
     }
 }
 
@@ -45,16 +48,32 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         var results: [RecordingRecoveryResult] = []
         let sessionManifests = try RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager).loadAll()
         for manifest in sessionManifests {
-            results.append(try await recoverSession(manifest, now: now))
+            do {
+                results.append(try await recoverSession(manifest, now: now))
+            } catch {
+                // One legacy damaged export must not prevent later PCM sessions
+                // from recovering. Preserve all inputs and the retry manifest.
+                results.append(RecordingRecoveryResult(status: .failed(error.localizedDescription),
+                    recording: nil, message: "Could not recover \(manifest.requestedName): \(error.localizedDescription)",
+                    recoveredFiles: [], failedFiles: [RecordingSessionManifestStore(folderURL: folderURL).url(for: manifest.id).lastPathComponent]))
+            }
         }
-        let candidates = try interruptedCandidates()
+        let manifestFiles = Set(sessionManifests.flatMap { manifest in
+            manifest.allSegments.map(\.fileName) + [manifest.microphoneFileName, manifest.systemFileName].compactMap { $0 }
+        })
+        let candidates = try interruptedCandidates(excluding: manifestFiles)
         for candidate in candidates {
-            results.append(try await recover(candidate, now: now))
+            do { results.append(try await recover(candidate, now: now)) }
+            catch {
+                results.append(RecordingRecoveryResult(status: .failed(error.localizedDescription),
+                    recording: nil, message: "Could not recover interrupted audio: \(error.localizedDescription)",
+                    recoveredFiles: [], failedFiles: []))
+            }
         }
         return results
     }
 
-    private func interruptedCandidates() throws -> [RecoveryCandidate] {
+    private func interruptedCandidates(excluding fileNames: Set<String>) throws -> [RecoveryCandidate] {
         let urls = try fileManager.contentsOfDirectory(
             at: folderURL,
             includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
@@ -65,6 +84,7 @@ public final class RecordingRecoveryService: @unchecked Sendable {
 
         for url in urls where url.pathExtension == "m4a" {
             let name = url.lastPathComponent
+            if fileNames.contains(name) { continue }
             if let parsed = parsePairedSide(name: name) {
                 var candidate = grouped[parsed.sessionID, default: PairedCandidate(sessionID: parsed.sessionID)]
                 switch parsed.channel {
@@ -95,11 +115,28 @@ public final class RecordingRecoveryService: @unchecked Sendable {
     }
 
     private func recoverSession(_ manifest: RecordingSessionManifest, now: Date) async throws -> RecordingRecoveryResult {
+        // Validate before any manifest-directed reads, moves, or cleanup.
+        for name in manifest.allSegments.map(\.fileName) + [manifest.microphoneFileName, manifest.systemFileName].compactMap({ $0 }) {
+            let input = try StoragePath.containedURL(in: folderURL, fileName: name)
+            guard StoragePath.isContained(input, in: folderURL) else {
+                throw StorageIntegrityError.pathEscapesLibrary(name)
+            }
+            for raw in DurableCaptureFiles.rawURLs(for: input, source: manifest.source) {
+                guard StoragePath.isContained(raw, in: folderURL) else {
+                    throw StorageIntegrityError.pathEscapesLibrary(raw.lastPathComponent)
+                }
+            }
+        }
         let manifestStore = RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager)
         let manifestURL = manifestStore.url(for: manifest.id)
         if let finalRecordingID = manifest.finalRecordingID,
            let published = try RecordingLibrary(folderURL: folderURL, fileManager: fileManager)
             .loadRecordings().first(where: { $0.id == finalRecordingID }) {
+            _ = try await audioInfo(for: published.audioURL)
+            for segment in manifest.allSegments {
+                _ = await DurableCaptureFiles.removeReadableRawFiles(for: folderURL.appendingPathComponent(segment.fileName), source: manifest.source)
+            }
+            try archiveLegacyInputs(manifest, excluding: published.audioURL)
             try manifestStore.delete(manifest)
             return RecordingRecoveryResult(
                 status: .recoveredSession(segmentCount: manifest.allSegments.count),
@@ -122,6 +159,11 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         }
 
         let segmentURLs = segments.map { folderURL.appendingPathComponent($0.fileName) }
+        var degradedCapture = false
+        for segmentURL in segmentURLs {
+            let degraded = try await DurableCaptureFiles.restoreSegmentIfNeeded(output: segmentURL, source: manifest.source)
+            degradedCapture = degradedCapture || degraded
+        }
         if let active = manifest.activeSegment,
            let activeIndex = segments.firstIndex(where: { $0.fileName == active.fileName }),
            !fileManager.fileExists(atPath: segmentURLs[activeIndex].path) {
@@ -130,9 +172,12 @@ public final class RecordingRecoveryService: @unchecked Sendable {
             let available = [systemURL, microphoneURL].compactMap { $0 }.filter { fileManager.fileExists(atPath: $0.path) }
             if available.count == 2 {
                 try await AudioTrackMixer.mixToSingleM4A(inputs: available, outputURL: segmentURLs[activeIndex])
-                for url in available { try? fileManager.removeItem(at: url) }
             } else if let only = available.first {
-                try fileManager.moveItem(at: only, to: segmentURLs[activeIndex])
+                if only.pathExtension == "caf" {
+                    try await AudioTrackMixer.mixToSingleM4A(inputs: [only], outputURL: segmentURLs[activeIndex])
+                } else {
+                    try fileManager.copyItem(at: only, to: segmentURLs[activeIndex])
+                }
             }
         }
         let missingFiles = zip(segments, segmentURLs)
@@ -180,10 +225,15 @@ public final class RecordingRecoveryService: @unchecked Sendable {
             endedAt: endedAt,
             durationSecondsOverride: duration,
             recoveredAt: now,
-            recoveryNote: "Recovered \(segmentURLs.count) segment\(segmentURLs.count == 1 ? "" : "s") from an interrupted recording session.",
+            recoveryNote: "Recovered \(segmentURLs.count) segment\(segmentURLs.count == 1 ? "" : "s") from an interrupted recording session." + (degradedCapture ? " One or more source tracks were missing or unreadable; only readable audio was recovered." : ""),
             segmentCount: segmentURLs.count,
             recordingID: manifest.finalRecordingID ?? manifest.id
         )
+        var retainedDamagedFiles: [String] = []
+        for segmentURL in segmentURLs {
+            retainedDamagedFiles += await DurableCaptureFiles.removeReadableRawFiles(for: segmentURL, source: manifest.source)
+        }
+        try archiveLegacyInputs(manifest, excluding: recording.audioURL)
 
         if segmentURLs.count > 1 {
             for url in segmentURLs {
@@ -196,7 +246,8 @@ public final class RecordingRecoveryService: @unchecked Sendable {
             recording: recording,
             message: "Recovered \(recording.displayName).",
             recoveredFiles: [recording.audioURL.lastPathComponent],
-            failedFiles: []
+            failedFiles: retainedDamagedFiles,
+            warnings: degradedCapture ? ["One or more source tracks were missing or unreadable; recovery is partial."] : []
         )
     }
 
@@ -240,8 +291,6 @@ public final class RecordingRecoveryService: @unchecked Sendable {
         if let microphoneInfo, let systemInfo, let microphoneURL = candidate.microphoneURL, let systemURL = candidate.systemURL {
             let outputURL = folderURL.appendingPathComponent(".recovered-\(candidate.sessionID).m4a")
             try await AudioTrackMixer.mixToSingleM4A(inputs: [systemURL, microphoneURL], outputURL: outputURL)
-            try? fileManager.removeItem(at: microphoneURL)
-            try? fileManager.removeItem(at: systemURL)
             let startedAt = min(microphoneInfo.startedAt, systemInfo.startedAt)
             let duration = max(microphoneInfo.duration, systemInfo.duration)
             let recording = try RecordingLibrary(folderURL: folderURL, fileManager: fileManager).finishRecording(
@@ -255,6 +304,8 @@ public final class RecordingRecoveryService: @unchecked Sendable {
                 recoveryNote: "Recovered mic and system audio from an interrupted recording.",
                 segmentCount: 1
             )
+            try? fileManager.removeItem(at: microphoneURL)
+            try? fileManager.removeItem(at: systemURL)
             return RecordingRecoveryResult(
                 status: .recoveredMixed,
                 recording: recording,
@@ -396,12 +447,40 @@ public final class RecordingRecoveryService: @unchecked Sendable {
 
     private func moveManifestSessionToFailed(_ manifest: RecordingSessionManifest, extraFailedFiles: [String]) throws {
         let store = RecordingSessionManifestStore(folderURL: folderURL, fileManager: fileManager)
-        let existingURLs = ([store.url(for: manifest.id)] + manifest.allSegments.map { folderURL.appendingPathComponent($0.fileName) })
+        let segments = manifest.allSegments.map { folderURL.appendingPathComponent($0.fileName) }
+        let raw = segments.flatMap { DurableCaptureFiles.rawURLs(for: $0, source: manifest.source) }
+        let existingURLs = ([store.url(for: manifest.id)] + segments + raw)
             .filter { fileManager.fileExists(atPath: $0.path) }
         for url in existingURLs {
             try moveToFailedFolder(url)
         }
         _ = extraFailedFiles
+    }
+
+    /// Checkpoint leftovers are retained outside the orphan scanner, so a second
+    /// launch cannot publish the same already-saved legacy capture a second time.
+    private func archiveLegacyInputs(_ manifest: RecordingSessionManifest, excluding published: URL) throws {
+        let names = Set(manifest.allSegments.map(\.fileName) +
+            [manifest.microphoneFileName, manifest.systemFileName].compactMap { $0 })
+        let archive = folderURL.appendingPathComponent("recovery-archive", isDirectory: true)
+            .appendingPathComponent(manifest.id.uuidString, isDirectory: true)
+        for name in names {
+            let input = try StoragePath.containedURL(in: folderURL, fileName: name)
+            guard StoragePath.isContained(input, in: folderURL) else {
+                throw StorageIntegrityError.pathEscapesLibrary(name)
+            }
+            let publishedBase = published.deletingPathExtension().lastPathComponent
+            // CAF cleanup handles readable tracks; damaged CAF stays available.
+            guard input.pathExtension != "caf", input != published,
+                  !input.lastPathComponent.hasPrefix(publishedBase + "."),
+                  fileManager.fileExists(atPath: input.path) else { continue }
+            try fileManager.createDirectory(at: archive, withIntermediateDirectories: true)
+            var destination = archive.appendingPathComponent(input.lastPathComponent)
+            if fileManager.fileExists(atPath: destination.path) {
+                destination = archive.appendingPathComponent(UUID().uuidString + "-" + input.lastPathComponent)
+            }
+            try fileManager.moveItem(at: input, to: destination)
+        }
     }
 
     private func moveToFailedFolder(_ url: URL) throws {

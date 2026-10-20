@@ -45,6 +45,7 @@ let package = Package(
             dependencies: [
                 "MSRCore",
                 "MSRServices",
+                "MSRMeetingRecorder",
                 .product(name: "Testing", package: "swift-testing")
             ]
         )

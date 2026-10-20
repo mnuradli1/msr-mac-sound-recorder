@@ -94,6 +94,7 @@ final class AppViewModel: ObservableObject {
     private let recorder: AudioRecording
     private let aiService: ProviderAIService
     private let libraryFactory: (URL) -> any RecordingLibraryServing
+    private let recordingsFolderOverride: URL?
     private var localServer: LocalHTTPServer?
     private var recordingSessionClock: RecordingSessionClock?
     private var temporaryAudioURL: URL?
@@ -104,7 +105,11 @@ final class AppViewModel: ObservableObject {
     private var audioPlayer: AVAudioPlayer?
     private var playbackTimer: Timer?
     private var recordingTimer: Timer?
-    private var recordingActionInFlight = false
+    private let recordingActions = RecordingActionCoordinator()
+    private var recordingActionInFlight: Bool { recordingActions.actionInFlight }
+    var sleepSafetyPending: Bool { recordingActions.sleepPending }
+    private var systemSleepCoordinator: SystemSleepCoordinator?
+    private var powerEventTask: Task<Void, Never>?
     private var transcriptionQueueTask: Task<Void, Never>?
     private var microphonePeakDuringRecording: Float = 0
     private var systemPeakDuringRecording: Float = 0
@@ -126,17 +131,19 @@ final class AppViewModel: ObservableObject {
 
     init(
         recorder: AudioRecording = MeetingAudioRecorder(),
-        libraryFactory: @escaping (URL) -> any RecordingLibraryServing = { RecordingLibrary(folderURL: $0) }
+        libraryFactory: @escaping (URL) -> any RecordingLibraryServing = { RecordingLibrary(folderURL: $0) },
+        recordingsFolderOverride: URL? = nil
     ) {
         let loadedSettings = settingsStore.load()
         settings = loadedSettings
         presentation = PresentationCoordinator(settings: loadedSettings)
         self.recorder = recorder
         self.libraryFactory = libraryFactory
+        self.recordingsFolderOverride = recordingsFolderOverride
         aiService = ProviderAIService(keyStore: keyStore)
         selectedSource = settings.preferredSource
         self.recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
-        if let bookmark = settings.recordingsFolderBookmark {
+        if recordingsFolderOverride == nil, let bookmark = settings.recordingsFolderBookmark {
             var stale = false
             if let url = try? URL(
                 resolvingBookmarkData: bookmark,
@@ -163,6 +170,22 @@ final class AppViewModel: ObservableObject {
             }
         }
         bindPresentationModels()
+    }
+
+    private func installCaptureFailureHandler(sessionID: UUID, segmentFileName: String) {
+        recorder.onCaptureFailure = { [weak self] message in
+            Task { @MainActor in
+                guard let self else { return }
+                await self.recordingActions.waitUntilIdle()
+                guard self.currentSessionManifest?.id == sessionID,
+                      self.currentSessionManifest?.activeSegment?.fileName == segmentFileName else { return }
+                await self.stopRecording()
+                self.recoveryMessage = self.workflowState == .saved
+                    ? "Audio capture failed: \(message). Saved audio may be incomplete; review the recording."
+                    : "Audio capture failed: \(message). Captured PCM was preserved for recovery."
+                self.recoveryNoticeSeverity = .error
+            }
+        }
     }
 
     private func bindPresentationModels() {
@@ -412,6 +435,7 @@ final class AppViewModel: ObservableObject {
     }
 
     var recordingsFolderURL: URL {
+        if let recordingsFolderOverride { return recordingsFolderOverride }
         if let securityScopedFolderURL { return securityScopedFolderURL }
         if let path = settings.recordingsFolderPath, !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
@@ -742,11 +766,15 @@ final class AppViewModel: ObservableObject {
             let results = try await RecordingRecoveryService(folderURL: recordingsFolderURL).recoverInterruptedRecordings()
             loadRecordings()
             let recovered = results.compactMap(\.recording)
+            let failedCount = results.filter { if case .failed = $0.status { return true }; return false }.count
+            let hasWarnings = results.contains { !$0.warnings.isEmpty || !$0.failedFiles.isEmpty }
             if let firstRecovered = recovered.first {
                 selectedRecording = recordings.first(where: { $0.id == firstRecovered.id }) ?? firstRecovered
                 loadSelectedSidecars()
                 recoveryMessage = "\(recovered.count) interrupted recording\(recovered.count == 1 ? "" : "s") recovered."
-                recoveryNoticeSeverity = .success
+                if failedCount > 0 { recoveryMessage += " \(failedCount) could not be recovered; original files were preserved." }
+                else if hasWarnings { recoveryMessage += " Some source audio was missing or unreadable; recovery is partial." }
+                recoveryNoticeSeverity = failedCount > 0 || hasWarnings ? .warning : .success
                 statusMessage = recoveryMessage
                 workflowState = .saved
             } else if results.contains(where: {
@@ -774,10 +802,22 @@ final class AppViewModel: ObservableObject {
     }
 
     func suspendForSystemSleep() async {
-        await performRecordingAction {
-            guard self.isRecording else { return }
-            await self.pauseCurrentRecording(reason: .systemSleep)
+        await recordingActions.prepareForSleep {
+            guard self.recordingSessionClock != nil else { return }
+            // A failed resume can contain a new partial active segment alongside
+            // older paused segments. Preserve the whole manifest for recovery,
+            // rather than publishing only older segments and deleting its index.
+            if case .failed = self.workflowState { return }
+            await self.runNonCancellableFinalization()
         }
+    }
+
+    func resumeAfterSystemWake() async {
+        recordingActions.didWake()
+        await recordingActions.waitForSleepCompletion()
+        await recordingActions.waitUntilIdle()
+        guard !recordingActions.sleepPending else { return }
+        await recoverInterruptedRecordings()
     }
 
     private func startNewRecordingSession() async {
@@ -797,7 +837,7 @@ final class AppViewModel: ObservableObject {
             let startedAt = Date()
             let temporaryURL = try makeTemporaryAudioURL(source: source)
             let requestedName = defaultMeetingName(for: startedAt)
-            let manifest = RecordingSessionManifest(
+            var manifest = RecordingSessionManifest(
                 state: .starting,
                 finalRecordingID: UUID(),
                 source: source,
@@ -809,9 +849,12 @@ final class AppViewModel: ObservableObject {
                     startedAt: startedAt
                 )
             )
+            manifest.microphoneFileName = source == .system ? nil : DurableCaptureFiles.rawURL(for: temporaryURL, channel: .microphone).lastPathComponent
+            manifest.systemFileName = source == .microphone ? nil : DurableCaptureFiles.rawURL(for: temporaryURL, channel: .system).lastPathComponent
             try manifestStore().save(manifest)
             currentSessionManifest = manifest
             temporaryAudioURL = temporaryURL
+            installCaptureFailureHandler(sessionID: manifest.id, segmentFileName: temporaryURL.lastPathComponent)
             try await recorder.start(source: source, outputURL: temporaryURL)
             var capturingManifest = manifest
             capturingManifest.state = .capturing
@@ -871,8 +914,12 @@ final class AppViewModel: ObservableObject {
                 startedAt: resumedAt,
                 updatedAt: resumedAt
             )
+            manifest.microphoneFileName = source == .system ? nil : DurableCaptureFiles.rawURL(for: temporaryURL, channel: .microphone).lastPathComponent
+            manifest.systemFileName = source == .microphone ? nil : DurableCaptureFiles.rawURL(for: temporaryURL, channel: .system).lastPathComponent
             try manifestStore().save(manifest)
+            currentSessionManifest = manifest
             temporaryAudioURL = temporaryURL
+            installCaptureFailureHandler(sessionID: manifest.id, segmentFileName: temporaryURL.lastPathComponent)
             try await recorder.start(source: source, outputURL: temporaryURL)
             manifest.state = .capturing
             manifest.microphoneFileName = recorder.captureArtifacts?.microphoneFileName
@@ -1030,6 +1077,7 @@ final class AppViewModel: ObservableObject {
                 confidenceReport: confidenceReport,
                 recordingID: currentSessionManifest?.finalRecordingID
             )
+            for segment in segmentURLs { DurableCaptureFiles.removeRawFiles(for: segment, source: source) }
             if segmentURLs.count > 1 {
                 for url in segmentURLs {
                     try? FileManager.default.removeItem(at: url)
@@ -1052,6 +1100,9 @@ final class AppViewModel: ObservableObject {
             workflowState = .saved
             statusMessage = segmentURLs.count > 1 ? "Recording saved from \(segmentURLs.count) segments" : "Recording saved"
         } catch {
+            // A failed checkpoint (for example disk full) must not leave capture
+            // running while we acknowledge sleep or report finalization failure.
+            if recorder.isRecording { try? await recorder.stop() }
             endSleepPrevention()
             if var manifest = currentSessionManifest {
                 manifest.state = .failed
@@ -1552,6 +1603,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshSetupHealth() {
+        // Isolated lifecycle tests must never prompt for the user's Keychain.
+        guard recordingsFolderOverride == nil else { return }
         let microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         let microphoneItem: SetupHealthItem
         switch microphoneStatus {
@@ -1857,10 +1910,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func performRecordingAction(_ operation: () async -> Void) async {
-        guard !recordingActionInFlight else { return }
-        recordingActionInFlight = true
-        defer { recordingActionInFlight = false }
-        await operation()
+        await recordingActions.perform(operation)
     }
 
     private func makeTemporaryAudioURL(source: AudioSource) throws -> URL {
@@ -2160,25 +2210,37 @@ final class AppViewModel: ObservableObject {
 
     private func installPowerObservers() {
         guard powerObserverTokens.isEmpty else { return }
-        let center = NSWorkspace.shared.notificationCenter
-        let willSleep = center.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                await self?.suspendForSystemSleep()
+        let coordinator = SystemSleepCoordinator(onSleep: { [weak self] acknowledgement in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { acknowledgement.complete(); return }
+                    let previous = self.powerEventTask
+                    self.powerEventTask = Task { @MainActor in
+                        await previous?.value
+                        await self.suspendForSystemSleep()
+                        acknowledgement.complete()
+                    }
+                }
             }
-        }
-        let didWake = center.addObserver(
-            forName: NSWorkspace.didWakeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                await self?.recoverInterruptedRecordings()
+        }, onWake: { [weak self] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let previous = self.powerEventTask
+                    self.powerEventTask = Task { @MainActor in
+                        await previous?.value
+                        await self.resumeAfterSystemWake()
+                    }
+                }
             }
-        }
+        }, onRegistrationFailure: { [weak self] in
+            Task { @MainActor in
+                self?.recoveryMessage = "Sleep protection could not register. Stop and save before closing the lid; PCM recovery remains available."
+                self?.recoveryNoticeSeverity = .warning
+            }
+        })
+        systemSleepCoordinator = coordinator
+        coordinator.start()
         let willTerminate = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -2189,7 +2251,7 @@ final class AppViewModel: ObservableObject {
                 self?.flushSummaryEdits()
             }
         }
-        powerObserverTokens = [willSleep, didWake, willTerminate]
+        powerObserverTokens = [willTerminate]
     }
 
     private func beginSleepPrevention() {
