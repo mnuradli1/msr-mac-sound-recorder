@@ -668,6 +668,11 @@ final class UIWalkthrough {
         try check(await ax.press(autoTranscribe), "second AXPress failed")
         try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoTranscribe == false },
                   "autoTranscribe still true after the second press")
+        // Leave it ON through the control itself: step 7 relies on this toggle, not on
+        // a programmatic assignment, to make the next recording transcribe automatically.
+        try check(await ax.press(autoTranscribe), "third AXPress failed")
+        try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoTranscribe == true },
+                  "autoTranscribe still false after the third press")
 
         let autoTitle = try require(await ax.find(AXDriver.Query(identifier: "msr.settings.autoTitle"), window: title),
                                     "auto-title toggle not found")
@@ -681,14 +686,16 @@ final class UIWalkthrough {
 
         settings.performClose(nil)
         try check(await ax.waitUntil(timeout: 2) { !settings.isVisible }, "settings window did not close")
-        return "gear → '\(title)'; Transcription & AI; auto-transcribe (\(autoTranscribe.role)) false→true→false; auto-title \(titleBefore)→\(!titleBefore)→\(titleBefore); closed"
+        return "gear → '\(title)'; Transcription & AI; auto-transcribe (\(autoTranscribe.role)) false→true→false→true (left on via the toggle); auto-title \(titleBefore)→\(!titleBefore)→\(titleBefore); closed"
     }
 
     private func recordViaButton() async throws -> String {
         try check(viewModel.credentialAvailable(for: viewModel.settings.provider),
                   "no API key for \(viewModel.settings.provider.displayName)")
-        viewModel.settings.autoTranscribe = true
-        viewModel.settings.autoTitle = true
+        // Both switches must already be on from step 6's presses on the Settings
+        // controls; this step never sets them programmatically.
+        try check(viewModel.settings.autoTranscribe, "autoTranscribe is off: step 6 should have left the toggle on")
+        try check(viewModel.settings.autoTitle, "autoTitle is off: step 6 should have left it at its default (on)")
         let existing = Set(viewModel.recordings.map(\.id))
         let recordQuery = AXDriver.Query(identifier: "msr.recordingBar.record")
 
