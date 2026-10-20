@@ -42,6 +42,7 @@ struct RecordingBar: View {
         .disabled(viewModel.sourcePickerDisabled)
         .help("Audio source")
         .accessibilityLabel("Audio source")
+        .accessibilityIdentifier("msr.recordingBar.source")
     }
 
     private func meters(showStatus: Bool) -> some View {
@@ -73,6 +74,7 @@ struct RecordingBar: View {
                 .lineLimit(1)
                 .fixedSize()
                 .accessibilityLabel(Text("Recording timer \(formatClock(viewModel.recordingElapsed))"))
+                .accessibilityIdentifier("msr.recordingBar.timer")
         }
     }
 
@@ -88,6 +90,7 @@ struct RecordingBar: View {
                 .controlSize(.large)
                 .disabled(!viewModel.canUseSecondaryRecordingAction)
                 .help(LocalizedStringKey(secondaryTitle))
+                .accessibilityIdentifier("msr.recordingBar.secondary")
             }
 
             Button {
@@ -100,6 +103,7 @@ struct RecordingBar: View {
             .buttonStyle(RecordButtonStyle())
             .disabled(!viewModel.canToggleRecording)
             .help(LocalizedStringKey(viewModel.recordingButtonTitle))
+            .accessibilityIdentifier("msr.recordingBar.record")
 
             Button {
                 viewModel.openSettingsWindow()
@@ -113,6 +117,7 @@ struct RecordingBar: View {
             .foregroundStyle(Theme.textSecondary)
             .help("Settings")
             .accessibilityLabel("Settings")
+            .accessibilityIdentifier("msr.recordingBar.settings")
         }
     }
 
