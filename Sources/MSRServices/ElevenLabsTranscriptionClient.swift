@@ -1,25 +1,77 @@
 import Foundation
 import MSRCore
 
-public final class ElevenLabsTranscriptionClient {
+public final class ElevenLabsTranscriptionClient: Sendable {
+    /// Retry behaviour for transient upload failures (rate limits, provider outages, dropped connections).
+    public struct RetryPolicy: Sendable, Equatable {
+        /// Total attempts including the first request. Values below 1 are treated as 1.
+        public var maxAttempts: Int
+        /// Base delay before each retry; the last entry is reused when more retries remain.
+        public var backoff: [Duration]
+        /// Random spread applied to each backoff delay (0.25 means ±25 %). Not applied to `Retry-After`.
+        public var jitterFraction: Double
+        /// Upper bound for a provider-supplied `Retry-After` delay.
+        public var maximumRetryAfter: Duration
+
+        public init(
+            maxAttempts: Int = 3,
+            backoff: [Duration] = [.seconds(2), .seconds(6)],
+            jitterFraction: Double = 0.25,
+            maximumRetryAfter: Duration = .seconds(30)
+        ) {
+            self.maxAttempts = maxAttempts
+            self.backoff = backoff
+            self.jitterFraction = jitterFraction
+            self.maximumRetryAfter = maximumRetryAfter
+        }
+
+        public static let `default` = RetryPolicy()
+        public static let none = RetryPolicy(maxAttempts: 1)
+    }
+
+    static let retryableStatusCodes: Set<Int> = [429, 500, 502, 503, 504]
+    static let retryableURLErrorCodes: Set<URLError.Code> = [
+        .timedOut, .networkConnectionLost, .notConnectedToInternet,
+        .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed
+    ]
+
     private static let transcriptionTimeout: TimeInterval = 15 * 60
     private static let maximumResponseBytes = 64 * 1_024 * 1_024
 
     private let endpoint: URL
     private let urlSession: URLSession
+    private let retryPolicy: RetryPolicy
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private let now: @Sendable () -> Date
 
     public init(
         endpoint: URL = URL(string: "https://api.elevenlabs.io/v1/speech-to-text")!,
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        retryPolicy: RetryPolicy = .default,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.endpoint = endpoint
         self.urlSession = urlSession
+        self.retryPolicy = retryPolicy
+        self.sleep = sleep
+        self.now = now
     }
 
-    public func transcribe(audioURL: URL, apiKey: String) async throws -> TranscribeResponse {
+    /// Uploads `audioURL` to ElevenLabs Scribe.
+    ///
+    /// HTTP 429/500/502/503/504 and dropped-connection `URLError`s are retried per `retryPolicy`
+    /// (honoring `Retry-After`); every other failure, and any cancellation, is thrown immediately.
+    /// - Parameter languageCode: Optional ISO-639 hint sent as the `language_code` field. Blank or
+    ///   malformed values are ignored so the provider keeps auto-detecting the language.
+    public func transcribe(audioURL: URL, apiKey: String, languageCode: String? = nil) async throws -> TranscribeResponse {
         let media = MultipartFileBody.neutralMediaDescriptor(for: audioURL)
+        var fields: [(name: String, value: String)] = [("model_id", "scribe_v2"), ("diarize", "true")]
+        if let languageCode = Self.sanitizedLanguageCode(languageCode) {
+            fields.append(("language_code", languageCode))
+        }
         let multipart = try MultipartFileBody.create(
-            fields: [("model_id", "scribe_v2"), ("diarize", "true")],
+            fields: fields,
             fileFieldName: "file",
             neutralFileName: media.fileName,
             mimeType: media.mimeType,
@@ -33,26 +85,94 @@ public final class ElevenLabsTranscriptionClient {
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
         request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
 
-        let (data, response) = try await urlSession.upload(for: request, fromFile: multipart.url)
-        guard data.count <= Self.maximumResponseBytes else { throw ProviderError.responseTooLarge }
-        try Self.validate(response: response, data: data)
-        let decoded = try JSONDecoder().decode(ElevenLabsTranscriptionResponse.self, from: data)
-        return TranscribeResponse(
-            text: decoded.diarizedText ?? decoded.text,
-            provider: .elevenLabs,
-            languageCode: decoded.languageCode,
-            segments: decoded.segments
-        )
+        let maxAttempts = max(1, retryPolicy.maxAttempts)
+        var attempt = 1
+        while true {
+            try Task.checkCancellation()
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await urlSession.upload(for: request, fromFile: multipart.url)
+            } catch {
+                guard attempt < maxAttempts, !Task.isCancelled, Self.isRetryable(error) else { throw error }
+                try await sleep(backoffDelay(afterAttempt: attempt))
+                attempt += 1
+                continue
+            }
+            guard data.count <= Self.maximumResponseBytes else { throw ProviderError.responseTooLarge }
+            guard let http = response as? HTTPURLResponse else { throw ProviderError.invalidResponse }
+            guard (200..<300).contains(http.statusCode) else {
+                let message = String((String(data: data, encoding: .utf8) ?? "No response body").prefix(500))
+                let rejection = ProviderError.providerRejected(http.statusCode, message)
+                guard attempt < maxAttempts,
+                      !Task.isCancelled,
+                      Self.retryableStatusCodes.contains(http.statusCode) else { throw rejection }
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap {
+                    Self.retryAfterDelay(from: $0, now: now(), maximum: retryPolicy.maximumRetryAfter)
+                }
+                try await sleep(retryAfter ?? backoffDelay(afterAttempt: attempt))
+                attempt += 1
+                continue
+            }
+            let decoded = try JSONDecoder().decode(ElevenLabsTranscriptionResponse.self, from: data)
+            return TranscribeResponse(
+                text: decoded.diarizedText ?? decoded.text,
+                provider: .elevenLabs,
+                languageCode: decoded.languageCode,
+                segments: decoded.segments
+            )
+        }
     }
 
-    private static func validate(response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw ProviderError.invalidResponse
+    static func isRetryable(_ error: Error) -> Bool {
+        guard !(error is CancellationError), let urlError = error as? URLError else { return false }
+        return retryableURLErrorCodes.contains(urlError.code)
+    }
+
+    private func backoffDelay(afterAttempt attempt: Int) -> Duration {
+        guard !retryPolicy.backoff.isEmpty else { return .zero }
+        let base = retryPolicy.backoff[min(max(0, attempt - 1), retryPolicy.backoff.count - 1)]
+        let spread = min(1, max(0, retryPolicy.jitterFraction))
+        guard spread > 0 else { return base }
+        return base * (1 + Double.random(in: -spread...spread))
+    }
+
+    /// Parses a `Retry-After` value (delta-seconds or HTTP-date) into a delay clamped to `0...maximum`.
+    static func retryAfterDelay(from value: String, now: Date, maximum: Duration) -> Duration? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        let seconds: Double
+        if let delta = Double(trimmed), delta.isFinite {
+            seconds = delta
+        } else if let date = httpDate(from: trimmed) {
+            seconds = date.timeIntervalSince(now)
+        } else {
+            return nil
         }
-        guard (200..<300).contains(http.statusCode) else {
-            let message = String((String(data: data, encoding: .utf8) ?? "No response body").prefix(500))
-            throw ProviderError.providerRejected(http.statusCode, message)
+        let bounded = min(max(0, seconds), 86_400)
+        return min(Duration.milliseconds(Int64((bounded * 1_000).rounded())), maximum)
+    }
+
+    private static func httpDate(from value: String) -> Date? {
+        // RFC 9110 §5.6.7: IMF-fixdate, obsolete RFC 850, and asctime.
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        let collapsed = value.replacingOccurrences(of: "  ", with: " ")
+        for format in ["EEE, dd MMM yyyy HH:mm:ss zzz", "EEEE, dd-MMM-yy HH:mm:ss zzz", "EEE MMM d HH:mm:ss yyyy"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: collapsed) {
+                return date
+            }
         }
+        return nil
+    }
+
+    static func sanitizedLanguageCode(_ code: String?) -> String? {
+        guard let trimmed = code?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty, trimmed.count <= 16,
+              trimmed.unicodeScalars.allSatisfy({ ($0.isASCII && CharacterSet.alphanumerics.contains($0)) || $0 == "-" || $0 == "_" })
+        else { return nil }
+        return trimmed
     }
 }
 
@@ -127,7 +247,13 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
                 return newLabel
             }()
             let trimmedText = word.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedText.isEmpty else { continue }
+            guard !trimmedText.isEmpty else {
+                // Keep explicit spacing tokens inside a turn so quote/punctuation spacing matches the diarized text.
+                if let lastIndex = turns.indices.last, turns[lastIndex].speaker == label {
+                    appendToken(word.text, to: &turns[lastIndex].text)
+                }
+                continue
+            }
 
             if let lastIndex = turns.indices.last, turns[lastIndex].speaker == label {
                 appendToken(word.text, to: &turns[lastIndex].text)
@@ -153,6 +279,10 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
 
     private static func appendToken(_ token: String, to text: inout String) {
         guard !token.isEmpty else { return }
+        // Collapse runs of spacing tokens so explicit spaces never double up.
+        if token.allSatisfy(\.isWhitespace), text.last?.isWhitespace == true {
+            return
+        }
         if text.isEmpty {
             text += token
             return
@@ -174,18 +304,44 @@ private struct ElevenLabsTranscriptionResponse: Decodable {
         if isClosingPunctuation(firstTokenCharacter) {
             return false
         }
+        // A straight quote directly after a word closes that word: `"hello` + `"` -> `"hello"`.
+        if isStraightQuote(firstTokenCharacter), isWordCharacter(lastExistingCharacter) {
+            return false
+        }
+        if isStraightQuote(lastExistingCharacter) {
+            // An existing straight quote is opening at the start or after whitespace/opening punctuation,
+            // and closing after a word or closing punctuation (`"hello"` + `world` -> `"hello" world`).
+            return isClosingStraightQuote(at: existingText.index(before: existingText.endIndex), in: existingText)
+        }
         if isOpeningPunctuation(lastExistingCharacter) {
             return false
         }
         return true
     }
 
+    private static func isClosingStraightQuote(at index: String.Index, in text: String) -> Bool {
+        guard index > text.startIndex else { return false }
+        let previous = text[text.index(before: index)]
+        if previous.isWhitespace || isOpeningPunctuation(previous) {
+            return false
+        }
+        return isWordCharacter(previous) || isClosingPunctuation(previous)
+    }
+
+    private static func isWordCharacter(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber
+    }
+
+    private static func isStraightQuote(_ character: Character) -> Bool {
+        character == "\"" || character == "'"
+    }
+
     private static func isClosingPunctuation(_ character: Character) -> Bool {
-        [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…"].contains(character)
+        [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…", "”", "’"].contains(character)
     }
 
     private static func isOpeningPunctuation(_ character: Character) -> Bool {
-        ["(", "[", "{", "“", "\"", "'"].contains(character)
+        ["(", "[", "{", "“", "‘", "\"", "'"].contains(character)
     }
 }
 
