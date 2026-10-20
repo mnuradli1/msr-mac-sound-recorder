@@ -50,6 +50,7 @@ struct SettingsView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .fixedSize()
+            .accessibilityIdentifier("msr.settings.tabs")
             .padding(.top, 14)
             .padding(.bottom, 2)
 
@@ -173,8 +174,11 @@ private struct TranscriptionSettingsTab: View {
                     }
                 }
                 Toggle("Compress large/uncompressed uploads", isOn: $viewModel.settings.compressUploads)
+                    .accessibilityIdentifier("msr.settings.compressUploads")
                 Toggle("Auto-title recordings from the transcript", isOn: $viewModel.settings.autoTitle)
+                    .accessibilityIdentifier("msr.settings.autoTitle")
                 Toggle("Auto-transcribe new recordings", isOn: $viewModel.settings.autoTranscribe)
+                    .accessibilityIdentifier("msr.settings.autoTranscribe")
             } header: {
                 Text("Transcription")
             } footer: {

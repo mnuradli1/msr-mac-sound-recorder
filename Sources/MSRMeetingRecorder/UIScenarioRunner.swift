@@ -6,7 +6,9 @@ import MSRServices
 /// environment variables. Call `runIfRequested(viewModel:)` after `bootstrap()`
 /// and before `UISnapshotCapture.runIfRequested()`.
 ///
-/// - `MSR_UI_SCENARIO`: the scenario to run. Supported: `auto-transcribe`.
+/// - `MSR_UI_SCENARIO`: the scenario to run. Supported: `auto-transcribe`,
+///   `ui-walkthrough` and `ui-walkthrough-empty` (accessibility-driven UI
+///   walkthrough, see `UIWalkthrough`).
 /// - `MSR_UI_SCENARIO_SECONDS`: how long to record (default 3).
 /// - `MSR_UI_SCENARIO_TIMEOUT`: how long to wait for the transcription job (default 180).
 ///
@@ -24,6 +26,10 @@ enum UIScenarioRunner {
         switch scenario {
         case "auto-transcribe":
             await runAutoTranscribe(viewModel: viewModel, environment: environment)
+        case "ui-walkthrough":
+            await UIWalkthrough.run(viewModel: viewModel)
+        case "ui-walkthrough-empty":
+            await UIWalkthrough.runEmpty(viewModel: viewModel)
         default:
             emit(["ok": false, "reason": "unknown scenario \(scenario)"])
             exit(2)

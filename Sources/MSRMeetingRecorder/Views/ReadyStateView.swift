@@ -16,6 +16,7 @@ struct ReadyStateView: View {
                 Text("Ready to record")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(Theme.textPrimary)
+                    .accessibilityIdentifier("msr.ready.title")
                 Text("Pick a source above and press Record (⌘⇧R). Recordings save automatically.")
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.textSecondary)
@@ -83,6 +84,7 @@ struct ReadinessChecklist: View {
                         viewModel.fixSetupItem(item)
                     }
                     .controlSize(.small)
+                    .accessibilityIdentifier("msr.ready.fix.\(item.id)")
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -106,6 +108,7 @@ struct StatusBar: View {
                 .truncationMode(.tail)
                 .foregroundStyle(Theme.textSecondary)
                 .accessibilityLabel(Text(viewModel.statusMessage))
+                .accessibilityIdentifier("msr.statusBar.message")
 
             Spacer(minLength: 8)
 

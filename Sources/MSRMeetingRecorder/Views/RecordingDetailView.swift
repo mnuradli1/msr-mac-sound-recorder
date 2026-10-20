@@ -73,11 +73,14 @@ struct RecordingDetailView: View {
                     .onSubmit(commitTitleEdit)
                     .onExitCommand(perform: cancelTitleEdit)
                     .frame(maxWidth: 520)
+                    .accessibilityIdentifier("msr.detail.titleField")
                 Button("Save", action: commitTitleEdit)
                     .controlSize(.small)
                     .disabled(viewModel.renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("msr.detail.titleSave")
                 Button("Cancel", action: cancelTitleEdit)
                     .controlSize(.small)
+                    .accessibilityIdentifier("msr.detail.titleCancel")
             }
         } else {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -90,6 +93,7 @@ struct RecordingDetailView: View {
                     .onTapGesture(count: 2, perform: beginTitleEdit)
                     .accessibilityAddTraits(.isHeader)
                     .help("Double-click to rename")
+                    .accessibilityIdentifier("msr.detail.title")
 
                 TitleBadge(recording: recording)
 
@@ -102,6 +106,7 @@ struct RecordingDetailView: View {
                 .disabled(!viewModel.canRenameSelection)
                 .help("Rename")
                 .accessibilityLabel("Rename")
+                .accessibilityIdentifier("msr.detail.rename")
             }
         }
     }
@@ -147,6 +152,7 @@ struct RecordingDetailView: View {
             .labelsHidden()
             .fixedSize()
             .help("Review ⌘1 · Notes ⌘2 · Export ⌘3")
+            .accessibilityIdentifier("msr.detail.tabs")
 
             Spacer()
         }
@@ -163,13 +169,16 @@ struct TitleBadge: View {
             if recording.isRecovered {
                 StatusChip(title: "Recovered", tone: .warning, systemImage: "lifepreserver", compact: true)
                     .help(Text(recording.metadata.recoveryNote ?? ""))
+                    .accessibilityIdentifier("msr.detail.chip.recovered")
             }
             if recording.isImported {
                 StatusChip(title: "Imported", tone: .neutral, systemImage: "square.and.arrow.down", compact: true)
+                    .accessibilityIdentifier("msr.detail.chip.imported")
             }
             if recording.effectiveTitleSource == .generated {
                 StatusChip(title: "Auto-titled", tone: .info, systemImage: "wand.and.stars", compact: true)
                     .help("This title was generated from the transcript. Rename the recording to keep your own title.")
+                    .accessibilityIdentifier("msr.detail.chip.autoTitled")
             }
         }
     }
@@ -204,6 +213,7 @@ struct NextStepActions: View {
             .controlSize(.large)
             .disabled(!viewModel.canRunPrimaryAction)
             .help(LocalizedStringKey(viewModel.primaryActionTitle))
+            .accessibilityIdentifier("msr.detail.primaryAction")
 
             Menu {
                 overflowItems
@@ -216,6 +226,7 @@ struct NextStepActions: View {
             .controlSize(.large)
             .fixedSize()
             .help("More actions")
+            .accessibilityIdentifier("msr.detail.moreActions")
         }
     }
 

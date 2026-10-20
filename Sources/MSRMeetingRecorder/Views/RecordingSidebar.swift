@@ -105,12 +105,15 @@ struct RecordingSidebar: View {
             .frame(width: 26, height: 24)
             .help("Sort recordings")
             .accessibilityLabel("Sort recordings")
+            .accessibilityIdentifier("msr.sidebar.sort")
             .onChange(of: viewModel.settings.sortOrder) { _, _ in viewModel.saveSettings() }
 
             iconButton("plus", label: "Import audio") { viewModel.importRecording() }
                 .disabled(!viewModel.canMutateRecordingLibrary)
+                .accessibilityIdentifier("msr.sidebar.import")
             iconButton("arrow.clockwise", label: "Refresh history") { viewModel.loadRecordings() }
                 .disabled(!viewModel.canSelectHistory)
+                .accessibilityIdentifier("msr.sidebar.refresh")
         }
         .foregroundStyle(Theme.textSecondary)
     }
@@ -138,6 +141,7 @@ struct RecordingSidebar: View {
                     .font(.system(size: 12.5))
                     .focused(searchFocused)
                     .disabled(!viewModel.canSelectHistory)
+                    .accessibilityIdentifier("msr.sidebar.search")
                     .onChange(of: viewModel.recordingSearchQuery) { _, _ in viewModel.scheduleRecordingSearch() }
                     .onExitCommand {
                         viewModel.clearRecordingSearch()
@@ -155,6 +159,7 @@ struct RecordingSidebar: View {
                     .foregroundStyle(Theme.textTertiary)
                     .help("Clear search")
                     .accessibilityLabel("Clear search")
+                    .accessibilityIdentifier("msr.sidebar.searchClear")
                 }
             }
             .padding(.horizontal, 8)
@@ -170,6 +175,7 @@ struct RecordingSidebar: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Theme.textSecondary)
                     .padding(.horizontal, 2)
+                    .accessibilityIdentifier("msr.sidebar.searchResultCount")
             }
         }
     }
@@ -205,6 +211,7 @@ struct RecordingSidebar: View {
                                 jobChip: viewModel.jobChip(for: recording)
                             )
                             .tag(recording.id)
+                            .accessibilityIdentifier("msr.sidebar.row.\(recording.id.uuidString)")
                             .contextMenu { contextMenu(for: recording) }
                         }
                     } header: {
@@ -214,6 +221,7 @@ struct RecordingSidebar: View {
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
+            .accessibilityIdentifier("msr.sidebar.list")
             .disabled(!viewModel.canSelectHistory)
             .opacity(viewModel.canSelectHistory ? 1 : 0.6)
         }

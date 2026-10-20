@@ -137,8 +137,9 @@ struct MSRMeetingRecorderApp: App {
 
                 Button("Delete Recording…") {
                     // ⌘⌫ means "delete to line start" while editing text; keep
-                    // that behavior instead of deleting the recording.
-                    if let textView = NSApp.keyWindow?.firstResponder as? NSTextView, textView.isEditable {
+                    // that behavior for the keystroke instead of deleting the
+                    // recording. Choosing the item from the menu bar always asks.
+                    if let textView = DeleteRecordingCommand.textViewToEdit(for: NSApp.currentEvent) {
                         textView.deleteToBeginningOfLine(nil)
                         return
                     }
@@ -188,5 +189,21 @@ struct MSRMeetingRecorderApp: App {
         case .english: Locale(identifier: "en")
         case .indonesian: Locale(identifier: "id")
         }
+    }
+}
+
+/// Routing for Recording → Delete Recording… (⌘⌫).
+enum DeleteRecordingCommand {
+    /// The editable text view that should get "delete to line start" instead
+    /// of the recording being deleted: only when the command came from a
+    /// keystroke typed into a text view. A menu-bar click (a mouse event, or
+    /// no key event) always asks to delete the recording, even while a text
+    /// field such as the search field still has focus.
+    @MainActor
+    static func textViewToEdit(for event: NSEvent?) -> NSTextView? {
+        guard let event, event.type == .keyDown else { return nil }
+        let window = event.window ?? NSApp.keyWindow
+        guard let textView = window?.firstResponder as? NSTextView, textView.isEditable else { return nil }
+        return textView
     }
 }

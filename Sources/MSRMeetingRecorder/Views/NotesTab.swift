@@ -62,6 +62,7 @@ struct TranscriptPanel: View {
                     .controlSize(.small)
                     .fixedSize()
                     .help("Read the speaker-labelled transcript, or edit its text")
+                    .accessibilityIdentifier("msr.notes.transcriptMode")
                 }
                 Spacer(minLength: 8)
                 saveStatus
@@ -107,6 +108,7 @@ struct TranscriptPanel: View {
                 .controlSize(.small)
                 .disabled(viewModel.transcriptSaveMessage != "Unsaved changes")
                 .help("Save transcript edits (⌘S)")
+                .accessibilityIdentifier("msr.notes.transcriptSave")
         }
     }
 
@@ -141,6 +143,7 @@ struct TranscriptPanel: View {
                 .disabled(viewModel.selectedRecordingIsTranscribing)
                 .onChange(of: viewModel.transcriptText) { _, _ in viewModel.scheduleTranscriptAutosave() }
                 .accessibilityLabel("Transcript")
+                .accessibilityIdentifier("msr.notes.transcriptEditor")
         }
     }
 
@@ -261,6 +264,7 @@ struct SummaryPanel: View {
                     .padding(8)
                     .onChange(of: viewModel.summaryText) { _, _ in viewModel.scheduleSummaryAutosave() }
                     .accessibilityLabel("Summary")
+                    .accessibilityIdentifier("msr.notes.summaryEditor")
 
                 if !viewModel.hasSummary {
                     VStack(alignment: .leading, spacing: 4) {
