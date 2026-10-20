@@ -151,6 +151,14 @@ public enum TranscriptionAudioPreparer {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     session.install(continuation)
+                    // `onCancel` can run before this closure when the task is already
+                    // cancelled; asking a cancelled writer input for media data throws
+                    // an NSException, so stop here instead.
+                    guard !session.isFinished, session.writer.status == .writing else {
+                        session.cancelReaderAndWriter()
+                        session.finish(throwing: CancellationError())
+                        return
+                    }
                     let queue = DispatchQueue(label: "app.msr.audio-compression")
                     session.input.requestMediaDataWhenReady(on: queue) {
                         while session.input.isReadyForMoreMediaData, !session.isFinished {
