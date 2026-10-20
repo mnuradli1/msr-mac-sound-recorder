@@ -1,6 +1,6 @@
 # MSR Mac Meeting Recorder
 
-MSR 1.0B is a native macOS meeting-recording workbench built with SwiftUI. It records microphone audio, all Mac system audio, or both; saves automatically on sleep; and turns recordings into editable, searchable, exportable meeting notes with ElevenLabs or OpenAI.
+MSR 1.1A is a native macOS meeting-recording workbench built with SwiftUI. It records microphone audio, all Mac system audio, or both; saves automatically on sleep; and turns recordings into editable, searchable, exportable meeting notes with ElevenLabs or OpenAI.
 
 The 1.0B sleep-safety update retains PCM audio until the final M4A is published.
 See [automatic save on sleep](docs/SLEEP_SAFETY.md) for behavior, verification,
@@ -46,7 +46,7 @@ chmod +x scripts/package_app.sh
 open dist/MSR\ Meeting\ Recorder.app
 ```
 
-The script creates `dist/MSR-Meeting-Recorder-1.0B-app.zip`, `dist/MSR-Meeting-Recorder-1.0B.dmg`, SHA-256 checksums, provenance metadata, and a generated Homebrew cask. Set `APPLE_SIGNING_IDENTITY` and `APPLE_NOTARY_PROFILE` for Developer ID signing and notarization; otherwise it produces a hardened ad-hoc build.
+The script creates `dist/MSR-Meeting-Recorder-1.1A-app.zip`, `dist/MSR-Meeting-Recorder-1.1A.dmg`, SHA-256 checksums, provenance metadata, and a generated Homebrew cask. Set `APPLE_SIGNING_IDENTITY` and `APPLE_NOTARY_PROFILE` for Developer ID signing and notarization; otherwise it produces a hardened ad-hoc build.
 
 ## API Keys
 
