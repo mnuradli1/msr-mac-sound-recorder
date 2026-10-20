@@ -41,11 +41,25 @@ public final class ProviderAIService: AIService, @unchecked Sendable {
         return try await openAI.summarize(transcript: transcript, apiKey: apiKey)
     }
 
+    /// Titles are always generated with OpenAI, whatever provider transcribed
+    /// the audio. Throws `ProviderError.missingAPIKey` without an OpenAI key;
+    /// check `canGenerateTitlesRemotely` first and fall back to
+    /// `MeetingTitleGenerator.localTitle(from:segments:)` when it is `false`.
     public func generateTitle(transcript: String) async throws -> String {
         guard let apiKey = keyStore.apiKey(for: .openAI) else {
             throw ProviderError.missingAPIKey("OPENAI_API_KEY")
         }
         return try await openAI.generateTitle(transcript: transcript, apiKey: apiKey)
+    }
+
+    /// Whether an API key for `provider` is available (session, Keychain or environment).
+    public func hasCredential(for provider: AIProvider) -> Bool {
+        keyStore.apiKey(for: provider) != nil
+    }
+
+    /// Whether `generateTitle(transcript:)` can reach OpenAI (an OpenAI key is available).
+    public var canGenerateTitlesRemotely: Bool {
+        hasCredential(for: .openAI)
     }
 }
 

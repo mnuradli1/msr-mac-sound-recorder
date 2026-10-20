@@ -4,6 +4,10 @@ import MSRCore
 public protocol AIService: AnyObject, Sendable {
     func transcribe(audioURL: URL, provider: AIProvider) async throws -> TranscribeResponse
     func summarize(transcript: String) async throws -> SummarizeResponse
+    /// A short, descriptive title for the transcript, already cleaned with
+    /// `MeetingTitleGenerator.cleaned(_:fallback:)`. Throws when no title could
+    /// be produced (for example a missing credential or an empty reply).
+    func generateTitle(transcript: String) async throws -> String
 }
 
 public enum LocalAPIError: Error, LocalizedError {

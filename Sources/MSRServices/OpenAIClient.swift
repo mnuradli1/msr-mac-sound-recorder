@@ -60,13 +60,22 @@ public final class OpenAIClient {
         return SummarizeResponse(markdown: try await summaryText(for: combined, apiKey: apiKey))
     }
 
+    static let titlePrompt = "You name meeting recordings. Write a specific, descriptive title of at most 8 words in the same language as the transcript. No quotes, no trailing period, no prefix like 'Title:'. Return only the title."
+
+    /// Asks OpenAI for a title from the first 12,000 characters of `transcript`
+    /// and cleans the reply with `MeetingTitleGenerator.cleaned(_:fallback:)`.
+    ///
+    /// - Throws: `ProviderError.invalidResponse` when the cleaned reply is empty.
     public func generateTitle(transcript: String, apiKey: String) async throws -> String {
         let value = try await responseText(
-            prompt: "Create a descriptive meeting title of at most eight words. Return only the title.\n\n\(String(transcript.prefix(12_000)))",
+            prompt: "\(Self.titlePrompt)\n\nTranscript:\n\(String(transcript.prefix(12_000)))",
             apiKey: apiKey,
-            timeout: 60
+            timeout: 60,
+            maximumOutputTokens: 32
         )
-        return value.split(whereSeparator: \.isWhitespace).prefix(8).joined(separator: " ")
+        let title = MeetingTitleGenerator.cleaned(value, fallback: "")
+        guard !title.isEmpty else { throw ProviderError.invalidResponse }
+        return title
     }
 
     private func summaryText(for transcript: String, apiKey: String) async throws -> String {
@@ -83,7 +92,12 @@ public final class OpenAIClient {
         """, apiKey: apiKey)
     }
 
-    private func responseText(prompt: String, apiKey: String, timeout: TimeInterval = textTimeout) async throws -> String {
+    private func responseText(
+        prompt: String,
+        apiKey: String,
+        timeout: TimeInterval = textTimeout,
+        maximumOutputTokens: Int? = nil
+    ) async throws -> String {
         var request = URLRequest(url: responsesEndpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
@@ -91,7 +105,9 @@ public final class OpenAIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(OpenAIResponsesRequest(
             model: ProcessInfo.processInfo.environment["OPENAI_SUMMARY_MODEL"] ?? "gpt-4.1-mini",
-            input: prompt
+            input: prompt,
+            store: false,
+            maxOutputTokens: maximumOutputTokens
         ))
 
         let (data, response) = try await urlSession.data(for: request)
@@ -141,6 +157,15 @@ private struct OpenAITranscriptionResponse: Decodable {
 private struct OpenAIResponsesRequest: Encodable {
     let model: String
     let input: String
+    /// `false` so OpenAI does not retain transcripts or summaries.
+    let store: Bool
+    /// Omitted from the JSON when `nil`.
+    let maxOutputTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case model, input, store
+        case maxOutputTokens = "max_output_tokens"
+    }
 }
 
 private struct OpenAIResponsesResponse: Decodable {
@@ -148,13 +173,15 @@ private struct OpenAIResponsesResponse: Decodable {
 
     var outputText: String? {
         output
-            .flatMap(\.content)
+            .compactMap(\.content)
+            .flatMap { $0 }
             .compactMap(\.text)
             .joined(separator: "\n")
     }
 
     struct OutputItem: Decodable {
-        let content: [Content]
+        /// `nil` for items without content, such as `reasoning` items.
+        let content: [Content]?
     }
 
     struct Content: Decodable {

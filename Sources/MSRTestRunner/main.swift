@@ -10,6 +10,8 @@ struct MSRTestRunner {
             try testCreatesMetadataAndReloads()
             try testRecordingLibraryIgnoresNonMetadataJSONSidecars()
             try testRenamesSidecarsTogether()
+            try testAutoTitleOnlyReplacesDefaultTitles()
+            try testMeetingTitleGeneratorAndAutoTranscribePolicy()
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
@@ -80,6 +82,66 @@ private func testCreatesMetadataAndReloads() throws {
     try expect(reloaded.map(\.displayName) == ["Weekly Sync"], "history should reload from metadata")
     try expect(reloaded.first?.durationSeconds == 60, "duration should be persisted")
     try expect(reloaded.first?.source == .micAndSystem, "source should be persisted")
+}
+
+private func testAutoTitleOnlyReplacesDefaultTitles() throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let audioURL = folder.url.appendingPathComponent("capture.m4a")
+    FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8))
+    let recording = try library.finishRecording(
+        temporaryAudioURL: audioURL,
+        requestedName: "Meeting 2026-06-29 14.05",
+        source: .micAndSystem,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 160)
+    )
+    try expect(recording.effectiveTitleSource == .default, "finished captures should carry a default title")
+
+    // The user renames while transcription runs; auto-title holds a stale snapshot.
+    let userRenamed = try library.rename(recording, to: "Client Demo")
+    try expect(userRenamed.metadata.titleSource == .user, "manual rename should record a user title")
+    let refused = try library.renameIfTitleIsDefault(recording, to: "Generated Title")
+    try expect(refused == nil, "auto-title must not replace a user title")
+    let reloaded = try library.loadRecordings()
+    try expect(reloaded.first?.displayName == "Client Demo", "user title should survive auto-title")
+
+    let second = folder.url.appendingPathComponent("second.m4a")
+    FileManager.default.createFile(atPath: second.path, contents: Data("audio".utf8))
+    let untouched = try library.finishRecording(
+        temporaryAudioURL: second,
+        requestedName: "Meeting 2026-06-30 09.00",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 200),
+        endedAt: Date(timeIntervalSince1970: 260)
+    )
+    let migrated = try library.migrateIfNeeded(untouched)
+    try expect(migrated.displayName == untouched.displayName, "migrateIfNeeded should not rename")
+    let titled = try library.renameIfTitleIsDefault(untouched, to: "\"Launch Readiness Review.\"")
+    try expect(titled?.metadata.titleSource == .generated, "auto-title should record a generated title")
+    try expect(titled?.displayName == "Launch Readiness Review", "auto-title should sanitize the generated name: \(String(describing: titled?.displayName))")
+}
+
+private func testMeetingTitleGeneratorAndAutoTranscribePolicy() throws {
+    try expect(MeetingTitleGenerator.isDefaultName("Meeting 2026-06-29 14.05 2"), "suffixed default names should be recognised")
+    try expect(!MeetingTitleGenerator.isDefaultName("Meeting with Bob"), "user names should not be treated as default")
+    try expect(
+        MeetingTitleGenerator.cleaned("**Title:** \"Roadmap Sync.\"", fallback: "Fallback") == "Roadmap Sync",
+        "cleaned should strip markdown, prefixes, quotes and trailing periods"
+    )
+    let transcript = "Speaker 1:\nHalo, oke.\n\nSpeaker 2:\nHari ini kita membahas rencana peluncuran aplikasi mobile."
+    let title = MeetingTitleGenerator.localTitle(from: transcript, segments: TranscriptParser.segments(from: transcript))
+    try expect(title == "Rencana peluncuran aplikasi mobile", "local title should skip filler and lead-ins: \(String(describing: title))")
+    try expect(MeetingTitleGenerator.localTitle(from: "[music] Okay. Um, yeah.") == nil, "filler-only transcripts should have no local title")
+
+    let silent = RecordingConfidenceReport(
+        checkedAt: Date(), durationSeconds: 0, peakLevel: 0, averageLevel: 0,
+        issues: [RecordingConfidenceIssue(kind: .emptyAudio, severity: .error, message: "empty")]
+    )
+    let healthy = RecordingConfidenceReport(checkedAt: Date(), durationSeconds: 120, peakLevel: 0.6, averageLevel: 0.2, issues: [])
+    try expect(!RecordingInteractionPolicy.shouldAutoTranscribe(report: silent), "empty audio should not be auto-transcribed")
+    try expect(RecordingInteractionPolicy.shouldAutoTranscribe(report: healthy), "healthy audio should be auto-transcribed")
+    try expect(RecordingInteractionPolicy.shouldAutoTranscribe(report: nil), "missing reports should not block auto-transcribe")
 }
 
 private func testRecordingLibraryIgnoresNonMetadataJSONSidecars() throws {
@@ -1227,6 +1289,10 @@ private final class FakeAIService: AIService, @unchecked Sendable {
             - Confirm launch checklist.
             """
         )
+    }
+
+    func generateTitle(transcript: String) async throws -> String {
+        "Fake Generated Title"
     }
 }
 
