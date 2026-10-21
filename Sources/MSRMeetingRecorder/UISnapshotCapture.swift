@@ -77,10 +77,13 @@ enum UISnapshotCapture {
         if environment["ELEVENLABS_API_KEY"]?.isEmpty != false {
             viewModel.elevenLabsKeyDraft = "snapshot-placeholder-key"
         }
-        if environment["OPENAI_API_KEY"]?.isEmpty != false {
+        // The text-model providers fall back to whichever key exists, so a
+        // placeholder for one must never shadow a real key for the other
+        // (it would be selected and then rejected with a 401).
+        let hasOpenAIKey = environment["OPENAI_API_KEY"]?.isEmpty == false
+        let hasDeepSeekKey = environment["DEEPSEEK_API_KEY"]?.isEmpty == false
+        if !hasOpenAIKey, !hasDeepSeekKey {
             viewModel.openAIKeyDraft = "snapshot-placeholder-key"
-        }
-        if environment["DEEPSEEK_API_KEY"]?.isEmpty != false {
             viewModel.deepSeekKeyDraft = "snapshot-placeholder-key"
         }
         viewModel.saveAPIKeys()
