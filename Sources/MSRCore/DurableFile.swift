@@ -36,12 +36,39 @@ public enum StoragePath {
     }
 }
 
+/// Serializes the library's file operations within the process.
+///
+/// `DurableFile.write` swaps the primary file for its backup in two steps, and
+/// `readRecoveringBackup` restores the backup when the primary is missing, so a
+/// read racing a write could "recover" stale data over the new file. Library
+/// work also runs off the main thread (the app's loader, the transcript
+/// publisher), so every durable write and recovering read, and every
+/// `RecordingLibrary` / `TranscriptionJobStore` operation (journal replay
+/// included), holds this lock. It is recursive: operations nest.
+public enum LibraryIO {
+    private static let lock = NSRecursiveLock()
+
+    public static func serialized<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    /// `serialized` for a whole function body: `LibraryIO.begin(); defer { LibraryIO.end() }`.
+    public static func begin() { lock.lock() }
+    public static func end() { lock.unlock() }
+}
+
 public enum DurableFile {
     public static func backupURL(for url: URL) -> URL {
         URL(fileURLWithPath: url.path + ".bak")
     }
 
     public static func write(_ data: Data, to url: URL, fileManager: FileManager = .default) throws {
+        try LibraryIO.serialized { try unserializedWrite(data, to: url, fileManager: fileManager) }
+    }
+
+    private static func unserializedWrite(_ data: Data, to url: URL, fileManager: FileManager) throws {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let temporary = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
@@ -81,6 +108,18 @@ public enum DurableFile {
         decoder: JSONDecoder,
         validate: (T) -> Bool = { _ in true },
         fileManager: FileManager = .default
+    ) -> T? {
+        LibraryIO.serialized {
+            unserializedReadRecoveringBackup(type, from: url, decoder: decoder, validate: validate, fileManager: fileManager)
+        }
+    }
+
+    private static func unserializedReadRecoveringBackup<T: Decodable>(
+        _ type: T.Type,
+        from url: URL,
+        decoder: JSONDecoder,
+        validate: (T) -> Bool,
+        fileManager: FileManager
     ) -> T? {
         if let value = tryDecode(type, at: url, decoder: decoder), validate(value) {
             return value

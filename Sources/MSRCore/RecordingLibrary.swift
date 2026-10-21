@@ -63,6 +63,10 @@ public protocol RecordingLibraryServing: Sendable {
     /// transcript (used when a new transcript replaces the old one).
     @discardableResult
     func resetSpeakerNames(for recording: RecordingItem) throws -> RecordingItem
+    /// Reverts every renamed speaker to its original label in the transcript,
+    /// segments and metadata. See `RecordingLibrary.resetAllSpeakerNames(for:)`.
+    @discardableResult
+    func resetAllSpeakerNames(for recording: RecordingItem) throws -> RecordingItem
     func delete(_ recording: RecordingItem) throws
 }
 
@@ -76,6 +80,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     }
 
     public func loadRecordings() throws -> [RecordingItem] {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         try ensureFolderExists()
         try resumePendingOperations()
         let urls = try fileManager.contentsOfDirectory(
@@ -126,6 +131,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         confidenceReport: RecordingConfidenceReport? = nil,
         recordingID: UUID? = nil
     ) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         try ensureFolderExists()
         guard fileManager.fileExists(atPath: temporaryAudioURL.path) else {
             throw RecordingLibraryError.audioMissing(temporaryAudioURL.lastPathComponent)
@@ -198,6 +204,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         importedAt: Date = Date(),
         confidenceReport: RecordingConfidenceReport? = nil
     ) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         try ensureFolderExists()
         guard fileManager.fileExists(atPath: sourceURL.path) else {
             throw RecordingLibraryError.audioMissing(sourceURL.lastPathComponent)
@@ -246,7 +253,8 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     /// Renames on behalf of the user; equivalent to `rename(_:to:source: .user)`.
     @discardableResult
     public func rename(_ recording: RecordingItem, to requestedName: String) throws -> RecordingItem {
-        try rename(recording, to: requestedName, source: .user)
+        LibraryIO.begin(); defer { LibraryIO.end() }
+        return try rename(recording, to: requestedName, source: .user)
     }
 
     /// Renames `recording` and records who chose the title.
@@ -268,6 +276,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         to requestedName: String,
         source: RecordingTitleSource
     ) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let (current, recordings) = try onDiskRecording(for: recording)
         return try applyRename(try ensureImmutableStorage(current), to: requestedName, source: source, among: recordings)
     }
@@ -286,6 +295,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     ///   no longer in the library.
     @discardableResult
     public func renameIfTitleIsDefault(_ recording: RecordingItem, to newName: String) throws -> RecordingItem? {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let sanitized = MeetingTitleGenerator.cleaned(newName, fallback: "")
         guard !sanitized.isEmpty, !MeetingTitleGenerator.isDefaultName(sanitized) else { return nil }
         let (current, recordings) = try onDiskRecording(for: recording)
@@ -298,11 +308,13 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     /// to its own name just to obtain stable file URLs.
     @discardableResult
     public func migrateIfNeeded(_ recording: RecordingItem) throws -> RecordingItem {
-        try ensureImmutableStorage(recording)
+        LibraryIO.begin(); defer { LibraryIO.end() }
+        return try ensureImmutableStorage(recording)
     }
 
     @discardableResult
     public func writeTranscript(_ transcript: String, for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         try DurableFile.write(Data(transcript.utf8), to: item.transcriptURL, fileManager: fileManager)
         return item
@@ -310,6 +322,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
     @discardableResult
     public func writeTranscriptSegments(_ segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         try DurableFile.write(segments, to: item.transcriptSegmentsURL, encoder: Self.makeEncoder(), fileManager: fileManager)
         return item
@@ -317,6 +330,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
     @discardableResult
     public func writeTranscriptBundle(_ transcript: String, segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         try DurableFile.write(Data(transcript.utf8), to: item.transcriptURL, fileManager: fileManager)
         do {
@@ -329,7 +343,8 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     }
 
     public func loadTranscriptSegments(for recording: RecordingItem) -> [TranscriptSegment] {
-        DurableFile.readRecoveringBackup(
+        LibraryIO.begin(); defer { LibraryIO.end() }
+        return DurableFile.readRecoveringBackup(
             [TranscriptSegment].self,
             from: recording.transcriptSegmentsURL,
             decoder: Self.makeDecoder(),
@@ -339,6 +354,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
     @discardableResult
     public func writeSummary(_ summary: String, for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         try DurableFile.write(Data(summary.utf8), to: item.summaryURL, fileManager: fileManager)
         return item
@@ -346,6 +362,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
     @discardableResult
     public func clearSummary(for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         for url in [item.summaryURL, DurableFile.backupURL(for: item.summaryURL)] where fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
@@ -379,8 +396,36 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     ///   `.recordingNotFound` when the recording was deleted.
     @discardableResult
     public func renameSpeaker(_ recording: RecordingItem, label: String, to name: String) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let (onDisk, _) = try onDiskRecording(for: recording)
-        let current = try ensureImmutableStorage(onDisk)
+        return try renameSpeaker(inStored: try ensureImmutableStorage(onDisk), label: label, to: name)
+    }
+
+    /// Reverts every renamed speaker of `recording` to its original label
+    /// (transcript, segments and metadata), then drops the mapping: the same as
+    /// `renameSpeaker(_:label:to: "")` for each original label in sorted order
+    /// followed by `resetSpeakerNames(for:)`, but reading the library once
+    /// instead of once per speaker.
+    @discardableResult
+    public func resetAllSpeakerNames(for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
+        let (onDisk, _) = try onDiskRecording(for: recording)
+        var current = try ensureImmutableStorage(onDisk)
+        for original in current.speakerNames.keys.sorted() {
+            current = try renameSpeaker(inStored: current, label: original, to: "")
+        }
+        guard current.metadata.speakerNames != nil else { return current }
+        var metadata = current.metadata
+        metadata.speakerNames = nil
+        metadata.updatedAt = Date()
+        let updated = RecordingItem(metadata: metadata, folderURL: folderURL)
+        try write(metadata: metadata, to: updated.metadataURL)
+        return updated
+    }
+
+    /// `renameSpeaker(_:label:to:)` on `current`, the recording as just read
+    /// from disk (in immutable storage).
+    private func renameSpeaker(inStored current: RecordingItem, label: String, to name: String) throws -> RecordingItem {
         var names = current.speakerNames
         let transcriptExists = fileManager.fileExists(atPath: current.transcriptURL.path)
         let transcript = transcriptExists ? ((try? String(contentsOf: current.transcriptURL, encoding: .utf8)) ?? "") : ""
@@ -456,6 +501,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
     @discardableResult
     public func resetSpeakerNames(for recording: RecordingItem) throws -> RecordingItem {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let (onDisk, _) = try onDiskRecording(for: recording)
         let current = try ensureImmutableStorage(onDisk)
         guard current.metadata.speakerNames != nil else { return current }
@@ -468,6 +514,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     }
 
     public func delete(_ recording: RecordingItem) throws {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         let item = try ensureImmutableStorage(recording)
         let files = ownedURLs(for: item).flatMap { [$0.lastPathComponent, DurableFile.backupURL(for: $0).lastPathComponent] }
         let operation = DeleteJournal(recordingID: item.id, fileNames: files)

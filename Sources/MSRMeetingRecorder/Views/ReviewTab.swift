@@ -5,6 +5,9 @@ import MSRCore
 /// trim range shaded, and the trim group.
 struct ReviewTab: View {
     @ObservedObject var viewModel: AppViewModel
+    /// Position, duration, play state, waveform and trim range: the only
+    /// state here that changes several times a second.
+    @ObservedObject var playback: PlaybackState
 
     private let speeds: [Double] = [0.75, 1.0, 1.25, 1.5, 2.0]
 
@@ -17,12 +20,12 @@ struct ReviewTab: View {
                         .padding(.vertical, 10)
                     HairlineDivider()
                     ReviewWaveformView(
-                        samples: viewModel.reviewWaveform,
-                        position: fraction(viewModel.playbackPosition),
-                        trimStart: fraction(viewModel.trimStartSeconds),
-                        trimEnd: viewModel.playbackDuration > 0 ? fraction(viewModel.trimEndSeconds) : 1
+                        samples: playback.reviewWaveform,
+                        position: fraction(playback.playbackPosition),
+                        trimStart: fraction(playback.trimStartSeconds),
+                        trimEnd: playback.playbackDuration > 0 ? fraction(playback.trimEndSeconds) : 1
                     ) { value in
-                        viewModel.seekPlayback(to: value * viewModel.playbackDuration)
+                        viewModel.seekPlayback(to: value * playback.playbackDuration)
                     }
                     .padding(12)
                 }
@@ -36,8 +39,8 @@ struct ReviewTab: View {
     }
 
     private func fraction(_ seconds: TimeInterval) -> Double {
-        guard viewModel.playbackDuration > 0 else { return 0 }
-        return min(1, max(0, seconds / viewModel.playbackDuration))
+        guard playback.playbackDuration > 0 else { return 0 }
+        return min(1, max(0, seconds / playback.playbackDuration))
     }
 
     private var playbackStrip: some View {
@@ -45,7 +48,7 @@ struct ReviewTab: View {
             Button {
                 viewModel.togglePlayback()
             } label: {
-                Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 14, weight: .semibold))
                     .frame(width: 32, height: 32)
                     .foregroundStyle(Color.white)
@@ -55,18 +58,18 @@ struct ReviewTab: View {
             .buttonStyle(.plain)
             .disabled(!viewModel.canPlaySelectedRecording)
             .opacity(viewModel.canPlaySelectedRecording ? 1 : 0.4)
-            .help(LocalizedStringKey(viewModel.isPlaying ? "Pause (⌥Space)" : "Play (⌥Space)"))
-            .accessibilityLabel(LocalizedStringKey(viewModel.isPlaying ? "Pause" : "Play"))
+            .help(LocalizedStringKey(playback.isPlaying ? "Pause (⌥Space)" : "Play (⌥Space)"))
+            .accessibilityLabel(LocalizedStringKey(playback.isPlaying ? "Pause" : "Play"))
 
             skipButton(seconds: -15, symbol: "gobackward.15", label: "Back 15 seconds")
             skipButton(seconds: 15, symbol: "goforward.15", label: "Forward 15 seconds")
 
-            Text(verbatim: "\(formatClock(viewModel.playbackPosition)) / \(formatClock(viewModel.playbackDuration))")
+            Text(verbatim: "\(formatClock(playback.playbackPosition)) / \(formatClock(playback.playbackDuration))")
                 .font(.system(size: 12.5, weight: .medium).monospacedDigit())
                 .foregroundStyle(Theme.textSecondary)
                 .padding(.leading, 4)
                 .accessibilityLabel("Playback position")
-                .accessibilityValue(Text(verbatim: "\(formatClock(viewModel.playbackPosition)) / \(formatClock(viewModel.playbackDuration))"))
+                .accessibilityValue(Text(verbatim: "\(formatClock(playback.playbackPosition)) / \(formatClock(playback.playbackDuration))"))
 
             Spacer()
 
@@ -121,7 +124,7 @@ struct ReviewTab: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
                 Spacer()
-                Text(verbatim: "\(formatClock(viewModel.trimStartSeconds)) – \(formatClock(viewModel.trimEndSeconds))")
+                Text(verbatim: "\(formatClock(playback.trimStartSeconds)) – \(formatClock(playback.trimEndSeconds))")
                     .font(.system(size: 12.5, weight: .medium).monospacedDigit())
                     .foregroundStyle(Theme.textSecondary)
             }
@@ -131,7 +134,7 @@ struct ReviewTab: View {
                     Text("Start")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.textSecondary)
-                    Slider(value: $viewModel.trimStartSeconds, in: 0...max(0.1, viewModel.trimEndSeconds - 0.1))
+                    Slider(value: $playback.trimStartSeconds, in: 0...max(0.1, playback.trimEndSeconds - 0.1))
                         .controlSize(.small)
                         .accessibilityLabel("Trim start")
                 }
@@ -140,8 +143,8 @@ struct ReviewTab: View {
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.textSecondary)
                     Slider(
-                        value: $viewModel.trimEndSeconds,
-                        in: min(viewModel.trimStartSeconds + 0.1, max(0.1, viewModel.playbackDuration))...max(0.1, viewModel.playbackDuration)
+                        value: $playback.trimEndSeconds,
+                        in: min(playback.trimStartSeconds + 0.1, max(0.1, playback.playbackDuration))...max(0.1, playback.playbackDuration)
                     )
                     .controlSize(.small)
                     .accessibilityLabel("Trim end")
@@ -151,7 +154,7 @@ struct ReviewTab: View {
             HStack(spacing: 8) {
                 Button("Reset") { viewModel.resetTrim() }
                 Button("Preview range") {
-                    viewModel.seekPlayback(to: viewModel.trimStartSeconds)
+                    viewModel.seekPlayback(to: playback.trimStartSeconds)
                     viewModel.togglePlayback()
                 }
                 .disabled(!viewModel.canPlaySelectedRecording)
