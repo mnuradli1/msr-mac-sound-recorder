@@ -111,7 +111,7 @@ struct RecordingSidebar: View {
             iconButton("plus", label: "Import audio") { viewModel.importRecording() }
                 .disabled(!viewModel.canMutateRecordingLibrary)
                 .accessibilityIdentifier("msr.sidebar.import")
-            iconButton("arrow.clockwise", label: "Refresh history") { viewModel.loadRecordings() }
+            iconButton("arrow.clockwise", label: "Refresh history") { Task { await viewModel.refreshLibrary() } }
                 .disabled(!viewModel.canSelectHistory)
                 .accessibilityIdentifier("msr.sidebar.refresh")
         }

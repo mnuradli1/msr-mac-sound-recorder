@@ -28,7 +28,7 @@ struct ContentView: View {
             renameSheet
         }
         .overlay(alignment: .bottomTrailing) {
-            miniRecordingIndicator
+            MiniRecordingIndicator(viewModel: viewModel, live: viewModel.live)
                 .padding(.trailing, 16)
                 .padding(.bottom, Theme.statusBarHeight + 12)
         }
@@ -166,25 +166,6 @@ struct ContentView: View {
         .background(Theme.windowBackground)
     }
 
-    @ViewBuilder
-    private var miniRecordingIndicator: some View {
-        if let text = viewModel.miniRecordingIndicatorText {
-            HStack(spacing: 6) {
-                Image(systemName: viewModel.isRecording ? "record.circle.fill" : "pause.circle.fill")
-                    .font(.system(size: 12, weight: .bold))
-                Text(text)
-                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                    .lineLimit(1)
-            }
-            .foregroundStyle(Color.white)
-            .padding(.horizontal, 12)
-            .frame(height: 30)
-            .background(viewModel.isRecording ? Theme.recording : Theme.warning, in: Capsule())
-            .shadow(color: Color.black.opacity(0.18), radius: 10, y: 4)
-            .accessibilityLabel(Text(text))
-        }
-    }
-
     private var renameSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Rename Recording")
@@ -206,6 +187,31 @@ struct ContentView: View {
             }
         }
         .padding(20)
+    }
+}
+
+/// Floating "Recording 00:12" capsule. Observes `RecordingLiveState` for the
+/// elapsed time, so the timer tick re-renders only this view.
+private struct MiniRecordingIndicator: View {
+    @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var live: RecordingLiveState
+
+    var body: some View {
+        if let text = viewModel.miniRecordingIndicatorText {
+            HStack(spacing: 6) {
+                Image(systemName: viewModel.isRecording ? "record.circle.fill" : "pause.circle.fill")
+                    .font(.system(size: 12, weight: .bold))
+                Text(text)
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(viewModel.isRecording ? Theme.recording : Theme.warning, in: Capsule())
+            .shadow(color: Color.black.opacity(0.18), radius: 10, y: 4)
+            .accessibilityLabel(Text(text))
+        }
     }
 }
 

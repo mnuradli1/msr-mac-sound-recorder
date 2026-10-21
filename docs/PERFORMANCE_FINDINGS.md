@@ -191,3 +191,92 @@ A dSYM (`dist/MSRMeetingRecorder.dSYM`, same UUID as the shipped binary) is writ
 - An in-memory library index, and library I/O plus the snapshot capture off the main thread (about 28 ms per load at N=1000).
 - Fewer full loads inside `TranscriptPublisher` and the speaker-reset loop (one load per speaker).
 - Multi-file import still reloads once per file.
+
+## Phase 2 results
+
+Measured 2026-10-21 with the same harness, libraries and fake recorder, `*_API_KEY` unset, both binaries a plain `swift build -c release`. The machine was busy with other apps during this session (load average 5 to 15), and one uninterleaved run came out 3 to 8 times slower for *both* binaries. So "before" is the Phase 1 binary (this branch's base, 64d2c53) re-measured **interleaved** with the Phase 2 binary, one run each in turn, at load average 5 to 7.5. Absolute times are a little higher than in "Phase 1 results"; the comparison is like for like.
+
+### App-level
+
+| N | Cold start to snapshot, median (s), before → after | CPU while recording (fake recorder, 10 s, 2 runs) | RSS at end of recording window | Peak / steady footprint | Idle CPU once settled | CPU-s to settle after launch |
+|---|---|---|---|---|---|---|
+| 50 | 0.68 → 0.64 | 38.2 / 38.2 % → **10.0 / 7.1 %** | 115 / 123 → 118 / 96 MB | 152 / 61 → 154 / 63 MB | 0.2 → 0.0 % | 0.71 → 0.58 |
+| 300 | 0.78 → 0.73 (8 runs each) | 47.0 / 45.9 % → **8.0 / 6.1 %** | 122 / 128 → 96 / 103 MB | 173 / 82 → 170 / 80 MB | 0.2 → 0.0 % | 0.77 → 0.73 |
+| 1000 | 1.18 → 1.03 | 53.1 / 50.5 % → **6.7 / 6.9 %** | 137 / 138 → 97 / 98 MB | 167 / 101 → 164 / 101 MB | 0.4 → 0.0 % | 1.08 → 1.04 |
+
+Recording CPU no longer depends on N and is under the 10 % target at N=1000. Cold start is unchanged or slightly better: the launch load now runs off the main actor, but the snapshot still waits for it. Peak and steady footprint are unchanged (the Phase 1 peak of about 200 MB at N=1000 measured on a quiet machine is in the same range; peaks vary from run to run). A 4 s `sample` at N=1000 while recording has **no** library frames on any thread: no `loadRecordings`, `LibraryFolderSnapshot`, `TranscriptionJobStore`, `recordingSections` or row code. About 3 % of main-thread samples are SwiftUI updating the meters.
+
+### Body evaluations per second while recording
+
+Counted with a temporary counter in each `body` (`MSR_RENDER_PROBE`, removed again), 5 s windows after the recording started:
+
+| View | Before (N = 50 / 1000) | After (N = 50 / 300 / 1000) |
+|---|---|---|
+| `ContentView` | 13.6 / 13.4 | 0 / 0 / 0 |
+| `RecordingSidebar` (recomputes `recordingSections`, diffs the list) | 13.6 / 13.4 | 0 / 0 / 0 |
+| `RecordingDetailView` | 13.6 / 13.4 | 0 / 0 / 0 |
+| `RecordingBar` | 13.6 / 13.4 | 0 / 0 / 0 |
+| `RecordingRow` (skipped by SwiftUI's equality check before too) | 0 / 0 | 0 / 0 / 0 |
+| `RecordingMeters` (new; the two source meters) | n/a | 24.8 / 24.2 / 24.2 |
+| `RecordingTimerText` (new) | n/a | 13.8 / 13.6 / 13.6 |
+
+With the split, the sidebar no longer re-renders on ticks, so no separate `LibraryState` observable was needed. The timer re-renders with the meters because both observe `RecordingLiveState` (one `Text`, negligible cost).
+
+### What changed
+
+1. **High-frequency state is out of `AppViewModel`** (LiveState.swift).
+   - `RecordingLiveState` holds `microphoneLevel`, `systemLevel` and `recordingElapsed`. It publishes only real changes.
+   - `PlaybackState` holds `isPlaying`, `playbackPosition`, `playbackDuration`, `reviewWaveform`, `trimStartSeconds` and `trimEndSeconds`. The playback timer writes only values that changed.
+   - Both are owned by the model (`let live`, `let playback`) and written by the existing timers and callbacks. The model keeps forwarding properties (trim read/write), so `transcribeSelectedRange`, `saveTrimmedCopy` and the scripts compile unchanged.
+   - Only these views observe them:
+     - `RecordingMeters` and `RecordingTimerText` in `RecordingBar`.
+     - `MiniRecordingIndicator` in `ContentView`.
+     - `ReviewTab` (strip, waveform, trim sliders bound to `$playback`).
+     - `PlayPauseCommand`, the Recording → Play/Pause menu item, which the scene would otherwise not refresh.
+   - `UISnapshotCapture`, `UIScenarioRunner` and `UIWalkthrough` read none of the moved properties.
+2. **Library I/O off the main actor.**
+   - `refreshLibrary()` runs `LibraryLoader.performLoad` (folder snapshot, `loadRecordings`, row facts, job `loadAll`) on the `LibraryLoader` actor and publishes on the main actor. A generation counter drops a result when a newer load (sync or async) started meanwhile. A superseded caller waits for the newer load to finish. The newest caller continues in the same main-actor turn as the publish, so no frame shows the new list with an old workflow state (the walkthrough checks this on stop). Jobs read by a load are dropped when a job was saved in memory meanwhile.
+   - Bootstrap, the folder watcher (dropped if a recording or busy state began meanwhile), recovery (its folder snapshot too), finalize, import, delete, publish, folder change and both Refresh buttons use it. `loadRecordings()` stays as the synchronous variant, for the scenario's final read and for tests.
+   - **Stop recording:** `finishRecording`, the raw/segment file removal and the reload run off the main actor while the bar shows "Saving". The workflow stays `.finalizing` until the reload has published, then the recording is selected and auto-transcribe queues; the order is unchanged. `AudioTrackMixer`, `RecordingConfidenceAnalyzer` and recovery were already off main (nonisolated async).
+   - **Rename** and **speaker rename/reset** keep the library call synchronous, so the result shows at once. The full reload after it is replaced by an in-memory patch: list, row facts, search document, selection, own-write snapshot entries, and a restarted index pass if one was running. A legacy recording that a rename moves to immutable storage still reloads, off main.
+   - **Delete** removes the item from memory at once. Deleting its job files and the reload run off main.
+   - **Import** copies each file off main and reloads once for the batch. The mutation policy is still checked per file.
+   - **Jobs:** each save puts the job into `transcriptionJobs`, read back from its own file so dates match the store's encoding, in `loadAll` order. This replaces about 5 `loadAll` folder listings per transcription. The queue re-reads jobs off main before picking the next one.
+   - **`TranscriptPublisher`:** every library step (migrate, transcript bundle write, clear/reset, re-reads, `renameIfTitleIsDefault`, the summary's check-then-write) runs off the main actor, in the same order. Two loads are gone: the re-read after `writeSummary`, and the re-read after `resetSpeakerNames` when replacing. A job now does 2 loads in `publish`, 2 in `summarize` and 1 refresh, all off main (before: about 6, mostly on main).
+   - **`RecordingLibrary.resetAllSpeakerNames(for:)`** reads the library once. Before, it read once per speaker plus once for the reset.
+   - **`LibraryIO`** (DurableFile.swift) is a process-wide recursive lock. Every `RecordingLibrary` and `TranscriptionJobStore` operation, `DurableFile.write` and `readRecoveringBackup` take it. `DurableFile.write` moves the primary to `.bak` before the new file lands. Without the lock, a load on another thread can find the primary missing, "recover" the stale backup over the new file, and quarantine it. A new test reproduces that: it fails 3 out of 3 with the lock disabled. The lock also keeps journal replay from running during an in-flight publish. A main-thread library call can now wait for a running background load: at most one load (about 175 ms at N=1000), no worse than when the load itself ran on main.
+3. **Tests:** 172 → 179 (`LiveStateAndLoaderTests`, plus a `resetAllSpeakerNames` case). They cover:
+   - ticks publish on `live` only;
+   - stop publishes before it returns;
+   - a stale async load is dropped;
+   - batched import;
+   - job upserts match `loadAll`;
+   - the durable read/write race.
+
+### Library loads per action, Phase 1 → Phase 2
+
+| Action | Phase 1 | Phase 2 |
+|---|---|---|
+| Launch | 1 VM load on main (2 when recovery changed the folder) | same, off main |
+| Stop recording | `finishRecording` (1 internal) + 1 VM load, on main | same, off main |
+| Rename / speaker rename | 1 internal + 1 VM load, on main | 1 internal on main, patched in memory |
+| Reset k speaker names | k + 1 internal + 1 VM load, on main | 1 internal on main, patched |
+| Import m files | m internal + m VM loads, on main | m internal + 1 VM load, off main |
+| Delete | job `loadAll` + 1 VM load, on main | off main |
+| One transcription (auto-title + auto-summary) | about 6 loads, mostly on main, plus about 5 job `loadAll`s | 5 loads, off main; job checkpoints read one file |
+| Folder watcher, external change | 1 VM load on main | 1, off main |
+
+### Still on the main thread
+
+These calls are rare, user-triggered and not tick-driven:
+- the `rename`/`renameSpeaker` library call (1 full load, about 175 ms at N=1000);
+- the journaled `delete` (no load);
+- transcript/summary autosave writes, and reads of the saved file to compare;
+- the selection's sidecar reads;
+- `TranscriptPublisher.recoverIfPublished` (crash recovery only).
+
+### Deferred
+
+- An in-memory library index inside `RecordingLibrary`, so `rename`, `renameSpeaker`, `onDisk` and `uniqueDisplayName` need not decode every metadata file (175 ms at N=1000). This would also make rename fully cheap on main.
+- The App scene still holds the model as `@StateObject`. Commands rebuild only on real model changes now (not on ticks), so this was left as is.
+- Phase 3 items are unchanged: search memory and folding, persisted waveform peaks, `swift-testing`/ZIPFoundation, deferring health checks.

@@ -96,6 +96,10 @@ public struct TranscriptSummaryOutcome: Sendable {
 ///    a summary the user already has (see `summarize`). The app passes no
 ///    summarizer and calls `summarize` itself afterwards, so the transcript is
 ///    shown (and the queue moves on) while the summary is generated.
+///
+/// The library's filesystem work (migration, writes, re-reads, renames) runs
+/// off the main actor, one step at a time and in the order above; only the
+/// checkpoints and the title/summary callbacks run on the main actor.
 @MainActor
 public enum TranscriptPublisher {
     /// Remote title generator. Returning `nil` (or throwing) falls back to the
@@ -114,7 +118,7 @@ public enum TranscriptPublisher {
         summarizer: Summarizer? = nil,
         checkpoint: (TranscriptionJob) -> Void = { _ in }
     ) async throws -> TranscriptPublishResult {
-        let stable = try library.migrateIfNeeded(recording)
+        let stable = try await offMain { try library.migrateIfNeeded(recording) }
         let segments = decoded.segments.isEmpty
             ? TranscriptParser.segments(from: decoded.text)
             : decoded.segments
@@ -126,19 +130,29 @@ public enum TranscriptPublisher {
         )
         checkpoint(current)
 
-        var published = try library.writeTranscriptBundle(decoded.text, segments: segments, for: stable)
-        if job.replacingExistingTranscript {
-            published = try library.clearSummary(for: published)
-            // Diarized labels of a new transcript need not match the old ones.
-            if let reset = try? library.resetSpeakerNames(for: published) {
-                published = reset
+        let text = decoded.text
+        let replacing = job.replacingExistingTranscript
+        var (published, readFromDisk) = try await offMain { () throws -> (RecordingItem, Bool) in
+            var published = try library.writeTranscriptBundle(text, segments: segments, for: stable)
+            var readFromDisk = false
+            if replacing {
+                published = try library.clearSummary(for: published)
+                // Diarized labels of a new transcript need not match the old ones.
+                if let reset = try? library.resetSpeakerNames(for: published) {
+                    published = reset
+                    readFromDisk = true
+                }
             }
+            return (published, readFromDisk)
         }
 
         current.markCompleted(transcriptFileName: published.transcriptURL.lastPathComponent)
         checkpoint(current)
-        // The caller's snapshot may predate a rename made while the job ran.
-        published = onDisk(published, library: library)
+        // The caller's snapshot may predate a rename made while the job ran
+        // (`resetSpeakerNames` above already re-read it from disk).
+        if !readFromDisk {
+            published = await onDisk(published, library: library)
+        }
 
         var finalRecording = published
         var generatedTitle: String?
@@ -198,9 +212,9 @@ public enum TranscriptPublisher {
     }
 
     /// `summarySkippedReason` when the recording already has a summary.
-    public static let existingSummaryKept = "Existing summary kept"
+    public nonisolated static let existingSummaryKept = "Existing summary kept"
     /// `summarySkippedReason` when the recording was deleted while summarizing.
-    public static let recordingDeleted = "Recording was deleted"
+    public nonisolated static let recordingDeleted = "Recording was deleted"
 
     /// Summarizes `transcript` into the recording's `summary.md`, best-effort.
     ///
@@ -218,8 +232,11 @@ public enum TranscriptPublisher {
     ) async -> TranscriptSummaryOutcome {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return TranscriptSummaryOutcome(recording: recording) }
-        let initial = onDisk(recording, library: library)
-        guard !hasSummaryText(storedSummary(of: initial)) else {
+        let (initial, initialSummary) = await offMain { () -> (RecordingItem, String) in
+            let initial = onDiskNow(recording, library: library)
+            return (initial, storedSummary(of: initial))
+        }
+        guard !hasSummaryText(initialSummary) else {
             return TranscriptSummaryOutcome(recording: initial, skippedReason: existingSummaryKept)
         }
         do {
@@ -228,30 +245,34 @@ public enum TranscriptPublisher {
             guard !markdown.isEmpty else {
                 return TranscriptSummaryOutcome(recording: initial, error: EmptySummaryError())
             }
-            // Re-read: the recording may have been renamed or deleted while the summary ran.
-            guard let latest = try library.loadRecordings().first(where: { $0.id == recording.id }) else {
-                return TranscriptSummaryOutcome(recording: initial, skippedReason: recordingDeleted)
+            let recordingID = recording.id
+            // Re-read, check and write as one step (the user may type a summary
+            // meanwhile): the recording may also have been renamed or deleted.
+            return try await offMain { () throws -> TranscriptSummaryOutcome in
+                try LibraryIO.serialized {
+                    guard let latest = try library.loadRecordings().first(where: { $0.id == recordingID }) else {
+                        return TranscriptSummaryOutcome(recording: initial, skippedReason: recordingDeleted)
+                    }
+                    let before = storedSummary(of: latest)
+                    guard !hasSummaryText(before) else {
+                        return TranscriptSummaryOutcome(recording: latest, previousSummary: before, skippedReason: existingSummaryKept)
+                    }
+                    // `latest` was just read from disk and the write changes only
+                    // `summary.md`: the returned item is the stored state.
+                    let written = try library.writeSummary(markdown, for: latest)
+                    return TranscriptSummaryOutcome(recording: written, markdown: markdown, previousSummary: before)
+                }
             }
-            let before = storedSummary(of: latest)
-            guard !hasSummaryText(before) else {
-                return TranscriptSummaryOutcome(recording: latest, previousSummary: before, skippedReason: existingSummaryKept)
-            }
-            let written = try library.writeSummary(markdown, for: latest)
-            return TranscriptSummaryOutcome(
-                recording: onDisk(written, library: library),
-                markdown: markdown,
-                previousSummary: before
-            )
         } catch {
             return TranscriptSummaryOutcome(recording: initial, error: error)
         }
     }
 
-    private static func storedSummary(of recording: RecordingItem) -> String {
-        (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) ?? ""
+    private nonisolated static func storedSummary(of recording: RecordingItem) -> String {
+        LibraryIO.serialized { (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) ?? "" }
     }
 
-    private static func hasSummaryText(_ summary: String) -> Bool {
+    private nonisolated static func hasSummaryText(_ summary: String) -> Bool {
         !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -271,7 +292,7 @@ public enum TranscriptPublisher {
               sha256(transcript) == expected else { return nil }
 
         var current = job
-        var recovered = onDisk(recording, library: library)
+        var recovered = onDiskNow(recording, library: library)
         if job.replacingExistingTranscript, let cleared = try? library.clearSummary(for: recovered) {
             recovered = cleared
             if let reset = try? library.resetSpeakerNames(for: recovered) {
@@ -300,9 +321,23 @@ public enum TranscriptPublisher {
         )
     }
 
-    /// The stored state of `recording` (falls back to the snapshot when it cannot be read).
-    private static func onDisk(_ recording: RecordingItem, library: any RecordingLibraryServing) -> RecordingItem {
+    /// The stored state of `recording` (falls back to the snapshot when it
+    /// cannot be read), read off the main actor.
+    private static func onDisk(_ recording: RecordingItem, library: any RecordingLibraryServing) async -> RecordingItem {
+        await offMain { onDiskNow(recording, library: library) }
+    }
+
+    private nonisolated static func onDiskNow(_ recording: RecordingItem, library: any RecordingLibraryServing) -> RecordingItem {
         (try? library.loadRecordings())?.first { $0.id == recording.id } ?? recording
+    }
+
+    /// Runs library filesystem work off the main actor.
+    private static func offMain<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await Task.detached(priority: .userInitiated) { try body() }.value
+    }
+
+    private static func offMain<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await Task.detached(priority: .userInitiated) { body() }.value
     }
 
     public nonisolated static func sha256(_ value: String) -> String {
@@ -348,7 +383,8 @@ public enum TranscriptPublisher {
             return (nil, note ?? "no title could be derived from the transcript")
         }
         do {
-            guard let renamed = try library.renameIfTitleIsDefault(recording, to: candidate) else {
+            let target = recording
+            guard let renamed = try await offMain({ try library.renameIfTitleIsDefault(target, to: candidate) }) else {
                 return (nil, "title already chosen")
             }
             return (renamed, note)

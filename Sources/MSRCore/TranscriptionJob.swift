@@ -293,6 +293,7 @@ public final class TranscriptionJobStore {
     }
 
     public func save(_ job: TranscriptionJob) throws {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
         let data = try Self.makeEncoder().encode(job)
         try DurableFile.write(data, to: url(for: job.id), fileManager: fileManager)
@@ -315,6 +316,7 @@ public final class TranscriptionJobStore {
     }
 
     public func loadAll() throws -> [TranscriptionJob] {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
         let urls = try fileManager.contentsOfDirectory(
             at: folderURL,
@@ -338,12 +340,14 @@ public final class TranscriptionJobStore {
     }
 
     public func delete(recordingID: UUID) throws {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         for job in try loadAll() where job.recordingID == recordingID {
             try delete(jobID: job.id)
         }
     }
 
     public func delete(jobID: UUID) throws {
+        LibraryIO.begin(); defer { LibraryIO.end() }
         for url in [url(for: jobID), DurableFile.backupURL(for: url(for: jobID))]
         where fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)

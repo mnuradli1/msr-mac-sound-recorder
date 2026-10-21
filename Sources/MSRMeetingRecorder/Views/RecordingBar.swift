@@ -46,35 +46,18 @@ struct RecordingBar: View {
     }
 
     private func meters(showStatus: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            SignalMeterView(
-                kind: .microphone,
-                level: viewModel.microphoneLevel,
-                isSelected: viewModel.meterSource != .system,
-                isActive: viewModel.isRecording && viewModel.meterSource != .system,
-                showStatus: showStatus
-            )
-            SignalMeterView(
-                kind: .system,
-                level: viewModel.systemLevel,
-                isSelected: viewModel.meterSource != .microphone,
-                isActive: viewModel.isRecording && viewModel.meterSource != .microphone,
-                showStatus: showStatus
-            )
-        }
-        .fixedSize()
+        RecordingMeters(
+            live: viewModel.live,
+            meterSource: viewModel.meterSource,
+            isRecording: viewModel.isRecording,
+            showStatus: showStatus
+        )
     }
 
     private var statusAndTimer: some View {
         HStack(spacing: 10) {
             StatusChip(title: viewModel.statusChip.title, tone: viewModel.statusChip.tone)
-            Text(formatClock(viewModel.recordingElapsed))
-                .font(.system(size: 22, weight: .semibold, design: .monospaced))
-                .foregroundStyle(viewModel.isRecordingSessionActive ? Theme.textPrimary : Theme.textSecondary)
-                .lineLimit(1)
-                .fixedSize()
-                .accessibilityLabel(Text("Recording timer \(formatClock(viewModel.recordingElapsed))"))
-                .accessibilityIdentifier("msr.recordingBar.timer")
+            RecordingTimerText(live: viewModel.live, isActive: viewModel.isRecordingSessionActive)
         }
     }
 
@@ -124,6 +107,51 @@ struct RecordingBar: View {
     private var recordSymbol: String {
         if viewModel.workflowState.isPaused { return "play.fill" }
         return viewModel.isRecording ? "stop.fill" : "record.circle"
+    }
+}
+
+/// The two source meters. Observes only `RecordingLiveState`, so a meter tick
+/// re-renders these rows and nothing else.
+private struct RecordingMeters: View {
+    @ObservedObject var live: RecordingLiveState
+    let meterSource: AudioSource
+    let isRecording: Bool
+    let showStatus: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            SignalMeterView(
+                kind: .microphone,
+                level: live.microphoneLevel,
+                isSelected: meterSource != .system,
+                isActive: isRecording && meterSource != .system,
+                showStatus: showStatus
+            )
+            SignalMeterView(
+                kind: .system,
+                level: live.systemLevel,
+                isSelected: meterSource != .microphone,
+                isActive: isRecording && meterSource != .microphone,
+                showStatus: showStatus
+            )
+        }
+        .fixedSize()
+    }
+}
+
+/// The session clock; observes only `RecordingLiveState`.
+private struct RecordingTimerText: View {
+    @ObservedObject var live: RecordingLiveState
+    let isActive: Bool
+
+    var body: some View {
+        Text(formatClock(live.recordingElapsed))
+            .font(.system(size: 22, weight: .semibold, design: .monospaced))
+            .foregroundStyle(isActive ? Theme.textPrimary : Theme.textSecondary)
+            .lineLimit(1)
+            .fixedSize()
+            .accessibilityLabel(Text("Recording timer \(formatClock(live.recordingElapsed))"))
+            .accessibilityIdentifier("msr.recordingBar.timer")
     }
 }
 

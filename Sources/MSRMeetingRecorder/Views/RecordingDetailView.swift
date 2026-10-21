@@ -31,7 +31,7 @@ struct RecordingDetailView: View {
             Group {
                 switch viewModel.selectedDetailTab {
                 case .review:
-                    ReviewTab(viewModel: viewModel)
+                    ReviewTab(viewModel: viewModel, playback: viewModel.playback)
                 case .notes:
                     NotesTab(viewModel: viewModel)
                 case .export:

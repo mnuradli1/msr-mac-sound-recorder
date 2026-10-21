@@ -53,11 +53,7 @@ struct MSRMeetingRecorderApp: App {
 
                 Divider()
 
-                Button(viewModel.isPlaying ? "Pause" : "Play") {
-                    viewModel.togglePlayback()
-                }
-                .keyboardShortcut(.space, modifiers: [.option])
-                .disabled(!viewModel.canPlaySelectedRecording)
+                PlayPauseCommand(viewModel: viewModel, playback: viewModel.playback)
 
                 Button("Rename") {
                     viewModel.startRename()
@@ -134,7 +130,7 @@ struct MSRMeetingRecorderApp: App {
                 .disabled(viewModel.selectedRecording == nil)
 
                 Button("Refresh History") {
-                    viewModel.loadRecordings()
+                    Task { await viewModel.refreshLibrary() }
                 }
 
                 Divider()
@@ -193,6 +189,21 @@ struct MSRMeetingRecorderApp: App {
         case .english: Locale(identifier: "en")
         case .indonesian: Locale(identifier: "id")
         }
+    }
+}
+
+/// Recording → Play/Pause. Observes `PlaybackState` for the title, which the
+/// scene itself (observing only `AppViewModel`) would not see change.
+private struct PlayPauseCommand: View {
+    @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var playback: PlaybackState
+
+    var body: some View {
+        Button(playback.isPlaying ? "Pause" : "Play") {
+            viewModel.togglePlayback()
+        }
+        .keyboardShortcut(.space, modifiers: [.option])
+        .disabled(!viewModel.canPlaySelectedRecording)
     }
 }
 

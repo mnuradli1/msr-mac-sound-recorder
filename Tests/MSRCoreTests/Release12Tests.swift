@@ -493,6 +493,22 @@ struct SpeakerNameTests {
         #expect(reloaded.displayName == "Weekly Sync")
     }
 
+    @Test func resetAllSpeakerNamesRevertsEverySpeakerInOneCall() throws {
+        let (fixture, recording) = try seeded()
+        _ = try fixture.library.renameSpeaker(recording, label: "Speaker 1", to: "Sarah")
+        let named = try fixture.library.renameSpeaker(recording, label: "Speaker 2", to: "Budi")
+        #expect(named.speakerNames == ["Speaker 1": "Sarah", "Speaker 2": "Budi"])
+
+        // Same result as renaming each speaker back, then dropping the mapping.
+        let reset = try fixture.library.resetAllSpeakerNames(for: recording)
+        #expect(reset.metadata.speakerNames == nil)
+        #expect(try String(contentsOf: reset.transcriptURL, encoding: .utf8) == Self.transcript)
+        #expect(fixture.library.loadTranscriptSegments(for: reset).map(\.speaker) == ["Speaker 1", "Speaker 2", "Speaker 1"])
+        #expect(try fixture.library.loadRecordings().first?.metadata.speakerNames == nil)
+        // Nothing to reset: a no-op that returns the stored recording.
+        #expect(try fixture.library.resetAllSpeakerNames(for: recording).metadata.speakerNames == nil)
+    }
+
     @Test func reRenameUpdatesMappingByOriginalLabelAndRevertRestoresIt() throws {
         let (fixture, recording) = try seeded()
         _ = try fixture.library.renameSpeaker(recording, label: "Speaker 1", to: "Sarah")
