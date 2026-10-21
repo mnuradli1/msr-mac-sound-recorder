@@ -19,6 +19,8 @@ public enum TranscriptionErrorMessage {
 
     private static func message(for error: ProviderError) -> String {
         switch error {
+        case let .missingAPIKey(name) where name == ProviderError.textModelKeyNames:
+            return "Summaries and titles need an OpenAI or DeepSeek API key (\(name)). Add one in Settings, then retry."
         case .missingAPIKey:
             return "Transcription needs an API key. Add it in Settings, then retry."
         case let .audioFileMissing(path):

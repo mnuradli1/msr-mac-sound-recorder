@@ -25,9 +25,11 @@ public final class LocalAPIProxy: @unchecked Sendable {
             if let pathAuthorization, !pathAuthorization(audioURL) {
                 throw LocalAPIError.forbidden("The requested audio file is outside the approved recordings library.")
             }
+            let languageCode = request.languageCode?.trimmingCharacters(in: .whitespacesAndNewlines)
             let response = try await aiService.transcribe(
                 audioURL: audioURL,
-                provider: request.provider
+                provider: request.provider,
+                languageCode: languageCode?.isEmpty == false ? languageCode : nil
             )
             return try json(response)
         case ("POST", "/summarize"):

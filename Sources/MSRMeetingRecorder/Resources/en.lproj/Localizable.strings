@@ -220,7 +220,6 @@
 "Microphone Permission" = "Microphone Permission";
 "System Audio Permission" = "System Audio Permission";
 "ElevenLabs Key" = "ElevenLabs Key";
-"OpenAI Key" = "OpenAI Key";
 "Allowed" = "Allowed";
 "Not requested yet" = "Not requested yet";
 "Unknown status" = "Unknown status";
@@ -228,7 +227,6 @@
 "Screen capture permission looks allowed" = "Screen capture permission looks allowed";
 "Allow Screen Recording for system audio capture." = "Allow Screen Recording for system audio capture.";
 "Missing" = "Missing";
-"Missing for summaries" = "Missing for summaries";
 "Folder is not writable." = "Folder is not writable.";
 "Recording selected" = "Recording selected";
 "Playback paused" = "Playback paused";
@@ -248,7 +246,6 @@
 "Auto-title recordings from the transcript" = "Auto-title recordings from the transcript";
 "API Keys" = "API Keys";
 "Paste a key to save or replace it" = "Paste a key to save or replace it";
-"ElevenLabs transcribes by default. OpenAI is used for summaries and optional transcription." = "ElevenLabs transcribes by default. OpenAI is used for summaries and optional transcription.";
 "Save Keys" = "Save Keys";
 "Menu Bar & Shortcuts" = "Menu Bar & Shortcuts";
 "Local API" = "Local API";
@@ -267,4 +264,52 @@
 "Showing your edited text; timestamps come from the original transcript." = "Showing your edited text; timestamps come from the original transcript.";
 "Auto" = "Auto";
 "Queued automatically by auto-transcribe" = "Queued automatically by auto-transcribe";
-"With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac." = "With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac.";
+
+// MARK: - 1.2: summaries, language, speaker names, meeting notes
+"Transcription language" = "Transcription language";
+"The spoken language of your meetings. Automatic lets the provider detect it." = "The spoken language of your meetings. Automatic lets the provider detect it.";
+"Automatic" = "Automatic";
+"DeepSeek" = "DeepSeek";
+"With an OpenAI or DeepSeek key saved, the beginning of each transcript is sent to that provider to name the recording; without one the title is generated on this Mac." = "With an OpenAI or DeepSeek key saved, the beginning of each transcript is sent to that provider to name the recording; without one the title is generated on this Mac.";
+"Summary provider" = "Summary provider";
+"Auto-summarize after transcription" = "Auto-summarize after transcription";
+"After each transcription, the transcript is sent to %@ for a summary." = "After each transcription, the transcript is sent to %@ for a summary.";
+"Summaries use %@. Turn this on to summarize every new transcript automatically." = "Summaries use %@. Turn this on to summarize every new transcript automatically.";
+"No %@ key is saved, so %@ is used." = "No %@ key is saved, so %@ is used.";
+"Requires an OpenAI or DeepSeek API key." = "Requires an OpenAI or DeepSeek API key.";
+"DeepSeek API Key" = "DeepSeek API Key";
+"Test DeepSeek Key" = "Test DeepSeek Key";
+"ElevenLabs transcribes by default. OpenAI or DeepSeek writes summaries and titles; OpenAI can also transcribe." = "ElevenLabs transcribes by default. OpenAI or DeepSeek writes summaries and titles; OpenAI can also transcribe.";
+"Summary key" = "Summary key";
+"OpenAI saved" = "OpenAI saved";
+"DeepSeek saved" = "DeepSeek saved";
+"Missing: add an OpenAI or DeepSeek key for summaries" = "Missing: add an OpenAI or DeepSeek key for summaries";
+"Originally %@. Click to rename this speaker." = "Originally %@. Click to rename this speaker.";
+"Click to rename this speaker." = "Click to rename this speaker.";
+"Rename this speaker" = "Rename this speaker";
+"Name this speaker" = "Name this speaker";
+"Renames %@ everywhere in this transcript. Leave empty to use the original label." = "Renames %@ everywhere in this transcript. Leave empty to use the original label.";
+"· via %@" = "· via %@";
+"Copy Meeting Notes" = "Copy Meeting Notes";
+"Reset speaker names" = "Reset speaker names";
+"Export Meeting Notes…" = "Export Meeting Notes…";
+"Save the title, summary, action items and transcript as one Markdown file" = "Save the title, summary, action items and transcript as one Markdown file";
+"Meeting notes copied" = "Meeting notes copied";
+"Speaker names reset" = "Speaker names reset";
+"Speaker name reset" = "Speaker name reset";
+"Transcribe or summarize this recording first." = "Transcribe or summarize this recording first.";
+"Add an OpenAI or DeepSeek API key in Settings to summarize." = "Add an OpenAI or DeepSeek API key in Settings to summarize.";
+"Wait for the transcription to finish before renaming speakers." = "Wait for the transcription to finish before renaming speakers.";
+
+// MARK: - 1.2 review fixes: runtime status and notices
+"Summary ready via %@" = "Summary ready via %@";
+"Summarizing with %@" = "Summarizing with %@";
+"Summarizing via %@" = "Summarizing via %@";
+"Auto-summary failed: %@" = "Auto-summary failed: %@";
+"Speaker renamed to %@" = "Speaker renamed to %@";
+"Existing summary kept" = "Existing summary kept";
+"The summary still uses the old speaker label. Summarize again to update it." = "The summary still uses the old speaker label. Summarize again to update it.";
+"Transcript recovered; summary was not generated. Press Summarize to create one." = "Transcript recovered; summary was not generated. Press Summarize to create one.";
+"Writing the summary… You can edit it when it is ready." = "Writing the summary… You can edit it when it is ready.";
+"Wait for the transcription to finish (or cancel it) before deleting this recording." = "Wait for the transcription to finish (or cancel it) before deleting this recording.";
+"Wait for the summary to finish before deleting this recording." = "Wait for the summary to finish before deleting this recording.";

@@ -8,37 +8,49 @@ public final class CredentialValidator: @unchecked Sendable {
         self.urlSession = urlSession
     }
 
+    /// Validates a transcription-provider key (ElevenLabs or OpenAI).
     public func validate(provider: AIProvider, apiKey: String) async -> CredentialValidationResult {
+        await validate(credential: provider.credentialProvider, apiKey: apiKey)
+    }
+
+    /// Validates any stored credential, including a DeepSeek key
+    /// (`GET https://api.deepseek.com/models`). Use
+    /// `TextModelProvider.credentialProvider` to test a summary provider's key.
+    public func validate(credential: CredentialProvider, apiKey: String) async -> CredentialValidationResult {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else {
-            return CredentialValidationResult(provider: provider, isValid: false, message: "API key is empty.")
+            return CredentialValidationResult(credential: credential, isValid: false, message: "API key is empty.")
         }
 
         do {
-            let request = try Self.validationRequest(provider: provider, apiKey: normalized)
+            let request = try Self.validationRequest(credential: credential, apiKey: normalized)
             let (data, response) = try await urlSession.data(for: request)
             guard let http = response as? HTTPURLResponse else {
-                return CredentialValidationResult(provider: provider, isValid: false, message: "Provider returned an invalid response.")
+                return CredentialValidationResult(credential: credential, isValid: false, message: "Provider returned an invalid response.")
             }
             if (200..<300).contains(http.statusCode) {
-                return CredentialValidationResult(provider: provider, isValid: true, message: "\(provider.displayName) key works for \(provider.validationPurpose).")
+                return CredentialValidationResult(credential: credential, isValid: true, message: "\(credential.displayName) key works for \(credential.validationPurpose).")
             }
             let body = String(data: data, encoding: .utf8) ?? "No response body"
             return CredentialValidationResult(
-                provider: provider,
+                credential: credential,
                 isValid: false,
-                message: Self.providerErrorMessage(provider: provider, statusCode: http.statusCode, body: body)
+                message: Self.providerErrorMessage(credential: credential, statusCode: http.statusCode, body: body)
             )
         } catch {
-            return CredentialValidationResult(provider: provider, isValid: false, message: error.localizedDescription)
+            return CredentialValidationResult(credential: credential, isValid: false, message: error.localizedDescription)
         }
     }
 
     public static func validationRequest(provider: AIProvider, apiKey: String) throws -> URLRequest {
+        try validationRequest(credential: provider.credentialProvider, apiKey: apiKey)
+    }
+
+    public static func validationRequest(credential: CredentialProvider, apiKey: String) throws -> URLRequest {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else {
             throw CredentialValidationError.emptyAPIKey
         }
 
-        switch provider {
+        switch credential {
         case .elevenLabs:
             var multipart = MultipartFormData()
             multipart.appendField(name: "model_id", value: "scribe_v2")
@@ -55,34 +67,50 @@ public final class CredentialValidator: @unchecked Sendable {
             request.httpBody = multipart.finalize()
             return request
         case .openAI:
-            var request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
-            request.httpMethod = "GET"
-            request.setValue("Bearer \(normalized)", forHTTPHeaderField: "Authorization")
-            return request
+            return bearerModelsRequest(URL(string: "https://api.openai.com/v1/models")!, apiKey: normalized)
+        case .deepSeek:
+            return bearerModelsRequest(URL(string: "https://api.deepseek.com/models")!, apiKey: normalized)
         }
     }
 
-    private static func providerErrorMessage(provider: AIProvider, statusCode: Int, body: String) -> String {
+    private static func bearerModelsRequest(_ url: URL, apiKey: String) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    private static func providerErrorMessage(credential: CredentialProvider, statusCode: Int, body: String) -> String {
         let lowercased = body.lowercased()
-        if provider == .elevenLabs, lowercased.contains("missing_permissions") {
+        if credential == .elevenLabs, lowercased.contains("missing_permissions") {
             return "ElevenLabs key was recognized but is missing permission for this operation. Enable Speech-to-Text permission for the key, or create a key with Speech-to-Text access. HTTP \(statusCode)."
         }
         if statusCode == 401 || statusCode == 403 {
-            return "\(provider.displayName) rejected the key. Check that the key is active and has permission for \(provider.validationPurpose). HTTP \(statusCode)."
+            return "\(credential.displayName) rejected the key. Check that the key is active and has permission for \(credential.validationPurpose). HTTP \(statusCode)."
         }
-        return "\(provider.displayName) rejected the key with HTTP \(statusCode): \(body.prefix(400))"
+        if credential == .deepSeek, statusCode == 402 {
+            return "DeepSeek key works but the account has no balance. Top up the DeepSeek account. HTTP 402."
+        }
+        return "\(credential.displayName) rejected the key with HTTP \(statusCode): \(body.prefix(400))"
     }
 }
 
 public struct CredentialValidationResult: Equatable, Sendable {
-    public var provider: AIProvider
+    public var credential: CredentialProvider
     public var isValid: Bool
     public var message: String
 
-    public init(provider: AIProvider, isValid: Bool, message: String) {
-        self.provider = provider
+    /// The transcription provider validated, or `nil` for a DeepSeek key.
+    public var provider: AIProvider? { credential.transcriptionProvider }
+
+    public init(credential: CredentialProvider, isValid: Bool, message: String) {
+        self.credential = credential
         self.isValid = isValid
         self.message = message
+    }
+
+    public init(provider: AIProvider, isValid: Bool, message: String) {
+        self.init(credential: provider.credentialProvider, isValid: isValid, message: message)
     }
 }
 
@@ -94,12 +122,12 @@ public enum CredentialValidationError: Error, LocalizedError {
     }
 }
 
-private extension AIProvider {
+private extension CredentialProvider {
     var validationPurpose: String {
         switch self {
         case .elevenLabs:
             return "speech-to-text"
-        case .openAI:
+        case .openAI, .deepSeek:
             return "model access"
         }
     }

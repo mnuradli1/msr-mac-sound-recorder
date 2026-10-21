@@ -6,6 +6,8 @@ public enum RecordingLibraryError: Error, LocalizedError, Equatable {
     case duplicateRecordingID(UUID)
     case invalidMetadata(String)
     case recordingNotFound(UUID)
+    case speakerNotFound(String)
+    case speakerNameInUse(String)
 
     public var errorDescription: String? {
         switch self {
@@ -14,6 +16,8 @@ public enum RecordingLibraryError: Error, LocalizedError, Equatable {
         case let .duplicateRecordingID(id): "A recording with ID \(id.uuidString) already exists."
         case let .invalidMetadata(message): message
         case .recordingNotFound: "The recording is no longer in the library."
+        case let .speakerNotFound(label): "\(label) is not a speaker in this transcript."
+        case let .speakerNameInUse(name): "Another speaker is already called \(name)."
         }
     }
 }
@@ -52,6 +56,13 @@ public protocol RecordingLibraryServing: Sendable {
     func loadTranscriptSegments(for recording: RecordingItem) -> [TranscriptSegment]
     func writeSummary(_ summary: String, for recording: RecordingItem) throws -> RecordingItem
     func clearSummary(for recording: RecordingItem) throws -> RecordingItem
+    /// Gives a diarized speaker a display name. See `RecordingLibrary.renameSpeaker(_:label:to:)`.
+    @discardableResult
+    func renameSpeaker(_ recording: RecordingItem, label: String, to name: String) throws -> RecordingItem
+    /// Drops all speaker display names from the metadata without touching the
+    /// transcript (used when a new transcript replaces the old one).
+    @discardableResult
+    func resetSpeakerNames(for recording: RecordingItem) throws -> RecordingItem
     func delete(_ recording: RecordingItem) throws
 }
 
@@ -323,6 +334,120 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             try fileManager.removeItem(at: url)
         }
         return item
+    }
+
+    /// Renames a diarized speaker everywhere it appears for `recording`.
+    ///
+    /// `label` may be the provider's original label (`"Speaker 1"`) or the
+    /// speaker's current display name (`"Sarah"`); either resolves to the
+    /// original label, which is the key stored in `RecordingMetadata.speakerNames`,
+    /// so a re-rename updates the mapping instead of chaining it. `name` is
+    /// cleaned with `SpeakerNames.sanitized(_:)`; an empty result (or the
+    /// original label itself) reverts the speaker to its original label.
+    ///
+    /// Metadata is re-read from disk (like `rename`). The transcript text
+    /// (`Label:` block headers) and the segments file (`TranscriptSegment.speaker`)
+    /// are rewritten first and the metadata last, so Read mode, Edit mode,
+    /// search and exports agree, and a failed write never leaves metadata
+    /// claiming a rename the transcript does not show. Headers still showing
+    /// either the original label or the previous display name are rewritten,
+    /// so an interrupted rename is completed by the next one, including a
+    /// retry with the name the metadata already holds. Renaming to the current
+    /// name is otherwise a no-op.
+    ///
+    /// - Throws: `RecordingLibraryError.speakerNotFound` when `label` is neither
+    ///   a stored speaker nor a label in the transcript/segments;
+    ///   `.speakerNameInUse` when another speaker already uses the name (or has
+    ///   it as its original label), compared case-insensitively;
+    ///   `.recordingNotFound` when the recording was deleted.
+    @discardableResult
+    public func renameSpeaker(_ recording: RecordingItem, label: String, to name: String) throws -> RecordingItem {
+        let (onDisk, _) = try onDiskRecording(for: recording)
+        let current = try ensureImmutableStorage(onDisk)
+        var names = current.speakerNames
+        let transcriptExists = fileManager.fileExists(atPath: current.transcriptURL.path)
+        let transcript = transcriptExists ? ((try? String(contentsOf: current.transcriptURL, encoding: .utf8)) ?? "") : ""
+        let segmentsExist = fileManager.fileExists(atPath: current.transcriptSegmentsURL.path)
+        let segments = loadTranscriptSegments(for: current)
+
+        let requested = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let original: String
+        if names[requested] != nil {
+            original = requested
+        } else if let key = names.filter({ $0.value == requested }).keys.sorted().first {
+            original = key
+        } else {
+            original = requested
+        }
+        let currentDisplay = names[original] ?? original
+        let present = Set(SpeakerNames.labels(in: transcript)).union(segments.map(\.speaker).filter { !$0.isEmpty })
+        guard !original.isEmpty, names[original] != nil || present.contains(original) else {
+            throw RecordingLibraryError.speakerNotFound(requested)
+        }
+
+        let cleaned = SpeakerNames.sanitized(name)
+        let newDisplay = cleaned.isEmpty ? original : cleaned
+        // Same name again: still finish an interrupted rename whose headers or
+        // segments kept the original label.
+        let completesInterruptedRename = newDisplay == currentDisplay
+            && original != newDisplay
+            && present.contains(original)
+        guard newDisplay != currentDisplay || completesInterruptedRename else { return current }
+
+        var reserved = Set<String>()
+        for (key, value) in names where key != original {
+            reserved.insert(key.lowercased())
+            reserved.insert(value.lowercased())
+        }
+        for other in present where other != currentDisplay && other != original {
+            reserved.insert(other.lowercased())
+        }
+        guard !reserved.contains(newDisplay.lowercased()) else {
+            throw RecordingLibraryError.speakerNameInUse(newDisplay)
+        }
+
+        if newDisplay == original {
+            names.removeValue(forKey: original)
+        } else {
+            names[original] = newDisplay
+        }
+        var metadata = current.metadata
+        metadata.speakerNames = names.isEmpty ? nil : names
+        metadata.updatedAt = Date()
+        let updated = RecordingItem(metadata: metadata, folderURL: folderURL)
+
+        let replaced: Set<String> = [currentDisplay, original]
+        let newTranscript = SpeakerNames.renaming(replaced, to: newDisplay, in: transcript)
+        let newSegments = segments.map { segment -> TranscriptSegment in
+            guard replaced.contains(segment.speaker) else { return segment }
+            var renamed = segment
+            renamed.speaker = newDisplay
+            return renamed
+        }
+        let transcriptChanged = transcriptExists && newTranscript != transcript
+        let segmentsChanged = segmentsExist && newSegments != segments
+        if transcriptChanged, segmentsChanged {
+            try writeTranscriptBundle(newTranscript, segments: newSegments, for: updated)
+        } else if transcriptChanged {
+            try writeTranscript(newTranscript, for: updated)
+        } else if segmentsChanged {
+            try writeTranscriptSegments(newSegments, for: updated)
+        }
+        try write(metadata: metadata, to: updated.metadataURL)
+        return updated
+    }
+
+    @discardableResult
+    public func resetSpeakerNames(for recording: RecordingItem) throws -> RecordingItem {
+        let (onDisk, _) = try onDiskRecording(for: recording)
+        let current = try ensureImmutableStorage(onDisk)
+        guard current.metadata.speakerNames != nil else { return current }
+        var metadata = current.metadata
+        metadata.speakerNames = nil
+        metadata.updatedAt = Date()
+        let updated = RecordingItem(metadata: metadata, folderURL: folderURL)
+        try write(metadata: metadata, to: updated.metadataURL)
+        return updated
     }
 
     public func delete(_ recording: RecordingItem) throws {

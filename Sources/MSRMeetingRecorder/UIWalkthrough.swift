@@ -280,6 +280,19 @@ final class AXDriver {
         return nil
     }
 
+    /// A string attribute read synchronously (AX requests to the own process are answered inline).
+    func string(_ node: AXNode, _ attribute: String = kAXValueAttribute) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(node.element, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    func bool(_ node: AXNode, _ attribute: String) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(node.element, attribute as CFString, &value) == .success else { return nil }
+        return (value as? NSNumber)?.boolValue
+    }
+
     /// Diagnostics for the last `setText` that did not apply.
     private(set) var lastTextFailure = ""
 
@@ -520,10 +533,14 @@ final class UIWalkthrough {
         await step("5a-inline-rename-commit") { try await self.inlineRenameCommit(window: window) }
         await step("5b-inline-rename-cancel") { try await self.inlineRenameCancel(window: window) }
         await step("6-settings-window") { try await self.settingsWindowToggles() }
+        await step("6b-transcription-language") { try await self.transcriptionLanguagePicker() }
+        await step("6c-auto-summarize") { try await self.autoSummarizeToggle() }
         await step("7-record-button") { try await self.recordViaButton() }
         await step("8a-overflow-menu-copy") { try await self.overflowMenuCopy() }
         await step("8b-menu-copy-transcript") { try await self.menuCopyTranscript() }
         await step("8c-menu-export-tab") { try await self.menuExportTab() }
+        await step("8d-speaker-rename") { try await self.speakerRename(window: window) }
+        await step("8e-menu-copy-meeting-notes") { try await self.menuCopyMeetingNotes() }
         await step("9a-command-delete-in-text-field") { try await self.commandDeleteInTextField(window: window) }
         await step("9b-menu-delete-with-confirmation") { try await self.deleteWithConfirmation(window: window) }
         await step("10-status-bar") { try await self.statusBar() }
@@ -689,6 +706,105 @@ final class UIWalkthrough {
         return "gear → '\(title)'; Transcription & AI; auto-transcribe (\(autoTranscribe.role)) false→true→false→true (left on via the toggle); auto-title \(titleBefore)→\(!titleBefore)→\(titleBefore); closed"
     }
 
+    /// Opens Settings (gear) on the Transcription & AI tab; returns the window.
+    private func openTranscriptionSettings() async throws -> NSWindow {
+        if settingsWindow() == nil {
+            let gear = try require(await ax.find(AXDriver.Query(identifier: "msr.recordingBar.settings")),
+                                   "gear button not in AX tree")
+            try check(await ax.press(gear), "AXPress on the gear failed")
+        }
+        var window: NSWindow?
+        try check(await ax.waitUntil(timeout: 3) {
+            window = self.settingsWindow()
+            return window != nil
+        }, "no window titled '\(Self.settingsTitle)' appeared")
+        let segment = try await segment(in: "msr.settings.tabs", label: "Transcription & AI", window: Self.settingsTitle)
+        try check(await ax.press(segment), "AXPress on Transcription & AI failed")
+        _ = await ax.waitFor(AXDriver.Query(identifier: "msr.settings.autoTranscribe"), window: Self.settingsTitle, timeout: 3)
+        return window!
+    }
+
+    private func closeSettings(_ window: NSWindow) async throws {
+        window.performClose(nil)
+        try check(await ax.waitUntil(timeout: 2) { !window.isVisible }, "settings window did not close")
+    }
+
+    /// The pop-up button of a Picker whose identifier may sit on the button or a wrapper.
+    private func popUpButton(identifier: String, window: String) async throws -> AXNode {
+        let control = try require(await ax.waitFor(AXDriver.Query(identifier: identifier), window: window, timeout: 3),
+                                  "\(identifier) not in AX tree")
+        if control.role == kAXPopUpButtonRole { return control }
+        let nodes = await ax.snapshot(window: window)
+        return try require(ax.descendants(of: control, in: nodes).first { $0.role == kAXPopUpButtonRole },
+                           "\(identifier) is \(control.role) without an AXPopUpButton inside")
+    }
+
+    private func transcriptionLanguagePicker() async throws -> String {
+        let settings = try await openTranscriptionSettings()
+        let title = Self.settingsTitle
+        let start = viewModel.settings.transcriptionLanguage
+        var log: [String] = []
+        // End on English: step 7 transcribes an English clip with this hint.
+        for (label, expected) in [("Bahasa Indonesia", TranscriptionLanguage.indonesian), ("English", .english)] {
+            var attempts = 0
+            var result: (AXDriver.MenuOutcome, String)
+            repeat {
+                // The pop-up is rebuilt after a selection; give it a moment, then retry once.
+                if attempts > 0 { try? await Task.sleep(for: .milliseconds(400)) }
+                let popup = try await popUpButton(identifier: "msr.settings.transcriptionLanguage", window: title)
+                result = await ax.choose(label, fromMenuButton: popup)
+                attempts += 1
+            } while !result.0.opened && attempts < 3
+            let (outcome, method) = result
+            try check(outcome.opened, "the language pop-up did not open for '\(label)' via \(method) after \(attempts) attempts")
+            try check(outcome.chosen, "no '\(label)' item in the language menu (items: \(outcome.items))")
+            try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.transcriptionLanguage == expected },
+                      "transcriptionLanguage is \(viewModel.settings.transcriptionLanguage.rawValue) after choosing \(label)")
+            try check(expected.languageCode == expected.rawValue, "\(label) sends language code \(expected.languageCode ?? "nil")")
+            log.append("\(label) → \(expected.rawValue)\(attempts > 1 ? " (attempt \(attempts))" : "")")
+        }
+        try await closeSettings(settings)
+        return "start \(start.rawValue); pop-up (\(AXDriver.Query(identifier: "msr.settings.transcriptionLanguage"))) " + log.joined(separator: "; ")
+    }
+
+    /// Passes with or without an OpenAI/DeepSeek key: with one the toggle flips
+    /// (and is restored); without one it must be disabled with the key footer.
+    private func autoSummarizeToggle() async throws -> String {
+        let settings = try await openTranscriptionSettings()
+        let title = Self.settingsTitle
+        let query = AXDriver.Query(identifier: "msr.settings.autoSummarize")
+        let toggle = try require(await ax.waitFor(query, window: title, timeout: 3), "auto-summarize toggle not found")
+        let enabled = ax.bool(toggle, kAXEnabledAttribute)
+        let before = viewModel.settings.autoSummarize
+        let path: String
+        if viewModel.canSummarize {
+            try check(enabled != false, "toggle is disabled although a summary key exists")
+            try check(await ax.press(toggle), "AXPress on the auto-summarize toggle failed")
+            try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoSummarize == !before },
+                      "autoSummarize did not flip on the first press")
+            try check(viewModel.autoSummarizeIsEffective == !before, "autoSummarizeIsEffective does not follow the toggle")
+            // Restore, so step 7 does not run (and bill) a summary unless it was already on.
+            await ax.press(try require(await ax.find(query, window: title), "toggle vanished"))
+            try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoSummarize == before },
+                      "autoSummarize did not flip back on the second press")
+            path = "key path (\(viewModel.resolvedSummaryProvider?.displayName ?? "?")): enabled, \(before)→\(!before)→\(before)"
+        } else {
+            try check(enabled == false, "toggle is enabled without an OpenAI or DeepSeek key (AXEnabled \(String(describing: enabled)))")
+            await ax.press(toggle)
+            try? await Task.sleep(for: .milliseconds(300))
+            try check(viewModel.settings.autoSummarize == before, "pressing the disabled toggle changed autoSummarize")
+            try check(!viewModel.autoSummarizeIsEffective, "autoSummarizeIsEffective is true without a key")
+            let footer = await ax.find(AXDriver.Query(text: "Requires an OpenAI or DeepSeek API key"), window: title)
+            try check(footer != nil, "no 'Requires an OpenAI or DeepSeek API key.' footer")
+            path = "no-key path: AXEnabled=false, press ignored, footer shown, not effective"
+        }
+        let deepSeekField = await ax.find(AXDriver.Query(identifier: "msr.settings.deepSeekKey"), window: title)
+        let deepSeekTest = await ax.find(AXDriver.Query(identifier: "msr.settings.testDeepSeek"), window: title)
+        try check(deepSeekField != nil && deepSeekTest != nil, "DeepSeek key field or Test button missing")
+        try await closeSettings(settings)
+        return path + "; DeepSeek key row present"
+    }
+
     private func recordViaButton() async throws -> String {
         try check(viewModel.credentialAvailable(for: viewModel.settings.provider),
                   "no API key for \(viewModel.settings.provider.displayName)")
@@ -773,6 +889,110 @@ final class UIWalkthrough {
             try check(await ax.waitUntil(timeout: 2) { pasteboard.string(forType: .string)?.contains(firstWords) == true },
                       "pasteboard does not contain '\(firstWords)'")
             return "Recording → Copy Transcript → pasteboard has '\(firstWords)…' (clipboard restored)"
+        }
+    }
+
+    /// Notes → Read mode → speaker chip → popover; Return saves the name to
+    /// the transcript, segments and metadata; Escape cancels; ⋯ → Reset reverts.
+    private func speakerRename(window: NSWindow) async throws -> String {
+        let recording = try require(
+            viewModel.filteredRecordings.first { FileManager.default.fileExists(atPath: $0.transcriptSegmentsURL.path) },
+            "no fixture recording has transcript segments"
+        )
+        if viewModel.selectedRecording?.id != recording.id {
+            _ = try await select(recording)
+        }
+        let notes = try await segment(in: "msr.detail.tabs", label: RecordingDetailTab.notes.rawValue)
+        await ax.press(notes)
+        try check(await ax.waitUntil(timeout: 2) { self.viewModel.selectedDetailTab == .notes }, "Notes tab did not open")
+        let read = try await segment(in: "msr.notes.transcriptMode", label: TranscriptMode.read.rawValue)
+        await ax.press(read)
+        let original = try require(viewModel.readModeSegments.first?.speaker, "no segments in Read mode")
+        try check(!original.isEmpty, "first segment has no speaker")
+        let newName = "Dana Walkthrough"
+
+        let chipQuery = AXDriver.Query(identifier: "msr.notes.speaker.0")
+        let chip = try require(await ax.waitFor(chipQuery, timeout: 3), "speaker chip msr.notes.speaker.0 not in AX tree")
+        try check(chip.texts.contains(original), "chip reads \(chip.texts), expected '\(original)'")
+
+        // Escape cancels without renaming.
+        let fieldQuery = AXDriver.Query(identifier: "msr.notes.speakerNameField")
+        let (cancelField, popover) = try await openSpeakerPopover(chipQuery, fieldQuery)
+        try check(ax.string(cancelField) == original, "popover field prefilled with '\(ax.string(cancelField) ?? "nil")', expected '\(original)'")
+        _ = await ax.setText("Not Saved", on: cancelField, in: popover) { self.ax.string(cancelField) == "Not Saved" }
+        await ax.sendKey(.escape, to: popover)
+        var cancelMethod = "Escape"
+        if !(await ax.waitForAbsence(fieldQuery, timeout: 2)) {
+            let cancel = try require(await ax.find(AXDriver.Query(identifier: "msr.notes.speakerCancel")), "no Cancel button")
+            await ax.press(cancel)
+            cancelMethod = "Cancel button (Escape did not reach the popover)"
+            try check(await ax.waitForAbsence(fieldQuery, timeout: 2), "popover still open after Cancel")
+        }
+        try check(try metadataObject("speakerNames", for: recording) == nil, "cancel wrote speakerNames")
+
+        // Return saves.
+        let (field, popoverWindow) = try await openSpeakerPopover(chipQuery, fieldQuery)
+        let typed = try require(
+            await ax.setText(newName, on: field, in: popoverWindow) { self.ax.string(field) == newName },
+            "could not type into the speaker name field (\(ax.lastTextFailure))"
+        )
+        await ax.sendKey(.returnKey, to: popoverWindow)
+        var saveMethod = "Return"
+        func savedOnDisk() -> Bool {
+            ((try? metadataObject("speakerNames", for: recording)) as? [String: String])?[original] == newName
+        }
+        if !(await ax.waitUntil(timeout: 2, savedOnDisk)) {
+            let save = try require(await ax.find(AXDriver.Query(identifier: "msr.notes.speakerSave")), "no Save button")
+            await ax.press(save)
+            saveMethod = "Save button (Return did not reach the popover)"
+            try check(await ax.waitUntil(timeout: 2, savedOnDisk), "speakerNames on disk: \(String(describing: try? metadataObject("speakerNames", for: recording)))")
+        }
+        try check(viewModel.selectedRecording?.speakerNames[original] == newName, "view model speakerNames \(viewModel.selectedRecording?.speakerNames ?? [:])")
+        let transcript = (try? String(contentsOf: recording.transcriptURL, encoding: .utf8)) ?? ""
+        try check(transcript.contains(newName), "transcript on disk does not mention '\(newName)'")
+        var renamedChip = chipQuery
+        renamedChip.exactText = newName
+        try check(await ax.waitFor(renamedChip, timeout: 3) != nil, "chip did not change to '\(newName)'")
+
+        // ⋯ → Reset speaker names reverts transcript and metadata.
+        let more = try require(await ax.find(AXDriver.Query(identifier: "msr.detail.moreActions")), "no More actions button")
+        let (outcome, method) = await ax.choose("Reset speaker names", fromMenuButton: more)
+        try check(outcome.chosen, "no enabled 'Reset speaker names' item (items: \(outcome.items)) via \(method)")
+        try check(await ax.waitUntil(timeout: 3) { (try? self.metadataObject("speakerNames", for: recording)) == nil },
+                  "speakerNames still on disk after reset")
+        var resetChip = chipQuery
+        resetChip.exactText = original
+        try check(await ax.waitFor(resetChip, timeout: 3) != nil, "chip did not return to '\(original)'")
+        return "chip '\(original)' → popover (prefilled); \(cancelMethod) cancels; typed via \(typed); \(saveMethod) → speakerNames['\(original)']='\(newName)' on disk + transcript, chip '\(newName)'; ⋯ Reset → '\(original)'"
+    }
+
+    private func openSpeakerPopover(_ chip: AXDriver.Query, _ field: AXDriver.Query) async throws -> (AXNode, NSWindow) {
+        let node = try require(await ax.find(chip), "speaker chip missing")
+        try check(await ax.press(node), "AXPress on the speaker chip failed")
+        let fieldNode = try require(await ax.waitFor(field, timeout: 3), "speaker name popover did not open")
+        var popover: NSWindow?
+        _ = await ax.waitUntil(timeout: 2) {
+            popover = NSApp.windows.first { $0.isVisible && String(describing: type(of: $0)).contains("Popover") }
+            return popover != nil
+        }
+        return (fieldNode, try require(popover ?? NSApp.keyWindow, "no popover window"))
+    }
+
+    private func menuCopyMeetingNotes() async throws -> String {
+        let recording = try require(viewModel.selectedRecording, "no recording selected")
+        try check(viewModel.canCopyMeetingNotes, "selected recording has neither transcript nor summary")
+        let item = NSApp.mainMenu?.items.first { $0.title == "Recording" }?.submenu?.items.first { $0.title == "Copy Meeting Notes" }
+        let shortcut = item.map { "⌘\($0.keyEquivalentModifierMask.contains(.shift) ? "⇧" : "")\($0.keyEquivalent.uppercased())" } ?? "none"
+        try check(shortcut == "⌘⇧C", "Copy Meeting Notes shortcut is \(shortcut)")
+        let expected = "# \(recording.displayName)"
+        return try await withPasteboardRestored { pasteboard in
+            let result = ax.performMainMenuItem(["Recording", "Copy Meeting Notes"])
+            try check(result == .performed, "menu Recording → Copy Meeting Notes: \(result)")
+            try check(await ax.waitUntil(timeout: 2) { pasteboard.string(forType: .string)?.hasPrefix(expected) == true },
+                      "pasteboard starts with '\(pasteboard.string(forType: .string)?.prefix(40) ?? "nil")', expected '\(expected)'")
+            let text = pasteboard.string(forType: .string) ?? ""
+            try check(text.contains("## Summary") && text.contains("## Transcript"), "notes lack Summary/Transcript sections")
+            return "Recording → Copy Meeting Notes (\(shortcut)) → pasteboard starts '\(expected.prefix(40))', has Summary + Transcript (clipboard restored)"
         }
     }
 
@@ -977,6 +1197,12 @@ final class UIWalkthrough {
         let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
         let speech = lines.first { !$0.isEmpty && !$0.hasPrefix("[") && !$0.hasSuffix(":") } ?? text
         return speech.split(whereSeparator: \.isWhitespace).prefix(3).joined(separator: " ")
+    }
+
+    private func metadataObject(_ key: String, for recording: RecordingItem) throws -> Any? {
+        let data = try Data(contentsOf: recording.metadataURL)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return object?[key]
     }
 
     private func metadataString(_ key: String, for recording: RecordingItem) throws -> String? {

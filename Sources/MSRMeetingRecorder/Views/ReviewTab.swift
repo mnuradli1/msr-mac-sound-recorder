@@ -252,6 +252,14 @@ struct ExportTab: View {
                 Button("Reveal Last") { viewModel.revealLastExport() }
                     .disabled(viewModel.lastExportURL == nil)
                 Button {
+                    viewModel.exportMeetingNotes()
+                } label: {
+                    Label("Export Meeting Notes…", systemImage: "list.bullet.clipboard")
+                }
+                .disabled(!viewModel.canCopyMeetingNotes)
+                .help("Save the title, summary, action items and transcript as one Markdown file")
+                .accessibilityIdentifier("msr.export.meetingNotes")
+                Button {
                     viewModel.exportSelected()
                 } label: {
                     Label("Export…", systemImage: "square.and.arrow.up")

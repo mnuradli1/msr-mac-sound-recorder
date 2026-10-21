@@ -103,8 +103,19 @@ struct ContentView: View {
             NoticeBanner(message: errorMessage, severity: .error)
         } else if let notice = viewModel.autoTranscribeNotice {
             dismissibleNotice(notice, severity: .warning) { viewModel.clearAutoTranscribeNotice() }
-        } else if let notice = viewModel.lastAutoTitleNotice {
-            dismissibleNotice(notice, severity: .info) { viewModel.clearAutoTitleNotice() }
+        } else if viewModel.lastAutoTitleNotice != nil || viewModel.lastAutoSummaryNotice != nil {
+            // Title and summary arrive together after one transcription; show both.
+            VStack(spacing: 0) {
+                if let notice = viewModel.lastAutoTitleNotice {
+                    dismissibleNotice(notice, severity: .info) { viewModel.clearAutoTitleNotice() }
+                }
+                if let notice = viewModel.lastAutoSummaryNotice {
+                    dismissibleNotice(
+                        notice,
+                        severity: viewModel.lastAutoSummaryFailed ? .warning : .success
+                    ) { viewModel.clearAutoSummaryNotice() }
+                }
+            }
         }
     }
 

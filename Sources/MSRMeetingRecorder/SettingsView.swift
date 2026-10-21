@@ -163,7 +163,7 @@ private struct GeneralSettingsTab: View {
 
 private struct TranscriptionSettingsTab: View {
     @ObservedObject var viewModel: AppViewModel
-    @State private var lastTestedProvider: AIProvider?
+    @State private var lastTestedCredential: CredentialProvider?
 
     var body: some View {
         Form {
@@ -173,6 +173,13 @@ private struct TranscriptionSettingsTab: View {
                         Text(LocalizedStringKey(provider.displayName)).tag(provider)
                     }
                 }
+                Picker("Transcription language", selection: $viewModel.settings.transcriptionLanguage) {
+                    ForEach(TranscriptionLanguage.allCases) { language in
+                        Text(LocalizedStringKey(language.displayName)).tag(language)
+                    }
+                }
+                .help("The spoken language of your meetings. Automatic lets the provider detect it.")
+                .accessibilityIdentifier("msr.settings.transcriptionLanguage")
                 Toggle("Compress large/uncompressed uploads", isOn: $viewModel.settings.compressUploads)
                     .accessibilityIdentifier("msr.settings.compressUploads")
                 Toggle("Auto-title recordings from the transcript", isOn: $viewModel.settings.autoTitle)
@@ -189,7 +196,7 @@ private struct TranscriptionSettingsTab: View {
                             : "Auto-transcribe is on, but no API key is saved for the selected provider. Add one below.")
                         : "Transcription starts when you press Transcribe. Turn this on to queue every finished recording automatically.")
                     if viewModel.settings.autoTitle {
-                        Text("With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac.")
+                        Text("With an OpenAI or DeepSeek key saved, the beginning of each transcript is sent to that provider to name the recording; without one the title is generated on this Mac.")
                     }
                 }
                 .font(.footnote)
@@ -197,25 +204,53 @@ private struct TranscriptionSettingsTab: View {
             }
 
             Section {
+                Picker("Summary provider", selection: $viewModel.settings.summaryProvider) {
+                    ForEach(TextModelProvider.allCases) { provider in
+                        Text(LocalizedStringKey(provider.displayName)).tag(provider)
+                    }
+                }
+                .accessibilityIdentifier("msr.settings.summaryProvider")
+                Toggle("Auto-summarize after transcription", isOn: Binding(
+                    // Reads as off while no summary key exists; the setting itself is kept.
+                    get: { viewModel.settings.autoSummarize && viewModel.canSummarize },
+                    set: { viewModel.settings.autoSummarize = $0 }
+                ))
+                .disabled(!viewModel.canSummarize)
+                .accessibilityIdentifier("msr.settings.autoSummarize")
+            } header: {
+                Text("Summary")
+            } footer: {
+                summaryFooter
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 credentialRow(
                     title: "ElevenLabs API Key",
-                    provider: .elevenLabs,
-                    healthID: "elevenlabs",
+                    credential: .elevenLabs,
                     draft: $viewModel.elevenLabsKeyDraft,
                     testTitle: "Test ElevenLabs Key"
                 )
                 credentialRow(
                     title: "OpenAI API Key",
-                    provider: .openAI,
-                    healthID: "openai",
+                    credential: .openAI,
                     draft: $viewModel.openAIKeyDraft,
                     testTitle: "Test OpenAI Key"
+                )
+                credentialRow(
+                    title: "DeepSeek API Key",
+                    credential: .deepSeek,
+                    draft: $viewModel.deepSeekKeyDraft,
+                    testTitle: "Test DeepSeek Key",
+                    fieldIdentifier: "msr.settings.deepSeekKey",
+                    testIdentifier: "msr.settings.testDeepSeek"
                 )
                 Toggle("Remember credentials in Keychain", isOn: $viewModel.settings.rememberCredentials)
             } header: {
                 Text("API Keys")
             } footer: {
-                Text("ElevenLabs transcribes by default. OpenAI is used for summaries and optional transcription.")
+                Text("ElevenLabs transcribes by default. OpenAI or DeepSeek writes summaries and titles; OpenAI can also transcribe.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -230,7 +265,8 @@ private struct TranscriptionSettingsTab: View {
                         viewModel.saveAPIKeys()
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(viewModel.elevenLabsKeyDraft.isEmpty && viewModel.openAIKeyDraft.isEmpty)
+                    .disabled(viewModel.elevenLabsKeyDraft.isEmpty && viewModel.openAIKeyDraft.isEmpty
+                        && viewModel.deepSeekKeyDraft.isEmpty)
                 }
             }
         }
@@ -238,35 +274,56 @@ private struct TranscriptionSettingsTab: View {
     }
 
     @ViewBuilder
+    private var summaryFooter: some View {
+        if let provider = viewModel.resolvedSummaryProvider {
+            VStack(alignment: .leading, spacing: 4) {
+                if viewModel.settings.autoSummarize {
+                    Text("After each transcription, the transcript is sent to \(provider.displayName) for a summary.")
+                } else {
+                    Text("Summaries use \(provider.displayName). Turn this on to summarize every new transcript automatically.")
+                }
+                if provider != viewModel.settings.summaryProvider {
+                    Text("No \(viewModel.settings.summaryProvider.displayName) key is saved, so \(provider.displayName) is used.")
+                }
+            }
+        } else {
+            Text("Requires an OpenAI or DeepSeek API key.")
+        }
+    }
+
+    @ViewBuilder
     private func credentialRow(
         title: LocalizedStringKey,
-        provider: AIProvider,
-        healthID: String,
+        credential: CredentialProvider,
         draft: Binding<String>,
-        testTitle: LocalizedStringKey
+        testTitle: LocalizedStringKey,
+        fieldIdentifier: String? = nil,
+        testIdentifier: String? = nil
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(title)
                 Spacer()
-                credentialStatus(healthID: healthID)
+                credentialStatus(credential)
             }
             SecureField(title, text: draft, prompt: Text("Paste a key to save or replace it"))
                 .textFieldStyle(.roundedBorder)
                 .labelsHidden()
+                .accessibilityIdentifier(fieldIdentifier ?? "msr.settings.\(credential.rawValue)Key")
             HStack(spacing: 8) {
                 Button(testTitle) {
-                    lastTestedProvider = provider
-                    Task { await viewModel.testCredential(provider: provider) }
+                    lastTestedCredential = credential
+                    Task { await viewModel.testCredential(credential: credential) }
                 }
                 .controlSize(.small)
                 .disabled(viewModel.isTestingCredential)
-                if viewModel.isTestingCredential, lastTestedProvider == provider {
+                .accessibilityIdentifier(testIdentifier ?? "msr.settings.test\(credential.displayName)")
+                if viewModel.isTestingCredential, lastTestedCredential == credential {
                     ProgressView().controlSize(.small)
                 }
                 Spacer()
             }
-            if lastTestedProvider == provider, !viewModel.credentialStatusMessage.isEmpty, !viewModel.isTestingCredential {
+            if lastTestedCredential == credential, !viewModel.credentialStatusMessage.isEmpty, !viewModel.isTestingCredential {
                 Label {
                     Text.uiString(viewModel.credentialStatusMessage)
                         .textSelection(.enabled)
@@ -281,18 +338,16 @@ private struct TranscriptionSettingsTab: View {
         .padding(.vertical, 2)
     }
 
-    @ViewBuilder
-    private func credentialStatus(healthID: String) -> some View {
-        if let item = viewModel.setupHealthItem(id: healthID) {
-            let saved = item.severity == .success
-            StatusChip(
-                title: saved ? "Saved" : "Missing",
-                tone: saved ? .success : (item.severity == .info ? .neutral : .warning),
-                systemImage: saved ? "checkmark" : nil,
-                compact: true
-            )
-            .help(Text.uiString(item.detail))
-        }
+    /// Saved/Missing chip. A missing ElevenLabs key is a warning (it is the
+    /// default transcription provider); OpenAI and DeepSeek are optional.
+    private func credentialStatus(_ credential: CredentialProvider) -> some View {
+        let saved = viewModel.hasSavedCredential(credential)
+        return StatusChip(
+            title: saved ? "Saved" : "Missing",
+            tone: saved ? .success : (credential == .elevenLabs ? .warning : .neutral),
+            systemImage: saved ? "checkmark" : nil,
+            compact: true
+        )
     }
 }
 

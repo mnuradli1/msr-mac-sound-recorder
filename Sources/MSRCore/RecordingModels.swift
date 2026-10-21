@@ -58,6 +58,12 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
     /// existed; use `effectiveTitleSource` to read it with a legacy fallback.
     /// Adding it did not bump `schemaVersion`, so older builds still open the file.
     public var titleSource: RecordingTitleSource?
+    /// Display names for diarized speakers, keyed by the ORIGINAL label the
+    /// provider produced (e.g. `"Speaker 1": "Sarah"`). The transcript and
+    /// segments files already carry the display names; this map keeps the
+    /// original labels recoverable. `nil` when no speaker was renamed. Added
+    /// without a `schemaVersion` bump.
+    public var speakerNames: [String: String]?
 
     public init(
         schema: String = RecordingMetadata.currentSchema,
@@ -77,7 +83,8 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         segmentCount: Int? = nil,
         importedAt: Date? = nil,
         confidenceReport: RecordingConfidenceReport? = nil,
-        titleSource: RecordingTitleSource? = nil
+        titleSource: RecordingTitleSource? = nil,
+        speakerNames: [String: String]? = nil
     ) {
         self.schema = schema
         self.schemaVersion = schemaVersion
@@ -97,6 +104,7 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         self.importedAt = importedAt
         self.confidenceReport = confidenceReport
         self.titleSource = titleSource
+        self.speakerNames = speakerNames
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -104,6 +112,7 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         case startedAt, endedAt, durationSeconds, createdAt, updatedAt
         case recoveredAt, recoveryNote, segmentCount, importedAt, confidenceReport
         case titleSource
+        case speakerNames
     }
 
     public init(from decoder: Decoder) throws {
@@ -126,6 +135,7 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         importedAt = try container.decodeIfPresent(Date.self, forKey: .importedAt)
         confidenceReport = try container.decodeIfPresent(RecordingConfidenceReport.self, forKey: .confidenceReport)
         titleSource = try? container.decodeIfPresent(RecordingTitleSource.self, forKey: .titleSource)
+        speakerNames = (try? container.decodeIfPresent([String: String].self, forKey: .speakerNames)) ?? nil
     }
 
     /// `titleSource` when recorded; otherwise inferred from the name itself:
@@ -151,6 +161,8 @@ public struct RecordingItem: Equatable, Identifiable, Sendable {
     public var isImported: Bool { metadata.importedAt != nil }
     /// See `RecordingMetadata.effectiveTitleSource`.
     public var effectiveTitleSource: RecordingTitleSource { metadata.effectiveTitleSource }
+    /// Original speaker label → display name (empty when none were renamed).
+    public var speakerNames: [String: String] { metadata.speakerNames ?? [:] }
     public var storageBaseName: String {
         let value = metadata.storageKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? displayName : value

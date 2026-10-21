@@ -43,6 +43,14 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
     /// job completes (captured when the job is queued, so a later settings change
     /// does not retroactively apply). Decodes as `false` when absent.
     public var autoTitleRequested: Bool
+    /// Whether a summary should be generated once this job's transcript is
+    /// published (captured at queue time, like `autoTitleRequested`). Decodes
+    /// as `false` when absent.
+    public var autoSummarizeRequested: Bool
+    /// The transcription language hint (`TranscriptionLanguage.languageCode`)
+    /// captured when the job was queued; `nil` lets the provider auto-detect.
+    /// Jobs saved before this field existed decode as `nil`.
+    public var languageCode: String?
 
     public init(
         id: UUID = UUID(),
@@ -66,7 +74,9 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         usedUncompressedAudioFallback: Bool = false,
         audioPreparationWarning: String? = nil,
         origin: TranscriptionJobOrigin = .manual,
-        autoTitleRequested: Bool = false
+        autoTitleRequested: Bool = false,
+        autoSummarizeRequested: Bool = false,
+        languageCode: String? = nil
     ) {
         self.id = id
         self.recordingID = recordingID
@@ -90,6 +100,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         self.audioPreparationWarning = audioPreparationWarning
         self.origin = origin
         self.autoTitleRequested = autoTitleRequested
+        self.autoSummarizeRequested = autoSummarizeRequested
+        self.languageCode = languageCode
     }
 
     enum CodingKeys: String, CodingKey {
@@ -115,6 +127,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         case audioPreparationWarning
         case origin
         case autoTitleRequested
+        case autoSummarizeRequested
+        case languageCode
     }
 
     public init(from decoder: Decoder) throws {
@@ -141,6 +155,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         audioPreparationWarning = try container.decodeIfPresent(String.self, forKey: .audioPreparationWarning)
         origin = (try? container.decodeIfPresent(TranscriptionJobOrigin.self, forKey: .origin)) ?? .manual
         autoTitleRequested = try container.decodeIfPresent(Bool.self, forKey: .autoTitleRequested) ?? false
+        autoSummarizeRequested = try container.decodeIfPresent(Bool.self, forKey: .autoSummarizeRequested) ?? false
+        languageCode = try container.decodeIfPresent(String.self, forKey: .languageCode)
     }
 
     public static func start(
@@ -174,6 +190,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         trimEndSeconds: TimeInterval? = nil,
         origin: TranscriptionJobOrigin = .manual,
         autoTitleRequested: Bool = false,
+        autoSummarizeRequested: Bool = false,
+        languageCode: String? = nil,
         at date: Date = Date()
     ) -> TranscriptionJob {
         TranscriptionJob(
@@ -189,7 +207,9 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
             trimStartSeconds: trimStartSeconds.flatMap { $0 > 0 ? $0 : nil },
             trimEndSeconds: trimEndSeconds.flatMap { $0 > 0 ? $0 : nil },
             origin: origin,
-            autoTitleRequested: autoTitleRequested
+            autoTitleRequested: autoTitleRequested,
+            autoSummarizeRequested: autoSummarizeRequested,
+            languageCode: languageCode
         )
     }
 

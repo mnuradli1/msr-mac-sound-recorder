@@ -97,6 +97,10 @@ struct MSRMeetingRecorderApp: App {
                 Button("Copy Summary") { viewModel.copySummary() }
                     .disabled(!viewModel.hasSummary)
 
+                Button("Copy Meeting Notes") { viewModel.copyMeetingNotes() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(!viewModel.canCopyMeetingNotes)
+
                 Button("Save Notes") { viewModel.flushTranscriptEdits() }
                     .keyboardShortcut("s", modifiers: [.command])
                     .disabled(viewModel.selectedRecording == nil)

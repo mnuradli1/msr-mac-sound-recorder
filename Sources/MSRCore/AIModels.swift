@@ -16,6 +16,119 @@ public enum AIProvider: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Which API key a credential belongs to. Transcription providers
+/// (`AIProvider`) and text-model providers (`TextModelProvider`) both map onto
+/// it. `keychainAccount` values are the identifiers saved keys already use, so
+/// they must never change.
+public enum CredentialProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+    case elevenLabs, openAI, deepSeek
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .elevenLabs: "ElevenLabs"
+        case .openAI: "OpenAI"
+        case .deepSeek: "DeepSeek"
+        }
+    }
+
+    /// The exported variable read before the Keychain.
+    public var environmentVariableName: String {
+        switch self {
+        case .elevenLabs: "ELEVENLABS_API_KEY"
+        case .openAI: "OPENAI_API_KEY"
+        case .deepSeek: "DEEPSEEK_API_KEY"
+        }
+    }
+
+    /// The Keychain account (service `MSRMeetingRecorder`).
+    public var keychainAccount: String {
+        switch self {
+        case .elevenLabs: "elevenlabs"
+        case .openAI: "openai"
+        case .deepSeek: "deepseek"
+        }
+    }
+
+    public init(_ provider: AIProvider) {
+        switch provider {
+        case .elevenLabs: self = .elevenLabs
+        case .openAI: self = .openAI
+        }
+    }
+
+    /// The transcription provider using this credential, or `nil` for DeepSeek.
+    public var transcriptionProvider: AIProvider? {
+        switch self {
+        case .elevenLabs: .elevenLabs
+        case .openAI: .openAI
+        case .deepSeek: nil
+        }
+    }
+}
+
+extension AIProvider {
+    public var credentialProvider: CredentialProvider { CredentialProvider(self) }
+}
+
+/// The chat model used for summaries and remote titles (independent of the
+/// transcription provider).
+public enum TextModelProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+    case openAI = "openai"
+    case deepSeek = "deepseek"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .openAI: "OpenAI"
+        case .deepSeek: "DeepSeek"
+        }
+    }
+
+    public var credentialProvider: CredentialProvider {
+        switch self {
+        case .openAI: .openAI
+        case .deepSeek: .deepSeek
+        }
+    }
+
+    /// The other provider, tried when this one has no key.
+    public var alternative: TextModelProvider {
+        switch self {
+        case .openAI: .deepSeek
+        case .deepSeek: .openAI
+        }
+    }
+}
+
+/// The spoken language hint sent with transcription requests.
+public enum TranscriptionLanguage: String, Codable, CaseIterable, Identifiable, Sendable {
+    case automatic = "auto"
+    case english = "en"
+    case indonesian = "id"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .english: "English"
+        case .indonesian: "Bahasa Indonesia"
+        }
+    }
+
+    /// ISO-639-1 code for the provider, or `nil` to let it auto-detect.
+    public var languageCode: String? {
+        switch self {
+        case .automatic: nil
+        case .english: "en"
+        case .indonesian: "id"
+        }
+    }
+}
+
 public enum RecordingSortOrder: String, Codable, CaseIterable, Identifiable, Sendable {
     case newest, oldest, nameAscending, nameDescending, durationLongest, durationShortest
     public var id: String { rawValue }
@@ -73,6 +186,16 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// recording finishes (see `RecordingInteractionPolicy.shouldAutoTranscribe`).
     /// Defaults to `false`; settings saved before this key existed decode as `false`.
     public var autoTranscribe: Bool
+    /// When `true`, a summary is generated automatically after an
+    /// auto-transcribed (or any queued, per the view model) transcript is
+    /// published. Defaults to `false`.
+    public var autoSummarize: Bool
+    /// Preferred text model for summaries and remote titles. When its key is
+    /// missing the other provider is used if it has one
+    /// (`ProviderAIService.resolvedTextModelProvider`).
+    public var summaryProvider: TextModelProvider
+    /// Language hint for transcription; `.automatic` lets the provider detect it.
+    public var transcriptionLanguage: TranscriptionLanguage
     public var rememberCredentials: Bool
     public var showMenuBarControl: Bool
     public var globalShortcutEnabled: Bool
@@ -94,6 +217,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         compressUploads: true,
         autoTitle: true,
         autoTranscribe: false,
+        autoSummarize: false,
+        summaryProvider: .openAI,
+        transcriptionLanguage: .automatic,
         rememberCredentials: false,
         showMenuBarControl: true,
         globalShortcutEnabled: true,
@@ -116,6 +242,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         compressUploads: Bool = true,
         autoTitle: Bool = true,
         autoTranscribe: Bool = false,
+        autoSummarize: Bool = false,
+        summaryProvider: TextModelProvider = .openAI,
+        transcriptionLanguage: TranscriptionLanguage = .automatic,
         rememberCredentials: Bool = false,
         showMenuBarControl: Bool = true,
         globalShortcutEnabled: Bool = true,
@@ -136,6 +265,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.compressUploads = compressUploads
         self.autoTitle = autoTitle
         self.autoTranscribe = autoTranscribe
+        self.autoSummarize = autoSummarize
+        self.summaryProvider = summaryProvider
+        self.transcriptionLanguage = transcriptionLanguage
         self.rememberCredentials = rememberCredentials
         self.showMenuBarControl = showMenuBarControl
         self.globalShortcutEnabled = globalShortcutEnabled
@@ -147,7 +279,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case provider, recordingsFolderPath, recordingsFolderBookmark, preferredSource, microphoneDeviceID
         case sortOrder, silenceThreshold, playbackSpeed, theme, language, compressUploads, autoTitle
-        case autoTranscribe
+        case autoTranscribe, autoSummarize, summaryProvider, transcriptionLanguage
         case rememberCredentials, showMenuBarControl, globalShortcutEnabled, localAPIEnabled, windowWidth, windowHeight
     }
 
@@ -167,6 +299,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         compressUploads = try c.decodeIfPresent(Bool.self, forKey: .compressUploads) ?? defaults.compressUploads
         autoTitle = try c.decodeIfPresent(Bool.self, forKey: .autoTitle) ?? defaults.autoTitle
         autoTranscribe = try c.decodeIfPresent(Bool.self, forKey: .autoTranscribe) ?? defaults.autoTranscribe
+        autoSummarize = try c.decodeIfPresent(Bool.self, forKey: .autoSummarize) ?? defaults.autoSummarize
+        // `try?`: a provider/language written by a newer build falls back instead of failing all settings.
+        summaryProvider = (try? c.decodeIfPresent(TextModelProvider.self, forKey: .summaryProvider)) ?? defaults.summaryProvider
+        transcriptionLanguage = (try? c.decodeIfPresent(TranscriptionLanguage.self, forKey: .transcriptionLanguage)) ?? defaults.transcriptionLanguage
         rememberCredentials = try c.decodeIfPresent(Bool.self, forKey: .rememberCredentials) ?? defaults.rememberCredentials
         showMenuBarControl = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarControl) ?? defaults.showMenuBarControl
         globalShortcutEnabled = try c.decodeIfPresent(Bool.self, forKey: .globalShortcutEnabled) ?? defaults.globalShortcutEnabled
@@ -179,10 +315,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
 public struct TranscribeRequest: Codable, Equatable, Sendable {
     public var audioPath: String
     public var provider: AIProvider
+    /// Optional ISO-639-1 language hint (`TranscriptionLanguage.languageCode`);
+    /// absent or `nil` lets the provider auto-detect (requests without it still decode).
+    public var languageCode: String?
 
-    public init(audioPath: String, provider: AIProvider) {
+    public init(audioPath: String, provider: AIProvider, languageCode: String? = nil) {
         self.audioPath = audioPath
         self.provider = provider
+        self.languageCode = languageCode
     }
 }
 

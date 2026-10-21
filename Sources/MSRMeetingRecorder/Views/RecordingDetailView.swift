@@ -184,7 +184,7 @@ struct TitleBadge: View {
     }
 }
 
-/// The single next-step button (Transcribe → Summarize → Copy Summary) plus an
+/// The single next-step button (Transcribe → Summarize → Copy Meeting Notes) plus an
 /// overflow menu holding every secondary action.
 struct NextStepActions: View {
     @ObservedObject var viewModel: AppViewModel
@@ -239,6 +239,8 @@ struct NextStepActions: View {
                 .disabled(!viewModel.hasSummary)
             Button("Copy All", systemImage: "doc.on.doc.fill") { viewModel.copyAllNotes() }
                 .disabled(!viewModel.hasTranscript)
+            Button("Copy Meeting Notes", systemImage: "list.bullet.clipboard") { viewModel.copyMeetingNotes() }
+                .disabled(!viewModel.canCopyMeetingNotes)
         }
         Section {
             if viewModel.primaryAction != .summarize {
@@ -252,6 +254,8 @@ struct NextStepActions: View {
                 viewModel.transcribeSelectedRange()
             }
             .disabled(!viewModel.canRunPrimaryAction)
+            Button("Reset speaker names", systemImage: "person.2.badge.gearshape") { viewModel.resetSpeakerNames() }
+                .disabled(!viewModel.selectedRecordingHasSpeakerNames || !viewModel.canRenameSpeakers)
         }
         Section {
             Menu("Save Transcript") {

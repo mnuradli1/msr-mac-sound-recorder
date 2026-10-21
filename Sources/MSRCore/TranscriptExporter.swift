@@ -104,6 +104,125 @@ public enum TranscriptExporter {
         """
     }
 
+    /// Shareable meeting notes:
+    ///
+    /// ```
+    /// # <title>
+    ///
+    /// <date> · <duration> · <source>
+    ///
+    /// ## Summary
+    /// <summary markdown, minus its Action Items section; "_No summary yet._" when empty>
+    ///
+    /// ## Action Items            (only when the summary has an "Action Items" section)
+    /// <that section's body>
+    ///
+    /// ## Transcript
+    /// **[00:01:05] Sarah:** text  (timestamps when the segments have them)
+    /// ```
+    ///
+    /// The transcript uses the saved segments while they still match the text
+    /// (`TranscriptParser.readableTranscript`); after edits it falls back to
+    /// the speaker blocks of the edited text (no times), or the plain text.
+    public static func meetingNotesMarkdown(_ input: MeetingNotesExportInput) -> String {
+        let recording = input.recording
+        let metadataLine = [
+            recording.startedAt.formatted(date: .abbreviated, time: .shortened),
+            timestamp(recording.durationSeconds),
+            recording.source.displayName
+        ].joined(separator: " · ")
+
+        let summary = input.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let split = splitActionItems(from: summary)
+        let summaryBody: String
+        if summary.isEmpty {
+            summaryBody = "_No summary yet._"
+        } else if split.summary.isEmpty, split.actionItems != nil {
+            // Only action items: they are listed once, in their own section.
+            summaryBody = "_No summary beyond the action items below._"
+        } else {
+            summaryBody = demotingHeadings(split.summary.isEmpty ? summary : split.summary, toAtLeast: 3)
+        }
+        var sections = [
+            "# \(recording.displayName)",
+            metadataLine,
+            "## Summary",
+            summaryBody
+        ]
+        if let actionItems = split.actionItems {
+            sections.append("## Action Items")
+            sections.append(demotingHeadings(actionItems, toAtLeast: 3))
+        }
+        sections.append("## Transcript")
+        let transcript = notesTranscript(input)
+        sections.append(transcript.isEmpty ? "_No transcript yet._" : transcript)
+        return sections.joined(separator: "\n\n") + "\n"
+    }
+
+    /// The summary without its `Action Items` heading section, and that
+    /// section's body (`nil` when absent or empty). Matches any heading level,
+    /// case-insensitively; the section ends at the next heading of the same or a
+    /// higher level.
+    static func splitActionItems(from summary: String) -> (summary: String, actionItems: String?) {
+        let lines = summary.components(separatedBy: "\n")
+        guard let start = lines.firstIndex(where: { headingLevel($0).map { $0.title.lowercased() == "action items" } ?? false }),
+              let level = headingLevel(lines[start])?.level else {
+            return (summary, nil)
+        }
+        let end = lines[(start + 1)...].firstIndex { line in
+            guard let heading = headingLevel(line) else { return false }
+            return heading.level <= level
+        } ?? lines.endIndex
+        let body = lines[(start + 1)..<end].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return (summary, nil) }
+        let remaining = (Array(lines[..<start]) + Array(lines[end...]))
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (remaining, body)
+    }
+
+    /// Shifts every Markdown heading in `markdown` down by the same number of
+    /// levels so the highest one is at least `minimumLevel` (capped at `######`),
+    /// keeping the summary's own structure under the notes' `##` sections.
+    static func demotingHeadings(_ markdown: String, toAtLeast minimumLevel: Int) -> String {
+        let lines = markdown.components(separatedBy: "\n")
+        guard let highest = lines.compactMap({ headingLevel($0)?.level }).min(), highest < minimumLevel else {
+            return markdown
+        }
+        let shift = minimumLevel - highest
+        return lines.map { line in
+            guard let level = headingLevel(line)?.level else { return line }
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            let newLevel = min(6, level + shift)
+            return String(repeating: "#", count: newLevel) + trimmed.dropFirst(level)
+        }.joined(separator: "\n")
+    }
+
+    private static func headingLevel(_ line: String) -> (level: Int, title: String)? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let hashes = trimmed.prefix(while: { $0 == "#" }).count
+        guard (1...6).contains(hashes) else { return nil }
+        let rest = trimmed.dropFirst(hashes)
+        guard rest.first == " " else { return nil }
+        let title = rest
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ":*_ "))
+        return (hashes, title)
+    }
+
+    private static func notesTranscript(_ input: MeetingNotesExportInput) -> String {
+        let text = input.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let readable = TranscriptParser.readableTranscript(saved: input.segments, transcript: text)
+        let segments = readable.segments.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard segments.contains(where: { !$0.speaker.isEmpty }) else { return text }
+        return segments.map { segment in
+            let body = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let time = segment.startTime.map { "[\(timestamp($0))] " } ?? ""
+            guard !segment.speaker.isEmpty else { return time.isEmpty ? body : "**\(time.trimmingCharacters(in: .whitespaces))** \(body)" }
+            return "**\(time)\(segment.speaker):** \(body)"
+        }.joined(separator: "\n\n")
+    }
+
     private static func srt(_ segments: [TranscriptSegment]) throws -> String {
         let timestamped = segments.filter { $0.startTime != nil && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !timestamped.isEmpty else { throw TranscriptExportError.timestampsRequired }

@@ -28,6 +28,7 @@ struct MSRTestRunner {
             try await testLocalHTTPServerHealthEndpoint()
             try testAPIKeyNormalizerRemovesPasteWhitespace()
             try testCredentialValidatorBuildsProviderRequests()
+            try testTextModelProvidersAndCredentials()
             try testWaveformBufferClampsAndRollsSamples()
             try testRecordingCaptureStrategyUsesMixdownForMicAndSystem()
             try testRecordingLibraryDeletesAudioAndSidecars()
@@ -52,6 +53,8 @@ struct MSRTestRunner {
             try await testAudioTrackMixerConcatenatesSegmentsSequentially()
             try await testAudioTrackMixerExportsSingleTrack()
             try await testTranscriptPublisherAutoTitlesDefaultRecording()
+            try await testTranscriptPublisherAutoSummarizes()
+            try testSpeakerRenameFlowsIntoTranscriptAndMeetingNotes()
             try await testLiveElevenLabsAutoTranscribeAndTitle()
             TemporaryFolder.removeAll()
             print("MSRTestRunner: all tests passed")
@@ -573,6 +576,32 @@ private func testCredentialValidatorBuildsProviderRequests() throws {
     let openAIRequest = try CredentialValidator.validationRequest(provider: .openAI, apiKey: "demo_key")
     try expect(openAIRequest.url?.absoluteString == "https://api.openai.com/v1/models", "OpenAI validation should use models endpoint")
     try expect(openAIRequest.value(forHTTPHeaderField: "Authorization") == "Bearer demo_key", "OpenAI validation should set bearer token")
+
+    let deepSeekRequest = try CredentialValidator.validationRequest(credential: .deepSeek, apiKey: "demo_key")
+    try expect(deepSeekRequest.url?.absoluteString == "https://api.deepseek.com/models", "DeepSeek validation should use models endpoint")
+    try expect(deepSeekRequest.httpMethod == "GET", "DeepSeek validation should GET models")
+    try expect(deepSeekRequest.value(forHTTPHeaderField: "Authorization") == "Bearer demo_key", "DeepSeek validation should set bearer token")
+}
+
+/// Uses session keys only, so no Keychain item is ever read from this unsigned binary.
+private func testTextModelProvidersAndCredentials() throws {
+    try expect(TextModelProvider.deepSeek.credentialProvider.environmentVariableName == "DEEPSEEK_API_KEY", "DeepSeek reads DEEPSEEK_API_KEY")
+    try expect(AIProvider.openAI.credentialProvider.keychainAccount == "openai", "OpenAI Keychain account must stay \"openai\"")
+    try expect(AppSettings.default.summaryProvider == .openAI && !AppSettings.default.autoSummarize, "1.2 settings defaults")
+    try expect(TranscriptionLanguage.indonesian.languageCode == "id" && TranscriptionLanguage.automatic.languageCode == nil, "language codes")
+
+    let keyStore = APIKeyStore(environment: [:])
+    try keyStore.setSession(apiKey: "ds-session", for: .deepSeek)
+    let service = ProviderAIService(keyStore: keyStore, textModelProvider: .deepSeek)
+    try expect(service.resolvedTextModelProvider == .deepSeek, "selected DeepSeek with a key resolves to DeepSeek")
+    try expect(service.canSummarize && service.canGenerateTitlesRemotely, "a DeepSeek key enables summaries and remote titles")
+    try keyStore.setSession(apiKey: "oa-session", for: .openAI)
+    service.textModelProvider = .openAI
+    try expect(service.resolvedTextModelProvider == .openAI, "selected OpenAI with a key resolves to OpenAI")
+    try expect(
+        TranscriptionErrorMessage.message(for: ProviderError.missingAPIKey(ProviderError.textModelKeyNames)).contains("OpenAI or DeepSeek"),
+        "missing summary key message names both providers"
+    )
 }
 
 private func testWaveformBufferClampsAndRollsSamples() throws {
@@ -1216,6 +1245,112 @@ private func testTranscriptPublisherAutoTitlesDefaultRecording() async throws {
     )
 }
 
+@MainActor
+private func testTranscriptPublisherAutoSummarizes() async throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let wav = folder.url.appendingPathComponent("capture.wav")
+    try writeToneWAV(to: wav, frequency: 440, duration: 1)
+    let recording = try library.finishRecording(
+        temporaryAudioURL: wav,
+        requestedName: "Meeting 2026-06-29 14.05",
+        source: .micAndSystem,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 160)
+    )
+    let service = FakeAIService()
+    let decoded = TranscribeResponse(text: "Speaker 1:\nWe confirmed the launch checklist.", provider: .elevenLabs, languageCode: "en")
+    var job = TranscriptionJob.queue(
+        recordingID: recording.id,
+        recordingName: recording.displayName,
+        audioFileName: recording.audioURL.lastPathComponent,
+        provider: .elevenLabs,
+        origin: .automatic,
+        autoTitleRequested: true,
+        autoSummarizeRequested: true
+    )
+    job.markRunning()
+    let result = try await TranscriptPublisher.publish(
+        job: job,
+        recording: recording,
+        decoded: decoded,
+        autoTitleRequested: true,
+        library: library,
+        titleGenerator: { transcript in try await service.generateTitle(transcript: transcript) },
+        summarizer: { transcript in try await service.summarize(transcript: transcript) }
+    )
+    try expect(result.job.status == .completed, "auto-summarize publish should complete the job")
+    try expect(result.summaryError == nil, "auto-summarize should succeed: \(String(describing: result.summaryError))")
+    try expect(result.recording.displayName == "Fake Generated Title", "auto-title should still apply before the summary")
+    let summary = try String(contentsOf: result.recording.summaryURL, encoding: .utf8)
+    try expect(summary.contains("## Action Items"), "summary should be written next to the renamed recording")
+
+    // A second auto-summary never replaces the summary the recording already has.
+    let kept = try await TranscriptPublisher.publish(
+        job: job,
+        recording: result.recording,
+        decoded: decoded,
+        autoTitleRequested: false,
+        library: library,
+        summarizer: { _ in SummarizeResponse(markdown: "## Replacement") }
+    )
+    try expect(kept.summarySkippedReason == TranscriptPublisher.existingSummaryKept, "an existing summary should be kept")
+    let keptSummary = try String(contentsOf: kept.recording.summaryURL, encoding: .utf8)
+    try expect(keptSummary == summary, "the existing summary must not be overwritten")
+
+    let cleared = try library.clearSummary(for: kept.recording)
+    let failing = try await TranscriptPublisher.publish(
+        job: job,
+        recording: cleared,
+        decoded: decoded,
+        autoTitleRequested: false,
+        library: library,
+        summarizer: { _ in throw ProviderError.missingAPIKey(ProviderError.textModelKeyNames) }
+    )
+    try expect(failing.job.status == .completed && failing.summaryError != nil, "a summary failure must not fail the job")
+}
+
+private func testSpeakerRenameFlowsIntoTranscriptAndMeetingNotes() throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let wav = folder.url.appendingPathComponent("capture.wav")
+    try writeToneWAV(to: wav, frequency: 440)
+    let recording = try library.finishRecording(
+        temporaryAudioURL: wav,
+        requestedName: "Launch Review",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 160)
+    )
+    let transcript = "Speaker 1:\nShip Friday.\n\nSpeaker 2:\nI'll update the checklist."
+    var segments = TranscriptParser.segments(from: transcript)
+    segments[0].startTime = 0
+    segments[1].startTime = 12
+    let published = try library.writeTranscriptBundle(transcript, segments: segments, for: recording)
+
+    _ = try library.renameSpeaker(published, label: "Speaker 1", to: "Sarah")
+    let renamed = try library.renameSpeaker(published, label: "Sarah", to: "Sarah Lee")
+    try expect(renamed.speakerNames == ["Speaker 1": "Sarah Lee"], "re-rename should update the mapping keyed by the original label")
+    let text = try String(contentsOf: renamed.transcriptURL, encoding: .utf8)
+    try expect(text.hasPrefix("Sarah Lee:\nShip Friday."), "transcript headers should use the speaker name")
+    let savedSegments = library.loadTranscriptSegments(for: renamed)
+    try expect(savedSegments.map(\.speaker) == ["Sarah Lee", "Speaker 2"], "segments should use the speaker name")
+
+    let notes = TranscriptExporter.meetingNotesMarkdown(MeetingNotesExportInput(
+        recording: renamed,
+        transcript: text,
+        segments: savedSegments,
+        summary: "## Brief Summary\nFriday launch.\n\n## Action Items\n- Speaker 2: update the checklist"
+    ))
+    try expect(notes.hasPrefix("# Launch Review\n"), "meeting notes should start with the title")
+    try expect(notes.contains("## Action Items\n\n- Speaker 2: update the checklist"), "meeting notes should extract action items")
+    try expect(notes.contains("**[00:00:00] Sarah Lee:** Ship Friday."), "meeting notes transcript should be speaker-labelled and timestamped")
+
+    let reverted = try library.renameSpeaker(renamed, label: "Speaker 1", to: "")
+    try expect(reverted.metadata.speakerNames == nil, "an empty name should revert to the original label")
+    try expect((try? String(contentsOf: reverted.transcriptURL, encoding: .utf8)) == transcript, "revert should restore the original transcript")
+}
+
 /// Real ElevenLabs round trip. Runs only with `MSR_LIVE_E2E=1` and
 /// `ELEVENLABS_API_KEY` set; never prints the key.
 @MainActor
@@ -1257,14 +1392,16 @@ private func testLiveElevenLabsAutoTranscribeAndTitle() async throws {
     // CLI binary blocks on a macOS authorization prompt).
     let keyStore = APIKeyStore()
     try keyStore.setSession(apiKey: key, for: .elevenLabs)
-    let remoteTitles: Bool
+    var textModel: TextModelProvider?
     if let openAIKey = environment["OPENAI_API_KEY"], APIKeyNormalizer.normalized(openAIKey) != nil {
         try keyStore.setSession(apiKey: openAIKey, for: .openAI)
-        remoteTitles = true
-    } else {
-        remoteTitles = false
+        textModel = .openAI
+    } else if let deepSeekKey = environment["DEEPSEEK_API_KEY"], APIKeyNormalizer.normalized(deepSeekKey) != nil {
+        try keyStore.setSession(apiKey: deepSeekKey, for: .deepSeek)
+        textModel = .deepSeek
     }
-    let service = ProviderAIService(keyStore: keyStore)
+    let remoteTitles = textModel != nil
+    let service = ProviderAIService(keyStore: keyStore, textModelProvider: textModel ?? .openAI)
     var job = TranscriptionJob.queue(
         recordingID: recording.id,
         recordingName: recording.displayName,
@@ -1281,20 +1418,33 @@ private func testLiveElevenLabsAutoTranscribeAndTitle() async throws {
         compressionEnabled: true
     )
     defer { prepared.cleanUp() }
-    let decoded = try await service.transcribe(audioURL: prepared.url, provider: .elevenLabs)
+    // The clip is English: exercise the 1.2 language hint end to end.
+    let decoded = try await service.transcribe(
+        audioURL: prepared.url,
+        provider: .elevenLabs,
+        languageCode: TranscriptionLanguage.english.languageCode
+    )
+    try expect(decoded.languageCode?.lowercased().hasPrefix("en") == true, "live transcript should honor the English hint: \(decoded.languageCode ?? "nil")")
     var titleGenerator: TranscriptPublisher.TitleGenerator?
+    var summarizer: TranscriptPublisher.Summarizer?
     if remoteTitles {
         titleGenerator = { transcript -> String? in try await service.generateTitle(transcript: transcript) }
+        summarizer = { transcript in try await service.summarize(transcript: transcript) }
     }
+    job.autoSummarizeRequested = summarizer != nil
     let result = try await TranscriptPublisher.publish(
         job: job,
         recording: recording,
         decoded: decoded,
         autoTitleRequested: true,
         library: library,
-        titleGenerator: titleGenerator
+        titleGenerator: titleGenerator,
+        summarizer: summarizer
     )
 
+    if summarizer != nil {
+        print("live E2E: summary \(result.summaryMarkdown?.count ?? 0) chars via \(textModel?.displayName ?? "-")\(result.summaryError.map { ", error: \($0.localizedDescription)" } ?? "")")
+    }
     print("live E2E: transcript \(decoded.text.count) chars, \(result.segments.count) segments")
     print("live E2E: title \"\(titleBefore)\" -> \"\(result.recording.displayName)\" (source: \(result.titleSource.rawValue), remote: \(titleGenerator != nil))")
     if let note = result.titleNote { print("live E2E: title note: \(note)") }
