@@ -60,25 +60,20 @@ extension AppViewModel {
         ].filter { !$0.recordings.isEmpty }
     }
 
-    /// Badges for a sidebar row. Single source of truth so new artifacts
-    /// (e.g. an auto-generated title) only need a new `RecordingBadge` case here.
+    /// Badges for a sidebar row, from the facts precomputed at library load
+    /// (`recordingRowFacts`); never touches the disk.
     func rowBadges(for recording: RecordingItem) -> [RecordingBadge] {
-        var badges: [RecordingBadge] = []
-        if recording.metadata.confidenceReport?.hasWarnings == true { badges.append(.warning) }
-        if FileManager.default.fileExists(atPath: recording.transcriptURL.path) { badges.append(.transcript) }
-        if FileManager.default.fileExists(atPath: recording.summaryURL.path) { badges.append(.summary) }
-        if recording.isRecovered { badges.append(.recovered) }
-        if recording.isImported { badges.append(.imported) }
-        if recording.effectiveTitleSource == .generated { badges.append(.autoTitled) }
-        return badges
+        recordingRowFacts[recording.id]?.badges
+            ?? RecordingRowFacts(recording: recording, hasTranscript: false, hasSummary: false).badges
     }
 
     /// Transcription job chip for a sidebar row (single `jobStatusText` path).
     /// `isAutomatic` marks jobs queued by auto-transcribe; the row draws a
     /// separate "Auto" chip so each title stays one localizable key.
+    /// In-memory only (`job(for:)`): evaluated for every row on every render.
     func jobChip(for recording: RecordingItem) -> (title: String, tone: Tone, isAutomatic: Bool)? {
         guard let text = transcriptionStatusText(for: recording) else { return nil }
-        let status = transcriptionJobs.first { $0.recordingID == recording.id }?.status
+        let status = job(for: recording.id)?.status
         return (text, status == .failed ? .warning : .progress, isAutomaticTranscription(for: recording))
     }
 
@@ -112,13 +107,10 @@ extension AppViewModel {
             || selectedRecordingIsSummarizing
     }
 
-    /// What Read mode shows: the saved (timed) segments while they still match
-    /// the transcript text, otherwise speaker blocks rebuilt from the edited
-    /// text. The segments file is left alone; it keeps the SRT timestamps.
-    var readModeTranscript: ReadableTranscript {
-        TranscriptParser.readableTranscript(saved: transcriptSegments, transcript: transcriptText)
-    }
-
+    /// What Read mode shows (`readModeTranscript`, cached in `AppViewModel`):
+    /// the saved (timed) segments while they still match the transcript text,
+    /// otherwise speaker blocks rebuilt from the edited text. The segments file
+    /// is left alone; it keeps the SRT timestamps.
     var readModeSegments: [TranscriptSegment] {
         readModeTranscript.segments
     }
@@ -192,5 +184,28 @@ extension AppViewModel {
     var localAPIStatusSummary: String? {
         guard settings.localAPIEnabled, !localAPIStatusMessage.isEmpty else { return nil }
         return localAPIStatusMessage.components(separatedBy: " · token").first
+    }
+}
+
+/// Per-recording sidebar facts, computed once per library load (and when the
+/// app writes a sidecar) instead of on every row render.
+struct RecordingRowFacts: Equatable {
+    let hasTranscript: Bool
+    let hasSummary: Bool
+    /// Single source of truth for row badges, so new artifacts (e.g. an
+    /// auto-generated title) only need a new `RecordingBadge` case here.
+    let badges: [RecordingBadge]
+
+    init(recording: RecordingItem, hasTranscript: Bool, hasSummary: Bool) {
+        self.hasTranscript = hasTranscript
+        self.hasSummary = hasSummary
+        var badges: [RecordingBadge] = []
+        if recording.metadata.confidenceReport?.hasWarnings == true { badges.append(.warning) }
+        if hasTranscript { badges.append(.transcript) }
+        if hasSummary { badges.append(.summary) }
+        if recording.isRecovered { badges.append(.recovered) }
+        if recording.isImported { badges.append(.imported) }
+        if recording.effectiveTitleSource == .generated { badges.append(.autoTitled) }
+        self.badges = badges
     }
 }

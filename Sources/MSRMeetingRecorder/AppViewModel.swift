@@ -6,7 +6,6 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import MSRCore
-import MSRPresentation
 import MSRServices
 
 enum AppNoticeSeverity {
@@ -33,8 +32,11 @@ struct SetupHealthItem: Identifiable, Equatable {
 
 @MainActor
 final class AppViewModel: ObservableObject {
-    let presentation: PresentationCoordinator
     @Published var recordings: [RecordingItem] = []
+    /// What the sidebar rows draw for each recording (transcript/summary
+    /// presence and badges). Rebuilt once per library load and updated when
+    /// the app writes a sidecar, so rendering a row never touches the disk.
+    @Published private(set) var recordingRowFacts: [UUID: RecordingRowFacts] = [:]
     @Published var selectedRecording: RecordingItem?
     @Published var selectedSource: AudioSource = .micAndSystem
     @Published var settings: AppSettings
@@ -49,7 +51,9 @@ final class AppViewModel: ObservableObject {
             )
         }
     }
-    @Published var transcriptText = ""
+    @Published var transcriptText = "" {
+        didSet { readModeCache = nil }
+    }
     @Published var summaryText = ""
     @Published var recordingSearchQuery = ""
     @Published var renameDraft = ""
@@ -57,18 +61,21 @@ final class AppViewModel: ObservableObject {
     @Published var elevenLabsKeyDraft = ""
     @Published var openAIKeyDraft = ""
     @Published var deepSeekKeyDraft = ""
-    @Published var inputLevel: Float = 0
     @Published var microphoneLevel: Float = 0
     @Published var systemLevel: Float = 0
-    @Published var waveform = WaveformBuffer(capacity: 36)
     @Published var isPlaying = false
     @Published var playbackPosition: TimeInterval = 0
     @Published var playbackDuration: TimeInterval = 0
     @Published var recordingElapsed: TimeInterval = 0
     @Published var transcriptionStartedAt: Date?
     @Published var selectedTranscriptionJob: TranscriptionJob?
-    @Published var transcriptionJobs: [TranscriptionJob] = []
-    @Published var transcriptSegments: [TranscriptSegment] = []
+    /// The single in-memory source for job state in render paths (see `job(for:)`).
+    @Published var transcriptionJobs: [TranscriptionJob] = [] {
+        didSet { jobsByRecordingID = Self.latestJobByRecording(transcriptionJobs) }
+    }
+    @Published var transcriptSegments: [TranscriptSegment] = [] {
+        didSet { readModeCache = nil }
+    }
     @Published var reviewWaveform: [Float] = []
     @Published var trimStartSeconds: TimeInterval = 0
     @Published var trimEndSeconds: TimeInterval = 0
@@ -159,6 +166,15 @@ final class AppViewModel: ObservableObject {
     private let searchIndexer = RecordingSearchIndexer(capacity: 64)
     private var searchIndexTask: Task<Void, Never>?
     private var watchedFolderPath: String?
+    /// The library folder as of the last load, patched for the app's own
+    /// writes since; folder-watcher events that leave it unchanged are ignored.
+    private(set) var libraryFolderSnapshot: LibraryFolderSnapshot?
+    /// `transcriptionJobs` indexed by recording (the first, i.e. most recently
+    /// updated, job of each recording).
+    private var jobsByRecordingID: [UUID: TranscriptionJob] = [:]
+    /// Parsed Read-mode transcript; cleared whenever the transcript text or
+    /// segments change (not published: it is derived state).
+    private var readModeCache: ReadableTranscript?
     private var didBootstrap = false
     /// The settings whose side effects (hotkey, watcher, health, local API) were
     /// last applied; `saveSettings()` only re-runs a side effect when its inputs change.
@@ -190,7 +206,6 @@ final class AppViewModel: ObservableObject {
         let loadedSettings = settingsStore.load()
         settings = loadedSettings
         lastAppliedSettings = loadedSettings
-        presentation = PresentationCoordinator(settings: loadedSettings)
         self.recorder = recorder ?? Self.makeDefaultRecorder()
         self.libraryFactory = libraryFactory
         self.recordingsFolderOverride = recordingsFolderOverride
@@ -213,11 +228,8 @@ final class AppViewModel: ObservableObject {
                 }
             }
         }
-        self.recorder.onLevelUpdate = { [weak self] level in
-            Task { @MainActor in
-                self?.updateFallbackInputLevel(level)
-            }
-        }
+        // `onLevelUpdate` (the combined level) is not installed: no view reads
+        // it, and each report would cost a main-actor hop and a model publish.
         self.recorder.onSourceLevelUpdate = { [weak self] channel, level in
             Task { @MainActor in
                 self?.updateSourceLevel(channel, level)
@@ -225,7 +237,6 @@ final class AppViewModel: ObservableObject {
         }
         // `onCaptureFailure` is installed per capture segment (see `installCaptureFailureHandler`).
         lastAppliedSettings = settings
-        bindPresentationModels()
     }
 
     private static func makeDefaultRecorder() -> AudioRecording {
@@ -244,42 +255,6 @@ final class AppViewModel: ObservableObject {
                 await self?.handleCaptureFailure(error, sessionID: sessionID, segmentFileName: segmentFileName)
             }
         }
-    }
-
-    private func bindPresentationModels() {
-        $recordings.assign(to: &presentation.library.$recordings)
-        $selectedRecording.assign(to: &presentation.library.$selectedRecording)
-        $recordingSearchQuery.assign(to: &presentation.library.$searchQuery)
-        $renameDraft.assign(to: &presentation.library.$renameDraft)
-        $showingRename.assign(to: &presentation.library.$showingRename)
-
-        $selectedSource.assign(to: &presentation.recordingSession.$selectedSource)
-        $workflowState.assign(to: &presentation.recordingSession.$workflowState)
-        $inputLevel.assign(to: &presentation.recordingSession.$inputLevel)
-        $microphoneLevel.assign(to: &presentation.recordingSession.$microphoneLevel)
-        $systemLevel.assign(to: &presentation.recordingSession.$systemLevel)
-        $waveform.assign(to: &presentation.recordingSession.$waveform)
-        $recordingElapsed.assign(to: &presentation.recordingSession.$elapsed)
-
-        $isPlaying.assign(to: &presentation.playback.$isPlaying)
-        $playbackPosition.assign(to: &presentation.playback.$position)
-        $playbackDuration.assign(to: &presentation.playback.$duration)
-        $reviewWaveform.assign(to: &presentation.playback.$waveform)
-        $trimStartSeconds.assign(to: &presentation.playback.$trimStart)
-        $trimEndSeconds.assign(to: &presentation.playback.$trimEnd)
-
-        $transcriptionJobs.assign(to: &presentation.queue.$jobs)
-        $selectedTranscriptionJob.assign(to: &presentation.queue.$selectedJob)
-        $transcriptionStartedAt.assign(to: &presentation.queue.$startedAt)
-
-        $transcriptText.assign(to: &presentation.notes.$transcript)
-        $summaryText.assign(to: &presentation.notes.$summary)
-        $transcriptSegments.assign(to: &presentation.notes.$segments)
-        $selectedExportFormat.assign(to: &presentation.notes.$exportFormat)
-        $exportPreview.assign(to: &presentation.notes.$exportPreview)
-        $transcriptSaveMessage.assign(to: &presentation.notes.$saveMessage)
-        $lastExportURL.assign(to: &presentation.notes.$lastExportURL)
-        $settings.assign(to: &presentation.settings.$settings)
     }
 
     var isRecording: Bool {
@@ -525,7 +500,7 @@ final class AppViewModel: ObservableObject {
     /// Whether the recording's latest transcription job was queued by auto-transcribe.
     func isAutomaticTranscription(for recording: RecordingItem) -> Bool {
         // In-memory only: this is evaluated per row while rendering.
-        transcriptionJobs.first { $0.recordingID == recording.id }?.origin == .automatic
+        job(for: recording.id)?.origin == .automatic
     }
 
     /// Auto-transcribe is switched on AND the current provider has an API key.
@@ -694,9 +669,24 @@ final class AppViewModel: ObservableObject {
         await recoverInterruptedRecordings()
     }
 
-    func loadRecordings() {
+    /// - Parameter folderSnapshot: the folder listing to treat as "before the
+    ///   load" (the folder watcher passes the one it just took); `nil` takes one.
+    func loadRecordings(folderSnapshot: LibraryFolderSnapshot? = nil) {
         do {
-            recordings = try library().loadRecordings()
+            let recordingLibrary = library()
+            // Taken before the load: a change landing in between is loaded now
+            // and, because the snapshot predates it, also reloaded once more.
+            let before = folderSnapshot ?? LibraryFolderSnapshot.capture(folderURL: recordingLibrary.folderURL)
+            let loaded = try recordingLibrary.loadRecordings()
+            libraryFolderSnapshot = before
+            // Journal replay during the load can move sidecars; list again then.
+            let listing = before.flatMap { Self.hasPendingJournal($0) ? nil : $0 }
+                ?? LibraryFolderSnapshot.capture(folderURL: recordingLibrary.folderURL)
+            recordingRowFacts = Dictionary(
+                loaded.map { ($0.id, Self.rowFacts(for: $0, listing: listing)) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            recordings = loaded
             recordingSearchDocuments = recordings.map { RecordingSearchDocument(recording: $0) }
             searchIndexTask?.cancel()
             let snapshot = recordings
@@ -1014,7 +1004,13 @@ final class AppViewModel: ObservableObject {
         statusMessage = "Checking interrupted recordings"
         do {
             let results = try await RecordingRecoveryService(folderURL: recordingsFolderURL).recoverInterruptedRecordings()
-            loadRecordings()
+            // Nothing recovered and the folder is as last loaded (the usual
+            // launch): the library `bootstrap` just loaded is still current.
+            let folderUnchanged = results.isEmpty && libraryFolderSnapshot != nil
+                && LibraryFolderSnapshot.capture(folderURL: library().folderURL) == libraryFolderSnapshot
+            if !folderUnchanged {
+                loadRecordings()
+            }
             let recovered = results.compactMap(\.recording)
             let failedCount = results.filter { if case .failed = $0.status { return true }; return false }.count
             let hasWarnings = results.contains { !$0.warnings.isEmpty || !$0.failedFiles.isEmpty }
@@ -1474,7 +1470,7 @@ final class AppViewModel: ObservableObject {
         guard let target else { return }
         // A transcription or summary still writing to the recording would
         // otherwise leave orphan files behind (or fail late).
-        if hasPendingTranscription(for: target.id) {
+        if hasPendingTranscriptionReadingDiskIfNeeded(for: target.id) {
             statusMessage = L("Wait for the transcription to finish (or cancel it) before deleting this recording.")
             return
         }
@@ -1544,7 +1540,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func cancelTranscription(recordingID: UUID) {
-        guard var job = job(for: recordingID),
+        guard var job = jobReadingDiskIfNeeded(for: recordingID),
               job.status == .queued || job.status == .running else { return }
         if job.status == .running {
             transcriptionQueueTask?.cancel()
@@ -1552,6 +1548,7 @@ final class AppViewModel: ObservableObject {
         job.markCancelled()
         do {
             try transcriptionJobStore().save(job)
+            noteOwnJobWrite(job)
             loadTranscriptionJobs()
             statusMessage = "Transcription cancelled"
         } catch {
@@ -1651,9 +1648,9 @@ final class AppViewModel: ObservableObject {
         }
         do {
             let decoded = try await aiService.summarize(transcript: transcript)
-            _ = try library().writeSummary(decoded.markdown, for: selectedRecording)
+            let written = try library().writeSummary(decoded.markdown, for: selectedRecording)
             summaryProviderByRecording[targetID] = provider
-            refreshSearchDocument(for: selectedRecording)
+            noteSidecarsChanged(for: written)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 summaryText = decoded.markdown
                 // Our own write: the next library refresh must not reload over it.
@@ -1925,6 +1922,7 @@ final class AppViewModel: ObservableObject {
         do {
             let updated = try library().writeTranscript(transcriptText, for: recording)
             selectedRecording = updated
+            noteSidecarsChanged(for: updated)
             // Our own write: the next library refresh must not reload over it.
             if lastLoadedSidecarStamp?.recordingID == updated.id {
                 lastLoadedSidecarStamp = sidecarStamp(for: updated)
@@ -1957,7 +1955,8 @@ final class AppViewModel: ObservableObject {
         if summaryText.isEmpty, !FileManager.default.fileExists(atPath: recording.summaryURL.path) { return }
         if (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) == summaryText { return }
         do {
-            _ = try library().writeSummary(summaryText, for: recording)
+            let updated = try library().writeSummary(summaryText, for: recording)
+            noteSidecarsChanged(for: updated)
             if lastLoadedSidecarStamp?.recordingID == recording.id {
                 lastLoadedSidecarStamp = sidecarStamp(for: recording)
             }
@@ -2069,9 +2068,13 @@ final class AppViewModel: ObservableObject {
         guard watchedFolderPath != folder.path else { return }
         watchedFolderPath = folder.path
         try? folderWatcher.start(folderURL: folder) { [weak self] in
+            // Listed on the watcher queue, off the main thread.
+            let snapshot = LibraryFolderSnapshot.capture(folderURL: folder)
             Task { @MainActor in
                 guard let self, !self.workflowState.isRecording, !self.workflowState.isBusy else { return }
-                self.loadRecordings()
+                // Only the app's own writes since the last load: nothing to reload.
+                if let snapshot, snapshot == self.libraryFolderSnapshot { return }
+                self.loadRecordings(folderSnapshot: snapshot)
             }
         }
     }
@@ -2271,7 +2274,7 @@ final class AppViewModel: ObservableObject {
         autoTitleRequested: Bool? = nil
     ) -> Bool {
         guard RecordingInteractionPolicy.canSelectHistory(during: workflowState) else { return false }
-        guard !hasPendingTranscription(for: recording.id) else {
+        guard !hasPendingTranscriptionReadingDiskIfNeeded(for: recording.id) else {
             statusMessage = "Transcription already queued"
             return false
         }
@@ -2301,6 +2304,7 @@ final class AppViewModel: ObservableObject {
 
         do {
             try store.save(job)
+            noteOwnJobWrite(job)
             loadTranscriptionJobs()
             statusMessage = replacingExistingTranscript ? "Re-transcription queued" : "Transcription queued"
             processTranscriptionQueueIfNeeded()
@@ -2526,7 +2530,7 @@ final class AppViewModel: ObservableObject {
     private func applyAutoSummary(_ outcome: TranscriptSummaryOutcome, recordingID: UUID, provider: TextModelProvider?) {
         if let markdown = outcome.markdown {
             if let provider { summaryProviderByRecording[recordingID] = provider }
-            refreshSearchDocument(for: outcome.recording)
+            noteSidecarsChanged(for: outcome.recording)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recordingID, selectedID: selectedRecording?.id) {
                 let editor = summaryText
                 if editor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || editor == outcome.previousSummary {
@@ -2576,6 +2580,7 @@ final class AppViewModel: ObservableObject {
                 for index in jobs.indices where jobs[index].status == .running {
                     jobs[index].markInterruptedIfRunning()
                     try? transcriptionJobStore().save(jobs[index])
+                    noteOwnJobWrite(jobs[index])
                 }
             }
             transcriptionJobs = jobs
@@ -2591,6 +2596,7 @@ final class AppViewModel: ObservableObject {
 
     private func saveTranscriptionJob(_ job: TranscriptionJob) {
         try? transcriptionJobStore().save(job)
+        noteOwnJobWrite(job)
         loadTranscriptionJobs()
     }
 
@@ -2613,15 +2619,92 @@ final class AppViewModel: ObservableObject {
         return true
     }
 
-    private func job(for recordingID: UUID) -> TranscriptionJob? {
-        transcriptionJobs.first { $0.recordingID == recordingID }
-            ?? transcriptionJobStore().loadIfExists(recordingID: recordingID)
+    /// The recording's latest job, from memory only (`transcriptionJobs`).
+    /// Evaluated by views while rendering, so it never reads the disk.
+    func job(for recordingID: UUID) -> TranscriptionJob? {
+        jobsByRecordingID[recordingID]
     }
 
+    /// Like `job(for:)`, but falls back to the job files on disk. Only for
+    /// actions (queueing, cancelling, deleting), never while rendering.
+    private func jobReadingDiskIfNeeded(for recordingID: UUID) -> TranscriptionJob? {
+        job(for: recordingID) ?? transcriptionJobStore().loadIfExists(recordingID: recordingID)
+    }
+
+    /// In-memory; safe to evaluate while rendering.
     private func hasPendingTranscription(for recordingID: UUID) -> Bool {
         if publishingRecordingID == recordingID { return true }
         guard let job = job(for: recordingID) else { return false }
         return job.status == .queued || job.status == .running
+    }
+
+    /// `hasPendingTranscription(for:)` with the disk fallback, for actions.
+    private func hasPendingTranscriptionReadingDiskIfNeeded(for recordingID: UUID) -> Bool {
+        if publishingRecordingID == recordingID { return true }
+        guard let job = jobReadingDiskIfNeeded(for: recordingID) else { return false }
+        return job.status == .queued || job.status == .running
+    }
+
+    private static func latestJobByRecording(_ jobs: [TranscriptionJob]) -> [UUID: TranscriptionJob] {
+        // `jobs` is newest first (`TranscriptionJobStore.loadAll`); keep the first.
+        Dictionary(jobs.map { ($0.recordingID, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    // MARK: - Row facts, Read mode and own-write bookkeeping
+
+    /// Parsed once per transcript/segments change instead of on every render.
+    var readModeTranscript: ReadableTranscript {
+        if let readModeCache { return readModeCache }
+        let parsed = TranscriptParser.readableTranscript(saved: transcriptSegments, transcript: transcriptText)
+        readModeCache = parsed
+        return parsed
+    }
+
+    /// Sidebar facts for one recording: from `listing` when given, else from disk.
+    private static func rowFacts(for recording: RecordingItem, listing: LibraryFolderSnapshot?) -> RecordingRowFacts {
+        let hasTranscript: Bool
+        let hasSummary: Bool
+        if let listing, recording.transcriptURL.deletingLastPathComponent().path == recording.folderURL.path {
+            hasTranscript = listing.contains(recording.transcriptURL.lastPathComponent)
+            hasSummary = listing.contains(recording.summaryURL.lastPathComponent)
+        } else {
+            hasTranscript = FileManager.default.fileExists(atPath: recording.transcriptURL.path)
+            hasSummary = FileManager.default.fileExists(atPath: recording.summaryURL.path)
+        }
+        return RecordingRowFacts(recording: recording, hasTranscript: hasTranscript, hasSummary: hasSummary)
+    }
+
+    private static func hasPendingJournal(_ snapshot: LibraryFolderSnapshot) -> Bool {
+        snapshot.entries.keys.contains { name in
+            (name.hasPrefix(".delete-") || name.hasPrefix(".migrate-") || name.hasPrefix(".publish-")) && name.hasSuffix(".json")
+        }
+    }
+
+    /// After the app wrote (or cleared) a recording's transcript, segments or
+    /// summary: refreshes its search document and sidebar facts, and records
+    /// the files as the app's own so the folder watcher does not reload for them.
+    private func noteSidecarsChanged(for recording: RecordingItem) {
+        refreshSearchDocument(for: recording)
+        if isSearchingRecordings { scheduleRecordingSearch() }
+        recordingRowFacts[recording.id] = Self.rowFacts(for: recording, listing: nil)
+        noteOwnLibraryWrites([recording.transcriptURL, recording.transcriptSegmentsURL, recording.summaryURL])
+    }
+
+    /// Patches `libraryFolderSnapshot` for files the app itself just wrote or
+    /// removed (each with its `DurableFile` backup).
+    private func noteOwnLibraryWrites(_ urls: [URL]) {
+        guard var snapshot = libraryFolderSnapshot else { return }
+        let folder = library().folderURL
+        let names = urls
+            .filter { $0.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path }
+            .flatMap { [$0.lastPathComponent, DurableFile.backupURL(for: $0).lastPathComponent] }
+        guard !names.isEmpty else { return }
+        snapshot.refresh(fileNames: names, in: folder)
+        libraryFolderSnapshot = snapshot
+    }
+
+    private func noteOwnJobWrite(_ job: TranscriptionJob) {
+        noteOwnLibraryWrites([transcriptionJobStore().url(for: job.id)])
     }
 
     private func recording(for job: TranscriptionJob) -> RecordingItem? {
@@ -2797,6 +2880,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func loadTranscriptionJobForSelection(_ recording: RecordingItem) -> TranscriptionJob? {
+        // `transcriptionJobs` already holds every job file (`loadAll`).
         job(for: recording.id)
     }
 
@@ -2918,12 +3002,6 @@ final class AppViewModel: ObservableObject {
         recordingTimer = nil
     }
 
-    private func updateFallbackInputLevel(_ level: Float) {
-        let clamped = min(1, max(0, level))
-        inputLevel = clamped
-        waveform.append(clamped)
-    }
-
     private func updateSourceLevel(_ channel: AudioSignalChannel, _ level: Float) {
         let clamped = min(1, max(0, level))
         switch channel {
@@ -2934,15 +3012,11 @@ final class AppViewModel: ObservableObject {
             systemLevel = clamped
             systemPeakDuringRecording = max(systemPeakDuringRecording, clamped)
         }
-        inputLevel = max(microphoneLevel, systemLevel)
-        waveform.append(inputLevel)
     }
 
     private func resetSignalLevels() {
         microphoneLevel = 0
         systemLevel = 0
-        inputLevel = 0
-        waveform.reset()
     }
 
     private func clearRecordingSession() {

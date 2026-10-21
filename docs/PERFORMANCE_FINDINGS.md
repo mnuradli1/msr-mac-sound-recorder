@@ -127,3 +127,67 @@ Each VM load also re-reads all transcripts (indexer capacity 64 < N), runs a job
 ## Not measured
 
 Playback CPU, real `SCStream`/microphone metering (the fake recorder was used), `TimelineView` overlays (need a running job), occluded-window behaviour, runtime speed under `-Osize`, and settings/resize jank (inferred from code).
+
+## Phase 1 results
+
+Measured 2026-10-21 on the same machine with the same harness (`harness.py`), libraries and fake recorder, `*_API_KEY` unset. "Before" is HEAD e0bff47 rebuilt and re-measured today. "After" is this branch's plain `swift build -c release` (-O, unstripped), so the comparison isolates the code changes. The packaged `-Osize` + `strip -x` binary was measured too and is within noise of "After" (cold start at N=1000 0.91 to 0.99 s, recording CPU 34 / 42 / 48 %), so `-Osize` costs no measurable speed here.
+
+### App-level
+
+| N | Cold start to snapshot (s), before → after | Busy CPU-s after launch | Peak footprint | Steady footprint | CPU while recording (fake recorder, 10 s) | RSS while recording |
+|---|---|---|---|---|---|---|
+| 50 | 1.22 / 0.69 / 0.75 → 1.16 / 0.61 / 0.64 | 0.68 → 0.50 | 127 → 115 MB (back-to-back rerun; one-off runs vary from 80 to 147 MB) | 77 → 65 MB | 77.8 → **36.4 %** | 140 → 129 MB |
+| 300 | 4.66 / 3.96 / 3.89 → **0.77 / 0.70 / 0.76** | 5.6 → 0.64 | 522 → **123 MB** | 84 → 94 MB | 97.1 → **42.1 %** | 596 → 148 MB |
+| 1000 | 20.1 / 13.2 / 16.6 → **1.07 / 1.01 / 0.94** | 16.0 (still 93 % busy 8 s after the snapshot) → **1.1** | 1.6 GB → **201 MB** | 133 → 132 MB | 100.7 % (recording starts 10.7 s after launch) → **47.0 %** (starts 0.8 s after launch) | 1.69 GB → 200 MB |
+
+Idle CPU once settled is 0.0 to 0.2 % before and after. The 2 to 20 s startup stall and the 0.5 to 1.6 GB peaks are gone. Recording CPU is no longer pegged, but it still grows with N (36 → 47 %). A 4 s `sample` at N=1000 while recording shows no disk access left in the render path (`jobChip` + `rowBadges` are about 5 of 2,896 main-thread samples). The remainder is the per-tick sidebar pass: `recordingSections` (about 210 samples, mostly `Calendar.isDateInToday` over 1000 rows, three times) and SwiftUI `OutlineList` diffing and layout. Each meter tick still publishes on the shared model. This is opportunity #2 (Phase 2): split the meter/elapsed state into its own observable.
+
+### Micro-benchmarks (release, median of 10; finish and rename are the median of 5 on a hard-link copy of `lib1000`)
+
+| Operation | Before | After |
+|---|---|---|
+| `RecordingLibrary.loadRecordings()` N = 50 / 300 / 1000 | 14.2 / 83.1 / 325.6 ms | **8.7 / 49.6 / 175.3 ms** (−40 to −46 %) |
+| `finishRecording`, N=1000 | 740 ms | **179 ms** (1 internal load instead of 2, each 46 % cheaper) |
+| `rename`, N=1000 | 436 ms | **176 ms** (still 1 internal load; the name filter makes it cheaper) |
+| `LibraryFolderSnapshot.capture`, N = 50 / 1000 (new: 265 / 5,300 entries) | — | 1.3 / 28.5 ms (dominated by per-file attribute reads; `getattrlistbulk` measured no faster) |
+| Sidebar `rowBadges`, 1000 rows | 19.8 ms per pass (2,000 `stat`s) | dictionary lookups only |
+| `job(for:)` per row without an in-memory job | up to 15.1 ms (`loadAll`) | dictionary lookup |
+| Read-mode parse (`readableTranscript`, 32 KB) | 3.8 ms per `TranscriptPanel` render | once per transcript/segments change |
+
+### Bundle
+
+| Item | Before | After |
+|---|---|---|
+| `MSR Meeting Recorder.app` (`du`) | 9.4 MB | **3.4 MB** |
+| `Contents/MacOS/MSRMeetingRecorder` | 7,853,280 B (-O, not stripped) | **3,007,936 B** (`-Osize`, `strip -x`; the unstripped -O build is 7,738,800 B without MSRPresentation) |
+| `MSRMeetingRecorder.icns` | 1,895,707 B | **481,679 B** |
+| Localizations | resource bundle (36 KB) + top-level `en.lproj`/`id.lproj` | top-level `en.lproj`/`id.lproj` only |
+| App zip / DMG | 3,942,225 / 4,367,862 B | **1,779,173 / 2,223,302 B** |
+
+A dSYM (`dist/MSRMeetingRecorder.dSYM`, same UUID as the shipped binary) is written next to the artifacts for symbolication; it is not part of the app, zip or DMG.
+
+### What changed
+
+1. **Render paths never touch the disk.**
+   - `job(for:)` is memory-only, reading a `jobsByRecordingID` index that `transcriptionJobs.didSet` rebuilds. Only actions use the disk fallback, via `jobReadingDiskIfNeeded(for:)` and `hasPendingTranscriptionReadingDiskIfNeeded(for:)`: enqueue/retry, cancel, delete.
+   - Sidebar badges come from `recordingRowFacts: [UUID: RecordingRowFacts]`, built once per load from the folder listing. `noteSidecarsChanged(for:)` updates the entry after the app writes a transcript or summary (autosave, Summarize, auto-summary).
+   - The Read-mode transcript is cached (`readModeCache`) and cleared by `transcriptText`/`transcriptSegments` `didSet`.
+   - The unread `inputLevel`/`waveform` properties are gone, and `onLevelUpdate` is no longer installed (one main-actor hop less per meter report). `TitleBadge` already read metadata only.
+2. **`loadRecordings` cost and frequency.**
+   - Segments sidecars (`<base>.transcript.segments.json` next to `<base>.json`) are skipped by name. Hidden job/session/journal JSON was already skipped by `.skipsHiddenFiles`. Orphan or lookalike files are still decoded and ignored as before.
+   - `finishRecording` lists the library once for both the unique name and the duplicate-ID check.
+   - The folder watcher takes a `LibraryFolderSnapshot` (name, size and mtime of every entry) off the main thread. It skips the reload when the snapshot equals the one kept from the last load, patched for the app's own writes (sidecars, job files, each with its `.bak`). External changes still reload. This replaces a "suppress until" timestamp, which could swallow an external change landing inside the window.
+   - Launch skips the second full load when recovery found nothing and the folder is unchanged.
+3. **Packaging.**
+   - `-Xswiftc -Osize`, plus `strip -x` before codesigning.
+   - Only the `*.lproj` folders are copied (once). `Bundle.main` serves them: verified by launching the packaged app with `-AppleLanguages (id)`, and the UI renders in Indonesian without the SwiftPM bundle.
+   - The icon was rebuilt from the same artwork. Redundant 1x entries are dropped (16, 16@2x, 32@2x, 128, 128@2x, 256@2x, 512@2x remain), and the 512 and 1024 px images are 256-colour palette PNGs (median cut).
+   - `MSRPresentation`, its product and `bindPresentationModels` are deleted.
+4. **Kept:** the `swift-testing` package dependency. Without it, `swift test` on this machine (Command Line Tools only, Swift 6.3.3) fails with `no such module 'Testing'`: SwiftPM does not add the CLT `Testing.framework` search path. CI's Xcode 16.2 would likely be fine, but local runs would break.
+
+### Deferred to Phase 2
+
+- Split the meter/elapsed/playback state out of `AppViewModel`; this is the remaining N-dependent recording cost.
+- An in-memory library index, and library I/O plus the snapshot capture off the main thread (about 28 ms per load at N=1000).
+- Fewer full loads inside `TranscriptPublisher` and the speaker-reset loop (one load per speaker).
+- Multi-file import still reloads once per file.
