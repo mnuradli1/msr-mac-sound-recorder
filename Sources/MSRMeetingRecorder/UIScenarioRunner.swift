@@ -633,7 +633,7 @@ extension UIScenarioRunner {
 
     /// The path with symlinks resolved (`/tmp` → `/private/tmp`), so one
     /// folder reached by two names is scanned once.
-    static func canonicalPath(_ path: String) -> String {
+    nonisolated static func canonicalPath(_ path: String) -> String {
         guard let resolved = realpath(path, nil) else { return path }
         defer { free(resolved) }
         return String(cString: resolved)
