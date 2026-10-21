@@ -280,3 +280,134 @@ These calls are rare, user-triggered and not tick-driven:
 - An in-memory library index inside `RecordingLibrary`, so `rename`, `renameSpeaker`, `onDisk` and `uniqueDisplayName` need not decode every metadata file (175 ms at N=1000). This would also make rename fully cheap on main.
 - The App scene still holds the model as `@StateObject`. Commands rebuild only on real model changes now (not on ticks), so this was left as is.
 - Phase 3 items are unchanged: search memory and folding, persisted waveform peaks, `swift-testing`/ZIPFoundation, deferring health checks.
+
+## Phase 3 results
+
+Measured 2026-10-21 with the same harness, libraries and fake recorder, `*_API_KEY` unset. "Before" is the Phase 2 binary (86687d8), re-measured **interleaved** with the Phase 3 binary, one run each in turn, both a plain `swift build -c release`. Load average was 3.4 to 5.7. Micro-benchmarks came from a temporary swift-testing file (release, `-enable-testing`; now deleted), median of 7 unless noted. Phase 3 writes one `.waveform` sidecar per selected recording; the scratch libraries were cleaned before each A/B pass.
+
+### App-level
+
+| N | Cold start, median of 3 (s) | Steady footprint (2 to 3 runs) | Peak footprint | CPU-s to settle after launch | CPU while recording (2 runs) | RSS at end of recording |
+|---|---|---|---|---|---|---|
+| 50 | 0.59 → 0.58 | 80 → **79 MB** | 151 → 150 MB | 0.50 → 0.49 | 8.0 / 11.3 → 9.9 / 11.8 % | 131 → 132 MB |
+| 300 | 0.64 → 0.67 | 96 → **90 MB** | 168 → 159 MB | 0.66 → 0.75 | 5.6 / 4.9 → 4.6 / 4.9 % | 148 → 142 MB |
+| 1000 | 0.83 → 0.81 | 123 to 129 → **98 to 99 MB** | 191 to 196 → **170 MB** | 1.0 to 1.1 → 1.3 to 1.4 | 8.9 / 11.4 → 10.6 / 10.6 % | 192 → **168 MB** |
+
+Idle CPU once settled is 0.0 to 0.2 % for both. Cold start and recording CPU are unchanged (the recording numbers are noisy on this busy machine for both binaries). The footprint drops by about 25 MB at N=1000: the live heap shrinks from 76.7 to 48.3 MB (`heap`: `Swift.StringStorage` 38.0 → 0.9 MB, replaced by 7.3 MB of `[UInt8]` index storage). The background indexing pass costs about 0.3 to 0.4 CPU-s more at launch at N=1000 (folding, sketches and LZFSE on 4 workers at utility priority); it is done well before the snapshot window ends.
+
+### Micro-benchmarks
+
+| Operation | Before | After |
+|---|---|---|
+| Search text held in memory, N=1000 | 33.4 MB (every transcript and summary as `String`) | **7.3 MB** in total: metadata 0.16 MB, sketches 0.54 MB, LZFSE text 6.6 MB (932 of 1000 documents cached, 31 MB folded) |
+| Indexing pass, N=1000 | 276 ms cold, 82 ms warm (`documents(for:)`, re-reads all files) | 190 ms cold on 4 workers; 9 ms warm (a `stat` per sidecar, nothing re-read) |
+| Query `budget` (matches all 1000) | 76 ms | **3.7 ms** to the first (in-memory) results, **7.6 ms** complete (61 uncached documents read) |
+| Query `zzqx` (no match) | 572 ms | **0.2 ms** (every sketch rules it out; no reads) |
+| Query `2026-10` (date, 71 hits) | 572 ms | **0.3 ms** (metadata only) |
+| Query `speaker 2 budget` | 78 ms | 3.8 ms first, 8.0 ms complete |
+| N = 300 / 50, any query above | n/a | ≤ 1.3 ms; everything cached (2.3 / 0.4 MB) |
+| "Realistic" N=1000 (Zipf-distributed words from 8,000 dictionary words, 32 KB each; more n-grams, compresses 3.1×) | n/a | 7.3 MB resident (sketches 2.1 MB, 492 documents cached). No match: **0.2 ms**. Match-all: **3.3 ms** first, **22 ms** complete (457 documents read from disk) |
+| `WaveformAnalyzer.samples`, 60 min 48 kHz stereo AAC | 1,723 / 1,757 ms (3,641 ms on a cold first run) | **322 ms** (8 parallel ranges; 1,470 ms on one thread); peaks equal to the old ones within 0.00013 |
+| Same, recording just finished or imported | separate decode on first selection | **0 ms**: computed by the confidence pass |
+| Waveform on revisit / later launch | analysis again (memory cache only) | **0.03 ms** (`.waveform` sidecar read) |
+| `RecordingConfidenceAnalyzer`, 60 min | 1,310 to 1,396 ms | **291 ms**; peak 0.35539487, average 0.12105823 and duration 3600 s identical |
+| `rename`, N=1000 (hard-link copy of `lib1000`) | 171 ms (one full load on main) | **5.8 ms** (index check: one folder `stat` and 1000 file `stat`s, one metadata read, durable write) |
+| DOCX export (32 KB transcript) | 1.8 ms, 8,463 B (deflate) | 1.6 ms, 60,231 B (stored entries) |
+
+### Bundle
+
+| Item | Before | After |
+|---|---|---|
+| `Contents/MacOS/MSRMeetingRecorder` (`-Osize`, `strip -x`) | 3,075,088 B | **3,049,360 B** (−25.7 KB net, after adding the scanner, index and ZIP writer) |
+| `MSR Meeting Recorder.app` (`du`) | 3,520 KB | 3,496 KB |
+| App zip / DMG | 1,806,921 / 2,254,471 B | 1,790,459 / 2,243,772 B |
+| Package dependencies | ZIPFoundation 0.9.20, swift-testing 0.12.0 | swift-testing 0.12.0 (test target only) |
+
+The Phase 0 estimate of about 213 KB for ZIPFoundation was its object text; in the dead-stripped `-Osize` build only about 25 KB of it was linked. `otool -L` lists no zip library before or after (it was linked statically).
+
+### What changed
+
+1. **Search: folded, compressed, bounded, streamed.**
+   - `SearchFolding` / `FoldBuffer` (RecordingSearch.swift:15, :45): lowercase, diacritics folded, whitespace collapsed, NFC UTF-8, once per document. ASCII is folded byte by byte; each non-ASCII run (plus the ASCII character before it, for combining marks) goes through Foundation's folding as before. The one deliberate difference is that ASCII `I` always folds to `i`, also in a Turkish locale; queries fold the same way.
+   - `RecordingSearchDocument` (:167) holds `metadataText` and `contentText` bytes. Matching is `memmem` per token: metadata first, then the text, so a token never spans fields. Dates use 5 formatters made once (`SearchDateText`, :197) instead of one `DateFormatter` per document per query. `RecordingSearch.filter` keeps its semantics (all tokens, case- and diacritic-insensitive, name/source/date/duration/transcript/summary); its `calendar:` parameter is gone (the date text is computed when a document is made).
+   - `SearchSketch` (:273): an exact set of the bytes present plus a one-hash Bloom filter of every 2- and 3-byte sequence. It is 160 B to 2 KB, folded in half while at most 30 % full. It can only rule tokens out.
+   - `RecordingSearchIndexer` (RecordingSearchIndexer.swift:22) is rewritten.
+     - It keeps metadata text and sketches resident for every recording.
+     - Transcript + summary text is held LZFSE-compressed in an LRU cache. A byte budget (default 7 MB) covers metadata, sketches and text.
+     - `update` (:95) mirrors the library without disk access. `indexContent` (:147) re-reads only files whose size or mtime changed, on 4 workers at utility priority. `refresh` (:123) re-reads one recording after the app writes its sidecars.
+     - `search` (:171) decides from metadata, then sketches, then cached text (decompressed in parallel), and delivers those matches first. It then reads only uncached documents whose sketch allows a match, one worker per core (:567), in chunks of 256, delivering after each chunk. Cancellation stops it between chunks.
+     - Text read by a query is cached only while it fits without evicting (:207, scan resistance). Indexing passes and `refresh` evict LRU. Files are read with `open`/`read` into per-worker reusable buffers (`LoadWorkspace`, :380), so a pass leaves one allocation per document. Before that change, transient buffers kept about 25 MB of freed heap in the footprint.
+   - `AppViewModel` no longer holds search documents. `filteredRecordings` (AppViewModel.swift:481) maps the streamed IDs onto `recordings`. `scheduleRecordingSearch` (:863) bumps a generation, debounces 150 ms (was 300), and runs the query in a detached task that streams `Progress` through an `AsyncStream`; results of an older generation are dropped. An empty partial result is not published, so "no results" does not flash before disk-backed matches arrive. `startSearchIndexing` (:824) and `refreshSearchDocument` (:3134) feed the indexer.
+2. **Waveform: one shared scanner, sidecar cache.**
+   - `AudioLevelScanner` (AudioLevelScanner.swift:17) decodes with `AVAudioFile` into 32K-frame chunks, using vDSP clip, max-magnitude and sum-of-squares per channel, plus per-bucket peaks split at exact bucket boundaries. Files of 60 s or more (AAC/M4A/WAV/CAF/AIFF) are split into up to 8 frame ranges, each decoded by its own `AVAudioFile`, with sample-accurate seeks: the frame totals match exactly, and parallel and single-threaded buckets are bit-identical in the tests. Cancellation is checked per chunk.
+   - **Why not `AVAssetReader` at 8 kHz mono, as planned:** measured on `long60.m4a`:
+     - `AVAssetReader` at native rate took 1,748 ms, at 8 kHz 1,454 ms, and 8 kHz mono 1,441 ms. The AAC decoder still runs at 48 kHz.
+     - 4 or 8 `AVAssetReader`s with time ranges took 2,026 / 2,063 ms: they do not run concurrently within a process (user time equalled wall time).
+     - `AVAudioFile` was 1,275 ms on one thread and **297 ms** with 8 ranges.
+     - A mono downmix also changes the peaks (0.497 vs 0.355 here), and the strip is not normalized.
+   - `RecordingConfidenceAnalyzer` (RecordingConfidenceAnalyzer.swift:27, :94) now uses the same scanner. It decoded the same way (`AVAudioFile`, full rate, clipped peak/RMS), so its results are unchanged: identical on `long60.m4a`, and the existing tolerance tests pass. `analyzeWithWaveform` returns the 96 review peaks from the same decode.
+   - `WaveformCacheFile` (WaveformCacheFile.swift) is binary: a 32-byte header (magic, version, bucket count, audio size, mtime in ns) plus `UInt16` peaks, 224 B for 96 buckets. A stale or foreign file reads as `nil`. It is written as a hidden temp file plus `rename`, with no `.bak`.
+   - `RecordingItem.waveformURL` (RecordingModels.swift:194) is `<base>.waveform`. `RecordingLibraryServing` gains `loadWaveformCache` / `storeWaveformCache` (RecordingLibrary.swift:74/77, with default implementations at :81/:85, so test fakes compile). The library's own versions are at :670/:676. `ownedURLs` (:870) includes the file, so delete removes it and legacy migration moves it (tested).
+   - Producers:
+     - Finalize stores the peaks from the confidence pass after `finishRecording`, off main (AppViewModel.swift:1501, :1548).
+     - Import stores them from its level check (:1075).
+     - Selection reads the sidecar off main (`reviewWaveform(for:)`, :3077). On a miss it analyzes (cancellable), stores, and records the write as the app's own for the folder watcher.
+3. **ZIPFoundation replaced.** `ZipArchiveWriter` (ZipArchiveWriter.swift) writes stored entries with local headers, a central directory, an end record, a table CRC-32 and UTF-8 names (flag bit 11). There is no ZIP64; it throws past 4 GiB. It rejects duplicate and `..` names. `TranscriptExporter.writeDOCX` (TranscriptExporter.swift:238) uses it and writes the file atomically. `Package.swift` and `Package.resolved` no longer list ZIPFoundation. `THIRD_PARTY_NOTICES.md` and the README are updated.
+   - Verified with `unzip -t` ("No errors detected") and `textutil -convert txt -stdout`. The round trip includes `&`/`<>` escaping and non-ASCII text, and both checks are now tests.
+   - Trade-off: stored entries make a DOCX about 7× larger (60 KB for a 32 KB transcript). If that matters, raw DEFLATE is available from the system Compression framework (`COMPRESSION_ZLIB` emits RFC 1951 data, which is ZIP method 8) without a dependency.
+4. **Metadata index for rename and speaker rename.** `RecordingLibrary.loadRecordings` (RecordingLibrary.swift:99) now records a process-wide `MetadataIndex` (:995) per folder: the result, the folder's `stat`, and each metadata file's path and `stat` (device, inode, size, mtime and ctime in ns; `FileStamp`, :961), taken before the listing and before each read. It is shared by every `RecordingLibrary` on the folder (the app makes one per call), lives under `LibraryIO`, and is capped at 4 folders.
+   - Who uses it:
+     - `validIndex()` (:160) accepts the index only when the folder `stat` and every metadata file's `stat` are unchanged. That is a `stat` per file and no listing.
+     - `onDiskRecording` (:690), used by rename, renameIfTitleIsDefault, renameSpeaker, resetSpeakerNames and resetAllSpeakerNames, takes the uniqueness list from a valid index and still re-reads the target's own metadata file.
+     - `finishRecording` and `importRecording` use it via `currentRecordings()` (:152).
+     - Otherwise every one of them falls back to a full load.
+   - `indexedWrite` (:177) wraps each library write. When the index matched the folder just before the write, it patches the changed recordings and re-stamps them and the folder. Otherwise, or on any throw, it drops the index. Writes by other code (job files, sessions) or other processes change the folder `stat` and so invalidate it.
+   - Journal replay: a journal is a new folder entry, so it always forces a full load, which replays it (tested with an interrupted delete). Duplicate IDs are excluded exactly as in a full load (tested via `finishRecording(recordingID:)`).
+   - Residual window: an external change that lands *during* one of the library's own writes is absorbed into the patched stamp until the next full load. The folder watcher's reload rebuilds the index about 600 ms later.
+5. **Tests:** 179 → 199 swift-testing tests, all passing 3 out of 3 runs. The `MSRTestRunner` suite passes, including `testRecordingSearch*` unchanged.
+   - The two old indexer tests asserted the capacity-64 cache. They are replaced by 4 tests:
+     - unchanged files are not re-read;
+     - eviction, then lazy reload of an evicted document for a query, with no reads for ruled-out or metadata-only queries;
+     - zero budget;
+     - streaming order and cancellation.
+   - `Phase3PerformanceTests.swift` covers:
+     - folding, including decomposed accents, NBSP and expansion growth;
+     - sketch soundness on 2,000 random substrings;
+     - the waveform cache (round trip, stale, wrong bucket count, delete, migration);
+     - parallel vs single scan;
+     - confidence + waveform from one decode;
+     - scan cancellation;
+     - CRC-32 check value;
+     - `unzip -t`;
+     - the DOCX `textutil` round trip;
+     - the metadata index (patched renames, in-place external edit, external add, journal replay, duplicate ID, deleted recording, speaker rename).
+   - `scripts/ui_walkthrough.sh`: 18 + 2 steps passed (one real ElevenLabs transcription).
+
+### Deferred
+
+- `finishRecording` at N=1000 with the index was not re-measured. The index replaces its full load when the index is current. After a recording session, though, the session manifests have changed the folder, so the load usually still happens (off main).
+- The DOCX container could use raw DEFLATE from the Compression framework (see above).
+- With high-diversity text the sketches take 2 KB per long transcript, so at N=1000 about half the text fits the 7 MB budget, and match-all queries read about 450 files (22 ms, streamed after a 3 ms first batch). Raising `defaultByteBudget` trades memory for that.
+- Deferring the health checks until after the first frame (from the Phase 3 list) was not done; cold start is already 0.6 to 0.8 s.
+- The App scene still holds the model as `@StateObject` (unchanged from Phase 2).
+
+## Overall
+
+Baseline is main @ b80f405 ("Measurements" above); Phase 3 is this branch, measured in this session.
+
+| Metric (N=1000 unless noted) | Baseline | Phase 3 |
+|---|---|---|
+| Cold start to snapshot | 14.2 to 16.7 s | **0.81 s** |
+| Cold start, N=300 / N=50 | 3.7 / 0.67 s | 0.67 / 0.58 s |
+| CPU while recording (fake recorder) | 100 % (main thread pegged) | 5 to 11 % (independent of N) |
+| Peak footprint | 1.6 GB | **170 MB** |
+| Steady footprint | 133 MB | **99 MB** |
+| `rename` | ≈430 ms on main | **5.8 ms** |
+| `finishRecording` | 676 ms on main | 179 ms (Phase 1), off main since Phase 2 |
+| Search filter, match / no match | 117 / 843 ms | **7.6 / 0.2 ms** (first results 3.7 ms) |
+| Search text held in memory | 33.4 MB | **7.3 MB** (bounded) |
+| Waveform, 60 min file: first view / revisit | 1,882 ms / memory cache only | **322 ms** (0 for new recordings) / **0.03 ms** from disk |
+| Confidence analysis, 60 min | 1,406 ms | **291 ms** |
+| App bundle / binary | 9.4 MB / 7.85 MB | **3.4 MB / 3.05 MB** |
+| App zip / DMG | 3.94 / 4.37 MB | **1.79 / 2.24 MB** |
+| Runtime dependencies | ZIPFoundation | none |

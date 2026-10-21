@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MSRCore
 
 public final class RecordingFolderWatcher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "app.msr.folder-watcher")
@@ -43,24 +44,36 @@ public final class RecordingFolderWatcher: @unchecked Sendable {
     deinit { stop() }
 }
 
-/// Name, size and modification date of every entry in a library folder (hidden
-/// files included).
+/// Name, size, modification and status-change times and inode of every entry
+/// in a library folder (hidden files included).
 ///
 /// The app keeps the snapshot taken just before its last library load and
-/// patches it for files it writes itself afterwards. When the folder watcher
-/// fires, a fresh snapshot equal to the kept one means the events came only
-/// from the app's own writes, so the full reload can be skipped; any external
-/// change (a new, removed, renamed or rewritten file) makes them differ.
+/// patches it for files it writes itself afterwards, with the stamps those
+/// writes recorded (`OwnFileWrites`). When the folder watcher fires, a fresh
+/// snapshot equal to the kept one means the events came only from the app's
+/// own writes, so the full reload can be skipped; any external change (a new,
+/// removed, renamed or rewritten file, even one replaced with the same size
+/// and modification date) makes them differ.
 public struct LibraryFolderSnapshot: Equatable, Sendable {
     public struct Entry: Equatable, Sendable {
         public let size: Int64
         public let modifiedSeconds: Int
         public let modifiedNanoseconds: Int
+        public let changedSeconds: Int
+        public let changedNanoseconds: Int
+        public let inode: UInt64
 
         init(_ info: stat) {
-            size = Int64(info.st_size)
-            modifiedSeconds = info.st_mtimespec.tv_sec
-            modifiedNanoseconds = info.st_mtimespec.tv_nsec
+            self.init(FileStamp(info))
+        }
+
+        public init(_ stamp: FileStamp) {
+            size = stamp.size
+            modifiedSeconds = stamp.modified.tv_sec
+            modifiedNanoseconds = stamp.modified.tv_nsec
+            changedSeconds = stamp.changed.tv_sec
+            changedNanoseconds = stamp.changed.tv_nsec
+            inode = stamp.inode
         }
     }
 
@@ -92,6 +105,15 @@ public struct LibraryFolderSnapshot: Equatable, Sendable {
 
     public func contains(_ fileName: String) -> Bool {
         entries[fileName] != nil
+    }
+
+    /// Sets the entry of `fileName` to what the app's own write recorded
+    /// (`.absent` removes it).
+    public mutating func patch(_ fileName: String, with status: OwnFileWrites.Status) {
+        switch status {
+        case let .present(stamp): entries[fileName] = Entry(stamp)
+        case .absent: entries[fileName] = nil
+        }
     }
 
     /// Re-reads the given entries of `folderURL` (a missing file is removed).

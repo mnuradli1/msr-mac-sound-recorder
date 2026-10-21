@@ -521,9 +521,9 @@ struct APIKeyStoreHardeningTests {
 
 // MARK: - G. Search indexer
 
-@Suite("Recording search indexer capacity")
+@Suite("Recording search indexer cache")
 struct RecordingSearchIndexerHardeningTests {
-    @Test func capacityCountsRecordingsNotFiles() async throws {
+    @Test func cachedTextIsReusedUntilTheFilesChange() async throws {
         let folder = try HardeningTestFolder()
         let first = makeRecording(in: folder.url, name: "First")
         let second = makeRecording(in: folder.url, name: "Second")
@@ -532,29 +532,121 @@ struct RecordingSearchIndexerHardeningTests {
             try write("\(text) transcript", to: recording.transcriptURL, modifiedAt: stamp)
             try write("\(text) summary", to: recording.summaryURL, modifiedAt: stamp)
         }
-        let indexer = RecordingSearchIndexer(capacity: 2)
+        let indexer = RecordingSearchIndexer()
 
         let initial = await indexer.documents(for: [first, second])
-        #expect(initial.map(\.transcriptText) == ["alpha transcript", "beta transcript"])
+        #expect(initial.map { String(decoding: $0.contentText, as: UTF8.self) } == ["alpha transcript alpha summary", "beta transcript beta summary"])
         #expect(await indexer.cachedRecordingCount == 2)
+        #expect(await indexer.statistics.diskReads == 2)
 
-        // Same modification date => served from cache, which proves the entries were not evicted.
-        try write("changed transcript", to: first.transcriptURL, modifiedAt: stamp)
-        let cached = await indexer.documents(for: [first, second])
-        #expect(cached.first?.transcriptText == "alpha transcript")
+        // Unchanged files are not read again.
+        _ = await indexer.documents(for: [first, second])
+        #expect(await indexer.statistics.diskReads == 2)
 
-        // A real modification is picked up.
-        try write("changed transcript", to: first.transcriptURL, modifiedAt: stamp.addingTimeInterval(60))
+        // A real modification (size or date) is picked up by the next pass.
+        try write("Changed TRANSCRIPT", to: first.transcriptURL, modifiedAt: stamp.addingTimeInterval(60))
         let refreshed = await indexer.documents(for: [first, second])
-        #expect(refreshed.first?.transcriptText == "changed transcript")
+        #expect(refreshed.first.map { String(decoding: $0.contentText, as: UTF8.self) } == "changed transcript alpha summary")
+        #expect(await indexer.statistics.diskReads == 3)
     }
 
-    @Test func evictsLeastRecentlyUsedRecordingsBeyondCapacity() async throws {
+    @Test func evictedTextIsReadAgainOnlyWhenAQueryNeedsIt() async throws {
         let folder = try HardeningTestFolder()
-        let recordings = (0..<3).map { makeRecording(in: folder.url, name: "R\($0)") }
-        let indexer = RecordingSearchIndexer(capacity: 2)
-        _ = await indexer.documents(for: recordings)
-        #expect(await indexer.cachedRecordingCount == 2)
+        // Names use "q", which no transcript contains, so name queries are decided without text.
+        let recordings = (0..<6).map { makeRecording(in: folder.url, name: "Meeting Q\($0)") }
+        for (index, recording) in recordings.enumerated() {
+            // Distinct, poorly compressible text (~8 KB each) so the budget holds about two.
+            var generator = SplitMix64(seed: UInt64(index + 1))
+            let words = (0..<1_200).map { _ in Self.word(using: &generator) }
+            let marker = index == 0 ? " kangaroo" : ""
+            try write(words.joined(separator: " ") + marker, to: recording.transcriptURL, modifiedAt: Date())
+        }
+        let probe = RecordingSearchIndexer(byteBudget: .max)
+        _ = await probe.documents(for: recordings)
+        let full = await probe.statistics
+        let perDocument = full.contentBytes / recordings.count
+        let budget = full.metadataBytes + full.sketchBytes + perDocument * 2 + perDocument / 2
+        let indexer = RecordingSearchIndexer(byteBudget: budget)
+        await indexer.update(recordings)
+        await indexer.indexContent()
+        let indexed = await indexer.statistics
+        #expect(indexed.indexedDocuments == 6)
+        #expect(indexed.residentDocuments == 2)
+        #expect(indexed.residentBytes <= budget)
+        // The least recently read text was evicted: recording 0 is not cached.
+        #expect(await indexer.isCached(recordings[0].id) == false)
+
+        // A token only in recording 0's evicted transcript: read back lazily, found.
+        let found = await collect(indexer, "kangaroo")
+        #expect(found.last?.matches == [recordings[0].id])
+        #expect(found.last?.isComplete == true)
+        let afterHit = await indexer.statistics
+        #expect(afterHit.diskReads > indexed.diskReads)
+        #expect(afterHit.residentBytes <= budget)
+
+        // Absent bytes: every sketch rules the token out, nothing is read.
+        let none = await collect(indexer, "QQQ-ZZZ")
+        #expect(none.count == 1)
+        #expect(none.last?.matches == [])
+        #expect(await indexer.statistics.diskReads == afterHit.diskReads)
+
+        // Metadata is always resident: name queries never read the disk.
+        let byName = await collect(indexer, "meeting q3")
+        #expect(byName.last?.matches == [recordings[3].id])
+        #expect(await indexer.statistics.diskReads == afterHit.diskReads)
+
+        // An evicted document changed on disk is searched as it is now.
+        let evicted = try #require(await recordings.asyncFirst { !(await indexer.isCached($0.id)) })
+        try write("platypus notes", to: evicted.transcriptURL, modifiedAt: Date().addingTimeInterval(120))
+        await indexer.refresh(evicted)
+        #expect(await collect(indexer, "platypus").last?.matches == [evicted.id])
+    }
+
+    @Test func zeroBudgetStillMatchesEverythingFromDisk() async throws {
+        let folder = try HardeningTestFolder()
+        let first = makeRecording(in: folder.url, name: "Supplier Call")
+        let second = makeRecording(in: folder.url, name: "Board Review")
+        try write("We reviewed the Café budget and the résumé.", to: first.transcriptURL, modifiedAt: Date())
+        try write("Action item: send scorecard", to: second.summaryURL, modifiedAt: Date())
+        let indexer = RecordingSearchIndexer(byteBudget: 0)
+        await indexer.update([first, second])
+        // Nothing indexed yet: the query reads what it needs.
+        #expect(await collect(indexer, "cafe RESUME").last?.matches == [first.id])
+        #expect(await collect(indexer, "scorecard board").last?.matches == [second.id])
+        #expect(await collect(indexer, "budget board").last?.matches == [])
+        #expect(await indexer.statistics.contentBytes == 0)
+        #expect(await indexer.statistics.indexedDocuments == 2)
+    }
+
+    @Test func streamedResultsFollowLibraryOrderAndCancelCleanly() async throws {
+        let folder = try HardeningTestFolder()
+        let recordings = (0..<300).map { makeRecording(in: folder.url, name: "R\($0)") }
+        for recording in recordings {
+            try write("shared token \(recording.displayName)", to: recording.transcriptURL, modifiedAt: Date())
+        }
+        let indexer = RecordingSearchIndexer(byteBudget: 0)
+        await indexer.update(recordings)
+        let updates = await collect(indexer, "shared")
+        // Nothing resident: an empty in-memory pass, then one update per disk chunk.
+        #expect(updates.count == 1 + (300 + RecordingSearchIndexer.chunkSize - 1) / RecordingSearchIndexer.chunkSize)
+        #expect(updates.last?.matches == recordings.map(\.id))
+        #expect(updates.dropLast().allSatisfy { !$0.isComplete })
+
+        let task = Task { await collect(indexer, "token") }
+        task.cancel()
+        let cancelled = await task.value
+        #expect(cancelled.allSatisfy { !$0.isComplete } || cancelled.last?.matches.count == 300)
+    }
+
+    private func collect(_ indexer: RecordingSearchIndexer, _ query: String) async -> [RecordingSearchIndexer.Progress] {
+        let box = ProgressBox()
+        await indexer.search(query) { box.append($0) }
+        return box.values
+    }
+
+    private static func word(using generator: inout SplitMix64) -> String {
+        let letters = Array("abcdefghijklmnoprstuvwy")
+        return String((0..<Int(3 + generator.next() % 6)).map { _ in letters[Int(generator.next() % UInt64(letters.count))] })
     }
 
     private func makeRecording(in folder: URL, name: String) -> RecordingItem {
@@ -662,6 +754,32 @@ private func captureError(_ body: () async throws -> Void) async -> Error? {
         return nil
     } catch {
         return error
+    }
+}
+
+private final class ProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [RecordingSearchIndexer.Progress] = []
+    var values: [RecordingSearchIndexer.Progress] { lock.withLock { stored } }
+    func append(_ progress: RecordingSearchIndexer.Progress) { lock.withLock { stored.append(progress) } }
+}
+
+struct SplitMix64 {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var value = state
+        value = (value ^ (value >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        value = (value ^ (value >> 27)) &* 0x94D0_49BB_1331_11EB
+        return value ^ (value >> 31)
+    }
+}
+
+private extension Array {
+    func asyncFirst(where predicate: (Element) async -> Bool) async -> Element? {
+        for element in self where await predicate(element) { return element }
+        return nil
     }
 }
 

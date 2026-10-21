@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum StorageIntegrityError: Error, LocalizedError, Equatable {
@@ -59,6 +60,46 @@ public enum LibraryIO {
     public static func end() { lock.unlock() }
 }
 
+/// What this process's own writes left on disk: each file's `FileStamp`
+/// (or its absence) taken inside the write, under `LibraryIO`.
+///
+/// The app patches its library folder snapshot with these stamps, so a file
+/// it wrote is recorded exactly as its write left it. Re-reading the file
+/// later instead would also absorb an outside change landing after the write.
+/// A stamp nobody takes is harmless: it can only make a snapshot differ from
+/// the folder (one extra reload), never hide a change.
+public enum OwnFileWrites {
+    public enum Status: Equatable, Sendable {
+        case present(FileStamp)
+        case absent
+    }
+
+    /// Bounded: cleared when it grows past this (journals and manifests are
+    /// recorded too, and only library sidecars are ever taken).
+    private static let capacity = 1_024
+    nonisolated(unsafe) private static var recorded: [String: Status] = [:]
+
+    /// Records the current status of `urls`. Call it inside the write's
+    /// `LibraryIO` section, right after the file operations.
+    public static func record(_ urls: [URL]) {
+        LibraryIO.serialized {
+            if recorded.count >= capacity { recorded.removeAll() }
+            for url in urls {
+                let path = url.standardizedFileURL.path
+                recorded[path] = FileStamp(path: path).map(Status.present) ?? .absent
+            }
+        }
+    }
+
+    /// The recorded status of each of `urls` (`nil`: none recorded), removed
+    /// from the record.
+    public static func take(_ urls: [URL]) -> [Status?] {
+        LibraryIO.serialized {
+            urls.map { recorded.removeValue(forKey: $0.standardizedFileURL.path) }
+        }
+    }
+}
+
 public enum DurableFile {
     public static func backupURL(for url: URL) -> URL {
         URL(fileURLWithPath: url.path + ".bak")
@@ -68,6 +109,12 @@ public enum DurableFile {
         try LibraryIO.serialized { try unserializedWrite(data, to: url, fileManager: fileManager) }
     }
 
+    /// Replaces `url` atomically: the new bytes go to a synced temporary file,
+    /// the current file is hard-linked to `.bak` (the previous version), and
+    /// the temporary file is renamed over `url`. The primary path therefore
+    /// never disappears, so a reader that does not hold `LibraryIO` sees either
+    /// the old or the new file. Where hard links are unavailable (another
+    /// file system) the old two-move sequence is used instead.
     private static func unserializedWrite(_ data: Data, to url: URL, fileManager: FileManager) throws {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let temporary = url.deletingLastPathComponent()
@@ -83,12 +130,21 @@ public enum DurableFile {
             try handle.close()
 
             if fileManager.fileExists(atPath: url.path) {
-                if fileManager.fileExists(atPath: backup.path) {
-                    try fileManager.removeItem(at: backup)
+                if unlink(backup.path) != 0, errno != ENOENT {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
-                try fileManager.moveItem(at: url, to: backup)
+                if linkat(AT_FDCWD, url.path, AT_FDCWD, backup.path, 0) != 0 {
+                    // No hard links here: move the primary aside, then the new file in.
+                    try fileManager.moveItem(at: url, to: backup)
+                    try fileManager.moveItem(at: temporary, to: url)
+                    OwnFileWrites.record([url, backup])
+                    return
+                }
             }
-            try fileManager.moveItem(at: temporary, to: url)
+            guard rename(temporary.path, url.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            OwnFileWrites.record([url, backup])
         } catch {
             try? fileManager.removeItem(at: temporary)
             if !fileManager.fileExists(atPath: url.path), fileManager.fileExists(atPath: backup.path) {

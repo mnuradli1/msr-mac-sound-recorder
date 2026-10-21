@@ -189,6 +189,12 @@ public struct RecordingItem: Equatable, Identifiable, Sendable {
         folderURL.appendingPathComponent("\(storageBaseName).transcript.segments.json")
     }
 
+    /// The review waveform cache (`WaveformCacheFile`), a derived sidecar the
+    /// library deletes and migrates with the recording.
+    public var waveformURL: URL {
+        folderURL.appendingPathComponent("\(storageBaseName).waveform")
+    }
+
     public init(metadata: RecordingMetadata, folderURL: URL) {
         self.metadata = metadata
         self.folderURL = folderURL

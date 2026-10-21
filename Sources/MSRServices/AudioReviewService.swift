@@ -1,4 +1,3 @@
-import Accelerate
 import AVFoundation
 import Foundation
 import MSRCore
@@ -292,25 +291,32 @@ private final class AudioCompressionSession: @unchecked Sendable {
     }
 }
 
+/// Review-waveform peaks per audio file, kept in memory for `capacity` files.
+/// The library's on-disk cache (`RecordingLibraryServing.loadWaveformCache`)
+/// is checked by the caller first; this is the fallback analysis.
 public actor WaveformAnalyzer {
+    /// Buckets shown by the review strip.
+    public static let defaultBucketCount = 96
+
     private var cache: [String: [Float]] = [:]
     private var order: [String] = []
     private let capacity: Int
 
     public init(capacity: Int = 64) { self.capacity = max(1, capacity) }
 
-    public func samples(for url: URL, bucketCount: Int = 96) async throws -> [Float] {
+    /// Peak magnitude per bucket (0...1), from `AudioLevelScanner` (one decode,
+    /// in parallel ranges for long files). Cancellable.
+    public func samples(for url: URL, bucketCount: Int = WaveformAnalyzer.defaultBucketCount) async throws -> [Float] {
         let key = "\(url.path)#\(bucketCount)"
         if let cached = cache[key] { return cached }
-        let result = try await Self.analyze(url: url, bucketCount: bucketCount)
-        cache[key] = result
-        order.removeAll { $0 == key }
-        order.append(key)
-        while order.count > capacity, let oldest = order.first {
-            order.removeFirst()
-            cache.removeValue(forKey: oldest)
-        }
+        let result = try await AudioLevelScanner.scan(url: url, bucketCount: bucketCount).buckets
+        remember(result, forKey: key)
         return result
+    }
+
+    /// Seeds the memory cache, e.g. with peaks read from the disk cache.
+    public func remember(_ samples: [Float], for url: URL, bucketCount: Int = WaveformAnalyzer.defaultBucketCount) {
+        remember(samples, forKey: "\(url.path)#\(bucketCount)")
     }
 
     public func clear() {
@@ -318,47 +324,13 @@ public actor WaveformAnalyzer {
         order.removeAll()
     }
 
-    private static func analyze(url: URL, bucketCount: Int) async throws -> [Float] {
-        let asset = AVURLAsset(url: url)
-        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
-            throw AudioReviewError.noAudioTrack
-        }
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsNonInterleaved: false
-        ])
-        guard reader.canAdd(output) else { throw AudioReviewError.noAudioTrack }
-        reader.add(output)
-        guard reader.startReading() else { throw AudioReviewError.noAudioTrack }
-
-        var peaks: [Float] = []
-        while let buffer = output.copyNextSampleBuffer() {
-            try Task.checkCancellation()
-            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
-            let length = CMBlockBufferGetDataLength(block)
-            var data = Data(count: length)
-            data.withUnsafeMutableBytes { bytes in
-                if let address = bytes.baseAddress {
-                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: address)
-                }
-            }
-            let localPeak: Float = data.withUnsafeBytes { bytes in
-                let floats = bytes.bindMemory(to: Float.self)
-                guard !floats.isEmpty else { return 0 }
-                var value: Float = 0
-                vDSP_maxmgv(Array(floats), 1, &value, vDSP_Length(floats.count))
-                return min(1, value)
-            }
-            peaks.append(localPeak)
-        }
-        guard !peaks.isEmpty else { return Array(repeating: 0, count: bucketCount) }
-        return (0..<bucketCount).map { bucket in
-            let start = bucket * peaks.count / bucketCount
-            let end = max(start + 1, (bucket + 1) * peaks.count / bucketCount)
-            return peaks[start..<min(end, peaks.count)].max() ?? 0
+    private func remember(_ samples: [Float], forKey key: String) {
+        cache[key] = samples
+        order.removeAll { $0 == key }
+        order.append(key)
+        while order.count > capacity, let oldest = order.first {
+            order.removeFirst()
+            cache.removeValue(forKey: oldest)
         }
     }
 }

@@ -98,6 +98,64 @@ struct LiveStateAndLoaderTests {
         #expect(model.libraryFolderSnapshot == LibraryFolderSnapshot.capture(folderURL: fixture.folder))
     }
 
+    @Test func aLoadThatReadBeforeARenameDoesNotPutTheOldTitleBack() async throws {
+        let fixture = try ModelFixture()
+        _ = try fixture.addRecording(name: "Before")
+        let library = GatedLibrary(folderURL: fixture.folder)
+        let model = fixture.makeModel(library: library)
+        model.loadRecordings()
+        model.select(try #require(model.recordings.first))
+
+        // A background load has read the library and is about to publish it…
+        library.armGate()
+        let load = Task { await model.refreshLibrary() }
+        while !library.gate.entered { try await Task.sleep(for: .milliseconds(5)) }
+        // …when the user renames the recording (patched into memory at once).
+        model.renameDraft = "After"
+        model.applyRename()
+        #expect(model.recordings.map(\.displayName) == ["After"])
+        library.gate.release()
+        await load.value
+        // The stale result was discarded and the load re-run.
+        #expect(model.recordings.map(\.displayName) == ["After"])
+        #expect(model.selectedRecording?.displayName == "After")
+        #expect(model.libraryFolderSnapshot == LibraryFolderSnapshot.capture(folderURL: fixture.folder))
+    }
+
+    @Test func anIdleOnlyLoadSupersedingARequiredOneStillAppliesWhileBusy() async throws {
+        let fixture = try ModelFixture()
+        _ = try fixture.addRecording(name: "First")
+        let model = fixture.makeModel()
+        await model.refreshLibrary()
+        let gate = Gate()
+        let required = Task { await model.refreshLibrary(beforeLoad: { gate.enterAndWait() }) }
+        while !gate.entered { try await Task.sleep(for: .milliseconds(5)) }
+        _ = try fixture.addRecording(name: "Second")
+        model.workflowState = .transcribing
+        // A folder-watcher style refresh supersedes the required load.
+        let idle = Task { await model.refreshLibrary(onlyWhenIdle: true) }
+        try await Task.sleep(for: .milliseconds(50))
+        gate.release()
+        await required.value
+        #expect(model.recordings.count == 2, "the superseded caller returned without a newer library")
+        await idle.value
+        model.workflowState = .ready
+    }
+
+    @Test func anOutsideTranscriptEditIsNotHiddenByAnOwnSummaryWrite() throws {
+        let fixture = try ModelFixture()
+        let recording = try fixture.addRecording(name: "Notes")
+        let model = fixture.makeModel()
+        model.loadRecordings()
+        model.select(try #require(model.recordings.first))
+        #expect(model.libraryFolderSnapshot == LibraryFolderSnapshot.capture(folderURL: fixture.folder))
+        // Someone else writes the transcript, then the app saves a summary edit.
+        try Data("Speaker 1:\nWritten elsewhere".utf8).write(to: recording.transcriptURL)
+        model.summaryText = "Mine"
+        model.flushSummaryEdits()
+        #expect(model.libraryFolderSnapshot != LibraryFolderSnapshot.capture(folderURL: fixture.folder))
+    }
+
     @Test func savedJobsUpdateMemoryInLoadAllOrder() throws {
         let fixture = try ModelFixture()
         let recording = try fixture.addRecording(name: "Jobs")
@@ -185,6 +243,16 @@ private final class ModelFixture {
         return model
     }
 
+    func makeModel(library: GatedLibrary) -> AppViewModel {
+        let model = AppViewModel(
+            recorder: FileReplayRecorder(clipURL: Self.clip),
+            libraryFactory: { _ in library },
+            recordingsFolderOverride: folder
+        )
+        model.settingsPersistenceSuspended = true
+        return model
+    }
+
     func addRecording(name: String) throws -> RecordingItem {
         let capture = folder.appendingPathComponent("capture-\(UUID().uuidString).m4a")
         try FileManager.default.copyItem(at: Self.clip, to: capture)
@@ -192,5 +260,109 @@ private final class ModelFixture {
             temporaryAudioURL: capture, requestedName: name, source: .microphone,
             startedAt: Date(), endedAt: Date().addingTimeInterval(5)
         )
+    }
+}
+
+/// A `RecordingLibrary` whose next `loadRecordings()` (once armed) blocks on
+/// `gate` after reading, outside `LibraryIO`: a background load that has read
+/// the library but not yet published it.
+private final class GatedLibrary: RecordingLibraryServing, @unchecked Sendable {
+    let base: RecordingLibrary
+    let gate = Gate()
+    private let lock = NSLock()
+    private var armed = false
+
+    init(folderURL: URL) { base = RecordingLibrary(folderURL: folderURL) }
+
+    func armGate() { lock.withLock { armed = true } }
+
+    var folderURL: URL { base.folderURL }
+
+    func loadRecordings() throws -> [RecordingItem] {
+        let loaded = try base.loadRecordings()
+        let block = lock.withLock { () -> Bool in
+            defer { armed = false }
+            return armed
+        }
+        if block { gate.enterAndWait() }
+        return loaded
+    }
+
+    func finishRecording(
+        temporaryAudioURL: URL, requestedName: String, source: AudioSource,
+        startedAt: Date, endedAt: Date, durationSecondsOverride: TimeInterval?,
+        recoveredAt: Date?, recoveryNote: String?, segmentCount: Int?,
+        confidenceReport: RecordingConfidenceReport?, recordingID: UUID?
+    ) throws -> RecordingItem {
+        try base.finishRecording(
+            temporaryAudioURL: temporaryAudioURL, requestedName: requestedName, source: source,
+            startedAt: startedAt, endedAt: endedAt, durationSecondsOverride: durationSecondsOverride,
+            recoveredAt: recoveredAt, recoveryNote: recoveryNote, segmentCount: segmentCount,
+            confidenceReport: confidenceReport, recordingID: recordingID
+        )
+    }
+
+    func importRecording(
+        sourceURL: URL, requestedName: String, source: AudioSource,
+        startedAt: Date, durationSeconds: TimeInterval, importedAt: Date,
+        confidenceReport: RecordingConfidenceReport?
+    ) throws -> RecordingItem {
+        try base.importRecording(
+            sourceURL: sourceURL, requestedName: requestedName, source: source,
+            startedAt: startedAt, durationSeconds: durationSeconds, importedAt: importedAt,
+            confidenceReport: confidenceReport
+        )
+    }
+
+    func rename(_ recording: RecordingItem, to requestedName: String) throws -> RecordingItem {
+        try base.rename(recording, to: requestedName)
+    }
+
+    func rename(_ recording: RecordingItem, to requestedName: String, source: RecordingTitleSource) throws -> RecordingItem {
+        try base.rename(recording, to: requestedName, source: source)
+    }
+
+    func renameIfTitleIsDefault(_ recording: RecordingItem, to newName: String) throws -> RecordingItem? {
+        try base.renameIfTitleIsDefault(recording, to: newName)
+    }
+
+    func migrateIfNeeded(_ recording: RecordingItem) throws -> RecordingItem { try base.migrateIfNeeded(recording) }
+
+    func writeTranscript(_ transcript: String, for recording: RecordingItem) throws -> RecordingItem {
+        try base.writeTranscript(transcript, for: recording)
+    }
+
+    func writeTranscriptBundle(_ transcript: String, segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem {
+        try base.writeTranscriptBundle(transcript, segments: segments, for: recording)
+    }
+
+    func loadTranscriptSegments(for recording: RecordingItem) -> [TranscriptSegment] { base.loadTranscriptSegments(for: recording) }
+
+    func writeSummary(_ summary: String, for recording: RecordingItem) throws -> RecordingItem {
+        try base.writeSummary(summary, for: recording)
+    }
+
+    func clearSummary(for recording: RecordingItem) throws -> RecordingItem { try base.clearSummary(for: recording) }
+
+    func renameSpeaker(_ recording: RecordingItem, label: String, to name: String) throws -> RecordingItem {
+        try base.renameSpeaker(recording, label: label, to: name)
+    }
+
+    func resetSpeakerNames(for recording: RecordingItem) throws -> RecordingItem { try base.resetSpeakerNames(for: recording) }
+
+    func resetAllSpeakerNames(for recording: RecordingItem) throws -> RecordingItem { try base.resetAllSpeakerNames(for: recording) }
+
+    func delete(_ recording: RecordingItem) throws { try base.delete(recording) }
+
+    func loadWaveformCache(for recording: RecordingItem, bucketCount: Int) -> [Float]? {
+        base.loadWaveformCache(for: recording, bucketCount: bucketCount)
+    }
+
+    func storeWaveformCache(_ samples: [Float], for recording: RecordingItem) throws {
+        try base.storeWaveformCache(samples, for: recording)
+    }
+
+    func storeWaveformCache(_ samples: [Float], for recording: RecordingItem, scannedAudio: WaveformCacheFile.AudioStamp) throws -> Bool {
+        try base.storeWaveformCache(samples, for: recording, scannedAudio: scannedAudio)
     }
 }

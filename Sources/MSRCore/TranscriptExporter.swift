@@ -1,5 +1,4 @@
 import Foundation
-import ZIPFoundation
 
 public enum TranscriptExportFormat: String, Codable, CaseIterable, Identifiable, Sendable {
     case text, markdown, srt, docx
@@ -234,42 +233,36 @@ public enum TranscriptExporter {
     }
 
     private static func writeDOCX(_ input: MeetingNotesExportInput, to url: URL) throws {
-        try? FileManager.default.removeItem(at: url)
-        let archive = try Archive(url: url, accessMode: .create)
-        try add("[Content_Types].xml", content: """
+        // Stored (uncompressed) entries: every DOCX reader accepts them, and the
+        // parts are a few kilobytes. `[Content_Types].xml` comes first.
+        var archive = ZipArchiveWriter()
+        try archive.addEntry("[Content_Types].xml", text: """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
           <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
           <Default Extension="xml" ContentType="application/xml"/>
           <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
         </Types>
-        """, to: archive)
-        try add("_rels/.rels", content: """
+        """)
+        try archive.addEntry("_rels/.rels", text: """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
           <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
         </Relationships>
-        """, to: archive)
+        """)
         let lines = try preview(input, format: .markdown).components(separatedBy: .newlines)
         let body = lines.map { line in
             let bold = line.hasPrefix("#")
             let text = line.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
             return paragraph(text, bold: bold)
         }.joined(separator: "\n")
-        try add("word/document.xml", content: """
+        try archive.addEntry("word/document.xml", text: """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
         \(body)
         <w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr></w:body></w:document>
-        """, to: archive)
-    }
-
-    private static func add(_ path: String, content: String, to archive: Archive) throws {
-        let data = Data(content.utf8)
-        try archive.addEntry(with: path, type: .file, uncompressedSize: Int64(data.count), compressionMethod: .deflate) { position, size in
-            let start = Int(position)
-            return data.subdata(in: start..<min(start + size, data.count))
-        }
+        """)
+        try archive.finalized().write(to: url, options: .atomic)
     }
 
     private static func paragraph(_ text: String, bold: Bool) -> String {

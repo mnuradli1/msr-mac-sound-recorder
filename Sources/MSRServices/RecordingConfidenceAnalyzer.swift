@@ -1,5 +1,3 @@
-import Accelerate
-import AVFoundation
 import Foundation
 import MSRCore
 
@@ -12,7 +10,30 @@ public enum RecordingConfidenceAnalyzer {
         silenceThreshold: Float = 0.01,
         now: Date = Date()
     ) async throws -> RecordingConfidenceReport {
-        let stats = try audioStats(for: audioURL)
+        try await analyzeWithWaveform(
+            audioURL: audioURL,
+            source: source,
+            expectedChannels: expectedChannels,
+            minimumDuration: minimumDuration,
+            silenceThreshold: silenceThreshold,
+            waveformBuckets: 0,
+            now: now
+        ).report
+    }
+
+    /// `analyze` plus the review waveform (`waveformBuckets` peaks, as
+    /// `WaveformAnalyzer` computes them) from the same decode, so a finished
+    /// recording's waveform cache costs no second pass.
+    public static func analyzeWithWaveform(
+        audioURL: URL,
+        source: AudioSource,
+        expectedChannels: [AudioSignalChannel: Float] = [:],
+        minimumDuration: TimeInterval = 3,
+        silenceThreshold: Float = 0.01,
+        waveformBuckets: Int = WaveformAnalyzer.defaultBucketCount,
+        now: Date = Date()
+    ) async throws -> (report: RecordingConfidenceReport, waveform: [Float]) {
+        let stats = try await audioStats(for: audioURL, waveformBuckets: waveformBuckets)
         var issues: [RecordingConfidenceIssue] = []
 
         if stats.durationSeconds <= 0 {
@@ -58,59 +79,24 @@ public enum RecordingConfidenceAnalyzer {
             }
         }
 
-        return RecordingConfidenceReport(
+        let report = RecordingConfidenceReport(
             checkedAt: now,
             durationSeconds: stats.durationSeconds,
             peakLevel: stats.peakLevel,
             averageLevel: stats.averageLevel,
             issues: issues
         )
+        return (report, stats.waveform)
     }
 
-    private static func audioStats(for url: URL) throws -> (durationSeconds: TimeInterval, peakLevel: Float, averageLevel: Float) {
-        let file = try AVAudioFile(forReading: url)
-        let format = file.processingFormat
-        let duration = format.sampleRate > 0 ? Double(file.length) / format.sampleRate : 0
-        let frameCapacity = AVAudioFrameCount(min(4_096, max(1, file.length)))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
-            return (duration, 0, 0)
-        }
-
-        var peak: Float = 0
-        var sumSquares = 0.0
-        var sampleCount = 0
-        // AVAudioFile's processing format is deinterleaved Float32, so each channel is a contiguous float run.
-        var clipped = [Float](repeating: 0, count: Int(frameCapacity))
-        var lowerBound: Float = -1
-        var upperBound: Float = 1
-
-        while file.framePosition < file.length {
-            try Task.checkCancellation()
-            try file.read(into: buffer)
-            let frames = Int(buffer.frameLength)
-            guard frames > 0 else { break }
-
-            if let channels = buffer.floatChannelData {
-                let channelCount = Int(format.channelCount)
-                let length = vDSP_Length(frames)
-                for channelIndex in 0..<channelCount {
-                    var channelPeak: Float = 0
-                    var channelRMS: Float = 0
-                    clipped.withUnsafeMutableBufferPointer { scratch in
-                        guard let scratch = scratch.baseAddress else { return }
-                        vDSP_vclip(channels[channelIndex], 1, &lowerBound, &upperBound, scratch, 1, length)
-                        vDSP_maxmgv(scratch, 1, &channelPeak, length)
-                        vDSP_rmsqv(scratch, 1, &channelRMS, length)
-                    }
-                    peak = max(peak, channelPeak)
-                    sumSquares += Double(channelRMS) * Double(channelRMS) * Double(frames)
-                    sampleCount += frames
-                }
-            }
-        }
-
-        let average = sampleCount == 0 ? 0 : Float(min(1, sqrt(sumSquares / Double(sampleCount))))
-        return (duration, peak, average)
+    /// Duration, peak and RMS of `url` (clipped to [-1, 1], all channels),
+    /// plus `waveformBuckets` review-waveform peaks from the same decode.
+    private static func audioStats(
+        for url: URL,
+        waveformBuckets: Int
+    ) async throws -> (durationSeconds: TimeInterval, peakLevel: Float, averageLevel: Float, waveform: [Float]) {
+        let levels = try await AudioLevelScanner.scan(url: url, bucketCount: waveformBuckets)
+        return (levels.durationSeconds, levels.peak, levels.rms, levels.buckets)
     }
 
     private static func expectedChannelsToCheck(for source: AudioSource) -> [AudioSignalChannel] {

@@ -40,7 +40,9 @@ final class AppViewModel: ObservableObject {
     @Published var selectedRecording: RecordingItem?
     @Published var selectedSource: AudioSource = .micAndSystem
     @Published var settings: AppSettings
-    @Published var workflowState: RecordingWorkflowState = .ready
+    @Published var workflowState: RecordingWorkflowState = .ready {
+        didSet { if libraryWatcherMissedEvents { resumeLibraryWatcherAfterBusy() } }
+    }
     @Published var statusMessage = "Ready" {
         didSet {
             guard statusMessage != oldValue else { return }
@@ -114,8 +116,11 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var savedCredentials: Set<CredentialProvider> = []
     /// Outcome of the auto-summarize step per recording in this run (scenario diagnostics).
     private(set) var autoSummaryOutcomes: [UUID: AutoSummaryOutcome] = [:]
-    @Published private var recordingSearchDocuments: [RecordingSearchDocument] = []
+    /// Matches of the current query (`nil` when not searching), as streamed by
+    /// `searchIndexer` for `searchGeneration`.
     @Published private var filteredRecordingIDs: [UUID]?
+    /// Bumped per query; results of an older query are dropped.
+    private var searchGeneration = 0
     /// The recording whose transcript is being published (auto-title runs
     /// after the job is marked completed; the summary runs afterwards, on its own).
     @Published private var publishingRecordingID: UUID?
@@ -165,10 +170,10 @@ final class AppViewModel: ObservableObject {
     private var windowSaveTask: Task<Void, Never>?
     private let globalHotkeyService = GlobalHotkeyService()
     private let folderWatcher = RecordingFolderWatcher()
-    private let searchIndexer = RecordingSearchIndexer(capacity: 64)
+    /// Full-text index (folded metadata always, transcript/summary text
+    /// compressed within a byte budget); every query runs on it, off main.
+    private let searchIndexer = RecordingSearchIndexer()
     private var searchIndexTask: Task<Void, Never>?
-    /// Whether `searchIndexTask` has yet to publish its documents.
-    private var searchIndexInFlight = false
     private var watchedFolderPath: String?
     /// The library folder as of the last load, patched for the app's own
     /// writes since; folder-watcher events that leave it unchanged are ignored.
@@ -188,6 +193,18 @@ final class AppViewModel: ObservableObject {
     /// `onlyWhenIdle`), and the superseded callers waiting for one at least as new.
     private var completedLibraryLoadGeneration = 0
     private var libraryLoadWaiters: [(generation: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    /// The newest generation started by a load that must be applied (not
+    /// `onlyWhenIdle`). An idle-only load that supersedes it is applied even
+    /// when busy, because the superseded caller waits for its result.
+    private var newestRequiredLibraryLoadGeneration = 0
+    /// Bumped by every in-memory patch of the library (`recordings`, row
+    /// facts) made without a reload: rename, speaker rename, delete, sidecar
+    /// writes. A background load that was reading while it changed would put
+    /// the old state back, so its result is discarded and the load re-run.
+    private var libraryMutationCounter = 0
+    /// The folder watcher dropped an event while recording or busy; checked
+    /// again (with a content re-index) once the workflow is idle.
+    private var libraryWatcherMissedEvents = false
     /// Parsed Read-mode transcript; cleared whenever the transcript text or
     /// segments change (not published: it is derived state).
     private var readModeCache: ReadableTranscript?
@@ -478,10 +495,10 @@ final class AppViewModel: ObservableObject {
     var filteredRecordings: [RecordingItem] {
         let matches: [RecordingItem]
         if let filteredRecordingIDs {
-            let lookup = Dictionary(uniqueKeysWithValues: recordingSearchDocuments.map { ($0.recording.id, $0.recording) })
+            let lookup = Dictionary(recordings.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             matches = filteredRecordingIDs.compactMap { lookup[$0] }
         } else {
-            matches = recordingSearchDocuments.map(\.recording)
+            matches = recordings
         }
         switch settings.sortOrder {
         case .newest: return matches.sorted { $0.startedAt > $1.startedAt }
@@ -734,31 +751,52 @@ final class AppViewModel: ObservableObject {
     ///   - onlyWhenIdle: drop the result when a recording session started or
     ///     the workflow became busy meanwhile (background refreshes).
     ///   - beforeLoad: file work to do first, on the loader (e.g. deleting job files).
+    ///
+    /// When the in-memory library was patched (rename, delete, …) while the
+    /// load was reading, its result predates the patch: it is discarded and
+    /// the load re-run once, with a fresh folder snapshot.
     func refreshLibrary(
         folderSnapshot: LibraryFolderSnapshot? = nil,
         onlyWhenIdle: Bool = false,
         beforeLoad: (@Sendable () -> Void)? = nil
     ) async {
-        libraryLoadGeneration += 1
-        let generation = libraryLoadGeneration
-        let jobsGeneration = transcriptionJobsGeneration
-        let result = await libraryLoader.load(
-            library: library(),
-            jobsFolder: recordingsFolderURL,
-            folderSnapshot: folderSnapshot,
-            beforeLoad: beforeLoad
-        )
-        guard generation == libraryLoadGeneration else {
-            // Superseded: wait for the newer load instead.
-            if completedLibraryLoadGeneration < generation {
-                await withCheckedContinuation { libraryLoadWaiters.append((generation, $0)) }
+        var folderSnapshot = folderSnapshot
+        var beforeLoad = beforeLoad
+        var mayRetry = true
+        while true {
+            libraryLoadGeneration += 1
+            let generation = libraryLoadGeneration
+            if !onlyWhenIdle { newestRequiredLibraryLoadGeneration = generation }
+            let jobsGeneration = transcriptionJobsGeneration
+            let mutations = libraryMutationCounter
+            let result = await libraryLoader.load(
+                library: library(),
+                jobsFolder: recordingsFolderURL,
+                folderSnapshot: folderSnapshot,
+                beforeLoad: beforeLoad
+            )
+            guard generation == libraryLoadGeneration else {
+                // Superseded: wait for the newer load instead.
+                if completedLibraryLoadGeneration < generation {
+                    await withCheckedContinuation { libraryLoadWaiters.append((generation, $0)) }
+                }
+                return
             }
+            if mayRetry, mutations != libraryMutationCounter {
+                mayRetry = false
+                folderSnapshot = nil
+                beforeLoad = nil
+                continue
+            }
+            // An idle-only result is dropped while busy, unless a load that
+            // must apply was superseded by this one and waits for it.
+            let required = newestRequiredLibraryLoadGeneration > completedLibraryLoadGeneration
+            if required || !(onlyWhenIdle && (workflowState.isRecording || workflowState.isBusy)) {
+                applyLibraryLoad(result, jobsGeneration: jobsGeneration)
+            }
+            completeLibraryLoad(generation)
             return
         }
-        if !(onlyWhenIdle && (workflowState.isRecording || workflowState.isBusy)) {
-            applyLibraryLoad(result, jobsGeneration: jobsGeneration)
-        }
-        completeLibraryLoad(generation)
     }
 
     /// Records that load `generation` finished and resumes the superseded
@@ -789,7 +827,6 @@ final class AppViewModel: ObservableObject {
         libraryFolderSnapshot = result.folderSnapshot
         recordingRowFacts = result.rowFacts
         recordings = loaded
-        recordingSearchDocuments = recordings.map { RecordingSearchDocument(recording: $0) }
         startSearchIndexing()
         if let selectedRecording,
            let refreshed = recordings.first(where: { $0.id == selectedRecording.id }) {
@@ -815,21 +852,19 @@ final class AppViewModel: ObservableObject {
         refreshSetupHealth()
     }
 
-    /// Builds full-text search documents for `recordings` off the main actor.
-    /// Restarted whenever `recordings` changes, so a pass started before a
-    /// patch (`applyUpdatedRecording`) never publishes the old state.
+    /// Mirrors `recordings` into the search index (metadata only, cheap), re-runs
+    /// an active query, then reads the transcripts and summaries that are new
+    /// or changed on disk, at utility priority. A query never waits for that
+    /// pass: documents not read yet are read by the query itself.
     private func startSearchIndexing() {
         searchIndexTask?.cancel()
-        searchIndexInFlight = true
         let snapshot = recordings
-        searchIndexTask = Task { [weak self] in
-            guard let self else { return }
-            let documents = await searchIndexer.documents(for: snapshot)
+        let indexer = searchIndexer
+        searchIndexTask = Task(priority: .utility) { [weak self] in
+            await indexer.update(snapshot)
             guard !Task.isCancelled else { return }
-            self.searchIndexInFlight = false
-            guard self.recordings.map(\.id) == snapshot.map(\.id) else { return }
-            self.recordingSearchDocuments = documents
-            self.scheduleRecordingSearch()
+            if let self, self.isSearchingRecordings { self.scheduleRecordingSearch() }
+            await indexer.indexContent()
         }
     }
 
@@ -838,6 +873,7 @@ final class AppViewModel: ObservableObject {
     /// document, selection; `ownWrites` are recorded as the app's own so the
     /// folder watcher does not reload for them.
     private func applyUpdatedRecording(_ updated: RecordingItem, ownWrites: [URL]) {
+        libraryMutationCounter += 1
         if let index = recordings.firstIndex(where: { $0.id == updated.id }) {
             recordings[index] = updated
         }
@@ -846,8 +882,6 @@ final class AppViewModel: ObservableObject {
             RecordingRowFacts(recording: updated, hasTranscript: $0.hasTranscript, hasSummary: $0.hasSummary)
         } ?? LibraryLoader.rowFacts(for: updated, listing: nil)
         refreshSearchDocument(for: updated)
-        if isSearchingRecordings { scheduleRecordingSearch() }
-        if searchIndexInFlight { startSearchIndexing() }
         if selectedRecording?.id == updated.id {
             selectedRecording = updated
         }
@@ -859,22 +893,39 @@ final class AppViewModel: ObservableObject {
         scheduleRecordingSearch()
     }
 
+    /// Runs the current query after a short debounce. Results stream in:
+    /// matches decided from memory first, then those whose text had to be read
+    /// from disk. A newer query (generation) or a cleared field drops them.
     func scheduleRecordingSearch() {
         recordingSearchTask?.cancel()
-        let documents = recordingSearchDocuments
+        searchGeneration += 1
+        let generation = searchGeneration
         let query = recordingSearchQuery
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             filteredRecordingIDs = nil
             return
         }
+        let indexer = searchIndexer
         recordingSearchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
+            try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
-            let ids = await Task.detached(priority: .userInitiated) {
-                RecordingSearch.filter(documents, query: query).map { $0.recording.id }
-            }.value
-            guard !Task.isCancelled else { return }
-            self?.filteredRecordingIDs = ids
+            let (updates, continuation) = AsyncStream.makeStream(of: RecordingSearchIndexer.Progress.self)
+            let producer = Task.detached(priority: .userInitiated) {
+                await indexer.search(query) { continuation.yield($0) }
+                continuation.finish()
+            }
+            await withTaskCancellationHandler {
+                for await update in updates {
+                    guard let self, generation == self.searchGeneration else { break }
+                    // An empty partial result would flash "no results" before
+                    // the disk-backed matches arrive.
+                    if update.isComplete || !update.matches.isEmpty {
+                        self.filteredRecordingIDs = update.matches
+                    }
+                }
+            } onCancel: {
+                producer.cancel()
+            }
         }
     }
 
@@ -1042,12 +1093,12 @@ final class AppViewModel: ObservableObject {
             statusMessage = "Importing \(url.lastPathComponent)"
             do {
                 let duration = try await audioDuration(for: url)
-                let confidenceReport = await confidenceReportForImportedRecording(url: url, duration: duration)
+                let (confidenceReport, reviewWaveform) = await confidenceReportForImportedRecording(url: url, duration: duration)
                 let recordingLibrary = library()
                 let requestedName = url.deletingPathExtension().lastPathComponent
                 let now = Date()
                 lastImported = try await libraryLoader.run {
-                    try recordingLibrary.importRecording(
+                    let imported = try recordingLibrary.importRecording(
                         sourceURL: url,
                         requestedName: requestedName,
                         source: .microphone,
@@ -1056,6 +1107,9 @@ final class AppViewModel: ObservableObject {
                         importedAt: now,
                         confidenceReport: confidenceReport
                     )
+                    // The level check decoded the file once; keep its waveform.
+                    if let reviewWaveform { try? recordingLibrary.storeWaveformCache(reviewWaveform, for: imported) }
+                    return imported
                 }
                 lastError = nil
             } catch {
@@ -1478,7 +1532,9 @@ final class AppViewModel: ObservableObject {
                 finalTemporaryURL = try makeFinalTemporaryAudioURL()
                 try await AudioTrackMixer.concatenateToSingleM4A(inputs: segmentURLs, outputURL: finalTemporaryURL)
             }
-            let confidenceReport = try await RecordingConfidenceAnalyzer.analyze(
+            // The same decode yields the review waveform, cached next to the
+            // recording below so its first selection needs no analysis.
+            let (confidenceReport, reviewWaveform) = try await RecordingConfidenceAnalyzer.analyzeWithWaveform(
                 audioURL: finalTemporaryURL,
                 source: source,
                 expectedChannels: [
@@ -1486,7 +1542,8 @@ final class AppViewModel: ObservableObject {
                     .system: systemPeakDuringRecording
                 ],
                 minimumDuration: 3,
-                silenceThreshold: Float(settings.silenceThreshold)
+                silenceThreshold: Float(settings.silenceThreshold),
+                waveformBuckets: WaveformAnalyzer.defaultBucketCount
             )
             if var manifest = currentSessionManifest {
                 manifest.state = .finalizing
@@ -1523,6 +1580,8 @@ final class AppViewModel: ObservableObject {
                         try? FileManager.default.removeItem(at: url)
                     }
                 }
+                // Best effort: without it the first selection analyzes the audio.
+                try? recordingLibrary.storeWaveformCache(reviewWaveform, for: recording)
                 return recording
             }
             if let currentSessionManifest {
@@ -1684,9 +1743,11 @@ final class AppViewModel: ObservableObject {
             }
             // Gone from the list at once; the job files and the full reload
             // follow off the main actor.
+            libraryMutationCounter += 1
             recordings.removeAll { $0.id == targetID }
             recordingRowFacts[targetID] = nil
-            recordingSearchDocuments.removeAll { $0.recording.id == targetID }
+            let indexer = searchIndexer
+            Task { await indexer.remove(targetID) }
             if isSearchingRecordings { scheduleRecordingSearch() }
             if selectedRecording == nil, let first = recordings.first {
                 selectedRecording = first
@@ -1856,7 +1917,7 @@ final class AppViewModel: ObservableObject {
             let decoded = try await aiService.summarize(transcript: transcript)
             let written = try library().writeSummary(decoded.markdown, for: selectedRecording)
             summaryProviderByRecording[targetID] = provider
-            noteSidecarsChanged(for: written)
+            noteSidecarsChanged(for: written, written: [written.summaryURL])
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 summaryText = decoded.markdown
                 // Our own write: the next library refresh must not reload over it.
@@ -2128,7 +2189,7 @@ final class AppViewModel: ObservableObject {
         do {
             let updated = try library().writeTranscript(transcriptText, for: recording)
             selectedRecording = updated
-            noteSidecarsChanged(for: updated)
+            noteSidecarsChanged(for: updated, written: [updated.transcriptURL])
             // Our own write: the next library refresh must not reload over it.
             if lastLoadedSidecarStamp?.recordingID == updated.id {
                 lastLoadedSidecarStamp = sidecarStamp(for: updated)
@@ -2162,7 +2223,7 @@ final class AppViewModel: ObservableObject {
         if (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) == summaryText { return }
         do {
             let updated = try library().writeSummary(summaryText, for: recording)
-            noteSidecarsChanged(for: updated)
+            noteSidecarsChanged(for: updated, written: [updated.summaryURL])
             if lastLoadedSidecarStamp?.recordingID == recording.id {
                 lastLoadedSidecarStamp = sidecarStamp(for: recording)
             }
@@ -2277,11 +2338,35 @@ final class AppViewModel: ObservableObject {
             // Listed on the watcher queue, off the main thread.
             let snapshot = LibraryFolderSnapshot.capture(folderURL: folder)
             Task { @MainActor in
-                guard let self, !self.workflowState.isRecording, !self.workflowState.isBusy else { return }
+                guard let self else { return }
+                guard !self.workflowState.isRecording, !self.workflowState.isBusy else {
+                    self.libraryWatcherMissedEvents = true
+                    return
+                }
                 // Only the app's own writes since the last load: nothing to reload.
                 if let snapshot, snapshot == self.libraryFolderSnapshot { return }
                 await self.refreshLibrary(folderSnapshot: snapshot, onlyWhenIdle: true)
             }
+        }
+    }
+
+    /// The workflow became idle after the watcher dropped events while
+    /// recording or busy: compares the folder again (reloading when it
+    /// changed), then re-reads changed transcripts and summaries for search
+    /// in any case, so outside edits made meanwhile become searchable.
+    private func resumeLibraryWatcherAfterBusy() {
+        guard libraryWatcherMissedEvents, !workflowState.isRecording, !workflowState.isBusy else { return }
+        libraryWatcherMissedEvents = false
+        let folder = recordingsFolderURL
+        let indexer = searchIndexer
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.libraryLoader.run { LibraryFolderSnapshot.capture(folderURL: folder) }
+            if snapshot == nil || snapshot != self.libraryFolderSnapshot {
+                await self.refreshLibrary(folderSnapshot: snapshot, onlyWhenIdle: true)
+            }
+            await Task.detached(priority: .utility) { await indexer.indexContent() }.value
+            if self.isSearchingRecordings { self.scheduleRecordingSearch() }
         }
     }
 
@@ -2736,7 +2821,7 @@ final class AppViewModel: ObservableObject {
     private func applyAutoSummary(_ outcome: TranscriptSummaryOutcome, recordingID: UUID, provider: TextModelProvider?) {
         if let markdown = outcome.markdown {
             if let provider { summaryProviderByRecording[recordingID] = provider }
-            noteSidecarsChanged(for: outcome.recording)
+            noteSidecarsChanged(for: outcome.recording, written: [outcome.recording.summaryURL])
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recordingID, selectedID: selectedRecording?.id) {
                 let editor = summaryText
                 if editor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || editor == outcome.previousSummary {
@@ -2910,26 +2995,35 @@ final class AppViewModel: ObservableObject {
         return parsed
     }
 
-    /// After the app wrote (or cleared) a recording's transcript, segments or
-    /// summary: refreshes its search document and sidebar facts, and records
-    /// the files as the app's own so the folder watcher does not reload for them.
-    private func noteSidecarsChanged(for recording: RecordingItem) {
+    /// After the app wrote (or cleared) some of a recording's sidecars
+    /// (`written`: exactly the files it wrote): refreshes its search document
+    /// and sidebar facts, and records those files as the app's own so the
+    /// folder watcher does not reload for them.
+    private func noteSidecarsChanged(for recording: RecordingItem, written: [URL]) {
+        libraryMutationCounter += 1
         refreshSearchDocument(for: recording)
         if isSearchingRecordings { scheduleRecordingSearch() }
         recordingRowFacts[recording.id] = LibraryLoader.rowFacts(for: recording, listing: nil)
-        noteOwnLibraryWrites([recording.transcriptURL, recording.transcriptSegmentsURL, recording.summaryURL])
+        noteOwnLibraryWrites(written)
     }
 
     /// Patches `libraryFolderSnapshot` for files the app itself just wrote or
-    /// removed (each with its `DurableFile` backup).
+    /// removed (each with its `DurableFile` backup), with the stamps those
+    /// writes recorded under `LibraryIO` (`OwnFileWrites`). The files are never
+    /// re-read here: that would also absorb an outside change made since. A
+    /// file without a recorded stamp keeps its old entry (the watcher then
+    /// reloads, which is always safe).
     private func noteOwnLibraryWrites(_ urls: [URL]) {
+        let folder = library().folderURL.standardizedFileURL.path
+        let files = urls
+            .filter { $0.deletingLastPathComponent().standardizedFileURL.path == folder }
+            .flatMap { [$0, DurableFile.backupURL(for: $0)] }
+        guard !files.isEmpty else { return }
+        let recorded = OwnFileWrites.take(files)
         guard var snapshot = libraryFolderSnapshot else { return }
-        let folder = library().folderURL
-        let names = urls
-            .filter { $0.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path }
-            .flatMap { [$0.lastPathComponent, DurableFile.backupURL(for: $0).lastPathComponent] }
-        guard !names.isEmpty else { return }
-        snapshot.refresh(fileNames: names, in: folder)
+        for (url, status) in zip(files, recorded) {
+            if let status { snapshot.patch(url.lastPathComponent, with: status) }
+        }
         libraryFolderSnapshot = snapshot
     }
 
@@ -3037,23 +3131,31 @@ final class AppViewModel: ObservableObject {
             return
         }
         let recordingLibrary = library()
-        transcriptText = (try? String(contentsOf: selectedRecording.transcriptURL, encoding: .utf8)) ?? ""
-        let savedSegments = recordingLibrary.loadTranscriptSegments(for: selectedRecording)
+        // One consistent read, never between the steps of an off-main durable write.
+        let (transcript, savedSegments, summary) = LibraryIO.serialized {
+            (
+                (try? String(contentsOf: selectedRecording.transcriptURL, encoding: .utf8)) ?? "",
+                recordingLibrary.loadTranscriptSegments(for: selectedRecording),
+                (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
+            )
+        }
+        transcriptText = transcript
         transcriptSegments = savedSegments.isEmpty ? TranscriptParser.segments(from: transcriptText) : savedSegments
-        summaryText = (try? String(contentsOf: selectedRecording.summaryURL, encoding: .utf8)) ?? ""
+        summaryText = summary
         playback.trimStartSeconds = 0
         playback.trimEndSeconds = selectedRecording.durationSeconds
         transcriptSaveMessage = ""
         updateExportPreview()
         waveformTask?.cancel()
         let targetID = selectedRecording.id
-        let audioURL = selectedRecording.audioURL
+        let waveformRecording = selectedRecording
+        let analyzer = waveformAnalyzer
         waveformTask = Task { [weak self] in
-            guard let self else { return }
-            if let samples = try? await waveformAnalyzer.samples(for: audioURL, bucketCount: 96), !Task.isCancelled {
-                await MainActor.run {
-                    if self.selectedRecording?.id == targetID { self.playback.reviewWaveform = samples }
-                }
+            guard let result = await Self.reviewWaveform(for: waveformRecording, library: recordingLibrary, analyzer: analyzer),
+                  let self else { return }
+            if result.stored { self.noteOwnLibraryWrites([waveformRecording.waveformURL]) }
+            if !Task.isCancelled, self.selectedRecording?.id == targetID {
+                self.playback.reviewWaveform = result.samples
             }
         }
         selectedTranscriptionJob = loadTranscriptionJobForSelection(selectedRecording)
@@ -3062,6 +3164,27 @@ final class AppViewModel: ObservableObject {
             preparePlayback(for: selectedRecording)
         }
         lastLoadedSidecarStamp = sidecarStamp(for: selectedRecording)
+    }
+
+    /// The review waveform of `recording`, off the main actor: the library's
+    /// sidecar cache when it matches the audio file, else an analysis
+    /// (cancellable), which is then stored (`stored`) for next time.
+    nonisolated private static func reviewWaveform(
+        for recording: RecordingItem,
+        library: any RecordingLibraryServing,
+        analyzer: WaveformAnalyzer
+    ) async -> (samples: [Float], stored: Bool)? {
+        let buckets = WaveformAnalyzer.defaultBucketCount
+        if let cached = library.loadWaveformCache(for: recording, bucketCount: buckets) {
+            return (cached, false)
+        }
+        // Stamped before the scan: a file replaced or edited while it is
+        // scanned is not cached under its new stamp.
+        let scannedAudio = WaveformCacheFile.AudioStamp(audioURL: recording.audioURL)
+        guard let samples = try? await analyzer.samples(for: recording.audioURL, bucketCount: buckets) else { return nil }
+        guard let scannedAudio else { return (samples, false) }
+        let stored = (try? library.storeWaveformCache(samples, for: recording, scannedAudio: scannedAudio)) ?? false
+        return (samples, stored)
     }
 
     /// Identity plus sidecar modification dates of a recording, so a library
@@ -3087,24 +3210,13 @@ final class AppViewModel: ObservableObject {
         )
     }
 
-    private func makeSearchDocuments(for recordings: [RecordingItem]) -> [RecordingSearchDocument] {
-        recordings.map(makeSearchDocument)
-    }
-
-    private func makeSearchDocument(for recording: RecordingItem) -> RecordingSearchDocument {
-        RecordingSearchDocument(
-            recording: recording,
-            transcriptText: readTextIfExists(at: recording.transcriptURL),
-            summaryText: readTextIfExists(at: recording.summaryURL)
-        )
-    }
-
+    /// Re-indexes `recording` (metadata, and its transcript and summary read
+    /// again) off the main actor, then re-runs an active query.
     private func refreshSearchDocument(for recording: RecordingItem) {
-        let document = makeSearchDocument(for: recording)
-        if let index = recordingSearchDocuments.firstIndex(where: { $0.recording.id == recording.id }) {
-            recordingSearchDocuments[index] = document
-        } else {
-            recordingSearchDocuments.insert(document, at: 0)
+        let indexer = searchIndexer
+        Task { [weak self] in
+            await indexer.refresh(recording)
+            if let self, self.isSearchingRecordings { self.scheduleRecordingSearch() }
         }
     }
 
@@ -3138,19 +3250,23 @@ final class AppViewModel: ObservableObject {
         return duration
     }
 
-    private func confidenceReportForImportedRecording(url: URL, duration: TimeInterval) async -> RecordingConfidenceReport {
+    /// The imported file's level report and, from the same decode, its review
+    /// waveform (`nil` when the file could not be decoded).
+    private func confidenceReportForImportedRecording(url: URL, duration: TimeInterval) async -> (RecordingConfidenceReport, [Float]?) {
         do {
-            var report = try await RecordingConfidenceAnalyzer.analyze(
+            let analysis = try await RecordingConfidenceAnalyzer.analyzeWithWaveform(
                 audioURL: url,
                 source: .microphone,
                 expectedChannels: [.microphone: 1],
                 minimumDuration: 1,
-                silenceThreshold: 0.01
+                silenceThreshold: 0.01,
+                waveformBuckets: WaveformAnalyzer.defaultBucketCount
             )
+            var report = analysis.report
             report.issues.append(importedSourceIssue)
-            return report
+            return (report, analysis.waveform)
         } catch {
-            return RecordingConfidenceReport(
+            return (RecordingConfidenceReport(
                 checkedAt: Date(),
                 durationSeconds: duration,
                 peakLevel: 0,
@@ -3163,7 +3279,7 @@ final class AppViewModel: ObservableObject {
                         message: "Audio level could not be checked for this file format."
                     )
                 ]
-            )
+            ), nil)
         }
     }
 
