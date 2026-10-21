@@ -69,7 +69,14 @@ enum CrashLogService {
     }
 }
 
+@MainActor
 final class MSRApplicationDelegate: NSObject, NSApplicationDelegate {
+    /// The app's view model, handed over by the main scene at launch; read by
+    /// `applicationShouldTerminate` (see `MSRMeetingRecorderApp.swift`).
+    weak var viewModel: AppViewModel?
+    /// A `.terminateLater` reply is pending while the session is being saved.
+    var isFinalizingBeforeQuit = false
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         CrashLogService.install()
         guard let bundleID = Bundle.main.bundleIdentifier else { return }

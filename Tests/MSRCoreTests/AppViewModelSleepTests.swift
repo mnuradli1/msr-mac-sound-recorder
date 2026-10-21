@@ -188,6 +188,76 @@ struct AppViewModelSleepTests {
         #expect(duration > 7.5)
     }
 
+    @Test func failedKeySaveDuringRecordingLeavesTheRecordingRunning() async throws {
+        let fixture = try await SleepFixture()
+        let model = fixture.model
+        model.settingsPersistenceSuspended = true
+        model.settings.rememberCredentials = false
+        await model.startRecording()
+        let recordingState = model.workflowState
+        #expect(model.isRecording)
+        // Whitespace only: rejected by the key store (no Keychain involved).
+        model.elevenLabsKeyDraft = "   "
+        #expect(!model.saveAPIKeys())
+        #expect(model.workflowState == recordingState)
+        #expect(model.isRecording)
+        #expect(model.credentialStatusSeverity == .error)
+        #expect(!model.credentialStatusMessage.isEmpty)
+        #expect(model.statusMessage == model.credentialStatusMessage)
+        // Onboarding stays open (not marked done) when the save fails.
+        model.settings.hasCompletedOnboarding = false
+        #expect(!Onboarding.complete(model, saveKeys: true))
+        #expect(!model.settings.hasCompletedOnboarding)
+        #expect(model.isRecording)
+        await model.stopRecording()
+        #expect(try fixture.library.loadRecordings().count == 1)
+    }
+
+    @Test func quitWhileRecordingSavesTheSessionFirst() async throws {
+        let fixture = try await SleepFixture()
+        let model = fixture.model
+        #expect(!model.needsFinalizeBeforeQuit)
+        await model.startRecording()
+        #expect(model.needsFinalizeBeforeQuit)
+        await model.finalizeBeforeQuit()
+        #expect(model.workflowState == .saved)
+        #expect(!model.needsFinalizeBeforeQuit)
+        #expect(fixture.recorder.stopCount == 1)
+        #expect(try fixture.library.loadRecordings().count == 1)
+        #expect(try fixture.manifests.loadAll().isEmpty)
+        let names = try FileManager.default.contentsOfDirectory(atPath: fixture.folder.path)
+        #expect(!names.contains { $0.hasPrefix(".in-progress-") })
+        // Nothing left to save: a second quit request returns at once.
+        await model.finalizeBeforeQuit()
+        #expect(fixture.recorder.stopCount == 1)
+    }
+
+    @Test func quitWhilePausedOrStartingSavesTheSessionOnce() async throws {
+        let paused = try await SleepFixture()
+        await paused.model.startRecording()
+        await paused.model.pauseRecording()
+        #expect(paused.model.needsFinalizeBeforeQuit)
+        await paused.model.finalizeBeforeQuit()
+        #expect(paused.model.workflowState == .saved)
+        #expect(try paused.library.loadRecordings().count == 1)
+
+        // Quit while the start is still in flight: waits for it, then saves.
+        let starting = try await SleepFixture()
+        let barrier = SleepTestBarrier()
+        starting.recorder.startBarrier = barrier
+        let start = Task { await starting.model.startRecording() }
+        await barrier.waitUntilEntered()
+        #expect(starting.model.needsFinalizeBeforeQuit)
+        let quit = Task { await starting.model.finalizeBeforeQuit() }
+        await settleActor()
+        await barrier.release()
+        await start.value
+        await quit.value
+        #expect(starting.recorder.stopCount == 1)
+        #expect(starting.model.workflowState == .saved)
+        #expect(try starting.library.loadRecordings().count == 1)
+    }
+
     private func waitForSleepRequest(_ model: AppViewModel) async throws {
         for _ in 0..<1_000 {
             if model.sleepSafetyPending { return }

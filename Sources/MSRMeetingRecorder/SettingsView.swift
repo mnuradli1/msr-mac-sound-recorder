@@ -360,6 +360,8 @@ private struct AdvancedSettingsTab: View {
         Form {
             Section("Menu Bar & Shortcuts") {
                 Toggle("Show menu bar control", isOn: $viewModel.settings.showMenuBarControl)
+                Toggle("Show timer in menu bar", isOn: $viewModel.settings.showMenuBarTimer)
+                    .disabled(!viewModel.settings.showMenuBarControl)
                 Toggle("Enable global Control–Option–R shortcut", isOn: $viewModel.settings.globalShortcutEnabled)
             }
             Section {

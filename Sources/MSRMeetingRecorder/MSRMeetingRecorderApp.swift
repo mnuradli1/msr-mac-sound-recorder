@@ -9,9 +9,12 @@ struct MSRMeetingRecorderApp: App {
     @StateObject private var viewModel = AppViewModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: Self.mainWindowID) {
             ContentView(viewModel: viewModel)
+                .background(QuickRecorderInstaller(viewModel: viewModel))
+                .background(MainWindowTagger())
                 .task {
+                    applicationDelegate.viewModel = viewModel
                     UISnapshotCapture.prepareIfRequested(viewModel: viewModel)
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
@@ -161,19 +164,11 @@ struct MSRMeetingRecorderApp: App {
                 .environment(\.locale, preferredLocale)
         }
 
-        MenuBarExtra(isInserted: .constant(viewModel.settings.showMenuBarControl)) {
-            Button("Show MSR") { viewModel.showMainWindow() }
-            Button(viewModel.isRecording ? "Stop Recording" : "Start Recording") {
-                Task { await viewModel.toggleRecording() }
-            }
-            .disabled(!viewModel.canToggleRecording)
-            Divider()
-            Button("Quit") { NSApp.terminate(nil) }
-        } label: {
-            Image(systemName: viewModel.isRecording ? "record.circle.fill" : "waveform.circle")
-        }
-        .menuBarExtraStyle(.menu)
+        // The menu-bar quick recorder is an AppKit status item + panel
+        // (`QuickRecorderController`), installed by `QuickRecorderInstaller`.
     }
+
+    static let mainWindowID = "main"
 
     private var preferredColorScheme: ColorScheme? {
         switch viewModel.settings.theme {
@@ -188,6 +183,121 @@ struct MSRMeetingRecorderApp: App {
         case .system: .current
         case .english: Locale(identifier: "en")
         case .indonesian: Locale(identifier: "id")
+        }
+    }
+}
+
+/// Installs the menu-bar quick recorder as soon as the main window's content
+/// exists, and hands it the scene's `openWindow` so "Open MSR" can re-create
+/// the main window after it was closed.
+private struct QuickRecorderInstaller: View {
+    let viewModel: AppViewModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onAppear {
+                let openWindow = openWindow
+                viewModel.installQuickRecorder {
+                    // An existing main window (visible, hidden or minimized) is
+                    // brought forward; only when none exists is one re-created.
+                    // The panel and Settings windows are never candidates.
+                    if !MainWindowLocator.bringForward() {
+                        openWindow(id: MSRMeetingRecorderApp.mainWindowID)
+                    }
+                }
+            }
+    }
+}
+
+/// Finds the main window (the `WindowGroup(id: "main")` window hosting
+/// `ContentView`) without relying on titles: the window `MainWindowTagger`
+/// recorded from inside `ContentView`, else a window whose SwiftUI identifier
+/// is the scene id ("main-AppWindow-1"). Never the Settings windows or the
+/// quick-recorder panel.
+@MainActor
+enum MainWindowLocator {
+    /// Cleared when that window closes (see `MainWindowTaggerView`).
+    fileprivate static weak var tagged: NSWindow?
+
+    static func isMainWindow(_ window: NSWindow) -> Bool {
+        if let tagged, window === tagged { return true }
+        guard let identifier = window.identifier?.rawValue else { return false }
+        let id = MSRMeetingRecorderApp.mainWindowID
+        return identifier == id || identifier.hasPrefix(id + "-")
+    }
+
+    /// The open main window, whether visible, hidden (app hidden or ordered
+    /// out) or minimized; `nil` once it was closed.
+    static func existing() -> NSWindow? {
+        if let tagged, NSApp.windows.contains(where: { $0 === tagged }) { return tagged }
+        return NSApp.windows.first { window in
+            window.sheetParent == nil && isMainWindow(window) && (window.isVisible || window.isMiniaturized)
+        }
+    }
+
+    /// Unhides the app, then brings the existing main window forward.
+    /// Returns `false` when there is none (the caller re-creates it).
+    @discardableResult
+    static func bringForward() -> Bool {
+        NSApp.unhide(nil)
+        guard let window = existing() else { return false }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        return true
+    }
+}
+
+/// Zero-size background of `ContentView` that records its window for `MainWindowLocator`.
+private struct MainWindowTagger: NSViewRepresentable {
+    func makeNSView(context: Context) -> MainWindowTaggerView { MainWindowTaggerView() }
+    func updateNSView(_ nsView: MainWindowTaggerView, context: Context) {}
+}
+
+private final class MainWindowTaggerView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: nil)
+        guard let window else { return }
+        MainWindowLocator.tagged = window
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowWillClose(_:)), name: NSWindow.willCloseNotification, object: window
+        )
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        if MainWindowLocator.tagged === notification.object as? NSWindow {
+            MainWindowLocator.tagged = nil
+        }
+    }
+}
+
+/// Quit while a recording session is active or paused finalizes it first
+/// (the same non-cancellable save as Stop), then lets the app terminate.
+extension MSRApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let viewModel, viewModel.needsFinalizeBeforeQuit else { return .terminateNow }
+        // A second Quit while saving: the pending reply already ends the app.
+        guard !isFinalizingBeforeQuit else { return .terminateCancel }
+        isFinalizingBeforeQuit = true
+        Task { @MainActor in
+            await viewModel.finalizeBeforeQuit()
+            self.isFinalizingBeforeQuit = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    /// `NSApp.terminate` from a run-loop callout, as a menu click does. Called
+    /// from inside a main-actor job (a main-queue block, e.g. a `Task`), the
+    /// `.terminateLater` wait would hold the main queue and the finalization
+    /// task above could never run.
+    static func requestTermination() {
+        RunLoop.main.perform {
+            MainActor.assumeIsolated { NSApp.terminate(nil) }
         }
     }
 }

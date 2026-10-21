@@ -14,7 +14,7 @@ The best next visual direction is:
 MSR should feel like a tiny meeting recorder first, not a file utility. The first thing users should see is whether they can record, whether audio is actually coming in, and what the next action is after saving.
 
 Reference wireframe: `artifacts/msr-kiss-ui-wireframe.svg`  
-Current UI screenshot: `artifacts/msr-current-ui.png`
+Current UI screenshot: `artifacts/msr-current-ui.png` (removed in 1.4 during the artifacts cleanup; see the `artifacts/ui-after-*.png` set for the current UI)
 
 ## Priority Findings
 

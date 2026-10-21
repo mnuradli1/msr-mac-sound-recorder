@@ -489,6 +489,10 @@ final class UIWalkthrough {
         viewModel.settings.language = .english
         viewModel.settings.sortOrder = .newest
         viewModel.settings.autoTranscribe = false
+        // The first-run sheet would cover the window; step 13 opens it on purpose.
+        if !UISnapshotCapture.requestsOnboarding {
+            viewModel.settings.hasCompletedOnboarding = true
+        }
         if !viewModel.credentialAvailable(for: viewModel.settings.provider),
            viewModel.credentialAvailable(for: .elevenLabs) {
             viewModel.settings.provider = .elevenLabs
@@ -544,6 +548,9 @@ final class UIWalkthrough {
         await step("9a-command-delete-in-text-field") { try await self.commandDeleteInTextField(window: window) }
         await step("9b-menu-delete-with-confirmation") { try await self.deleteWithConfirmation(window: window) }
         await step("10-status-bar") { try await self.statusBar() }
+        await step("12-quick-recorder") { try await self.quickRecorder(window: window) }
+        await step("13-onboarding") { try await self.onboarding() }
+        await step("13b-onboarding-escape") { try await self.onboardingEscape() }
     }
 
     private func sidebarSelection() async throws -> String {
@@ -1105,6 +1112,191 @@ final class UIWalkthrough {
         }
         try check(reflects, "AX texts \(seen) vs statusMessage '\(viewModel.statusMessage)'")
         return "AX status text == statusMessage '\(viewModel.statusMessage)'"
+    }
+
+    /// Menu-bar quick recorder: with the main window hidden, opens the panel
+    /// (`showQuickRecorder()`), presses its Record button through AX, waits for
+    /// `isRecording`, presses it again and checks the new recording on disk.
+    /// Auto-transcribe is switched off for the step (no extra provider call).
+    private func quickRecorder(window: NSWindow) async throws -> String {
+        try check(!viewModel.isRecording && !viewModel.workflowState.isPaused, "a recording session is already active")
+        try check(viewModel.canToggleRecording, "recording cannot start now (\(viewModel.workflowState))")
+        let savedAutoTranscribe = viewModel.settings.autoTranscribe
+        viewModel.settings.autoTranscribe = false
+        defer {
+            viewModel.settings.autoTranscribe = savedAutoTranscribe
+            viewModel.hideQuickRecorder()
+            // Bring the main window back without activating the app.
+            window.makeKeyAndOrderFront(nil)
+        }
+        let existing = Set(viewModel.recordings.map(\.id))
+
+        // The panel must work with the main window closed (shared view model).
+        window.orderOut(nil)
+        try check(await ax.waitUntil(timeout: 2) { self.mainWindow() == nil }, "main window still visible after orderOut")
+        viewModel.showQuickRecorder()
+        let controller = try require(viewModel.quickRecorder, "no quick recorder controller after showQuickRecorder()")
+        try check(await ax.waitUntil(timeout: 2) { controller.isQuickRecorderShown }, "quick recorder panel did not open")
+
+        let panelTitle = QuickRecorderController.panelTitle
+        let recordQuery = AXDriver.Query(identifier: "msr.quick.record")
+        var axWindow: String? = panelTitle
+        if await ax.waitFor(recordQuery, window: panelTitle, timeout: 5) == nil {
+            // Borderless panels may not expose their title; search every window.
+            axWindow = nil
+        }
+        let record = try require(await ax.waitFor(recordQuery, window: axWindow, timeout: 3),
+                                 "msr.quick.record not in the AX tree of the panel")
+        for identifier in ["msr.quick.source", "msr.quick.secondary", "msr.quick.open"] {
+            try check(await ax.find(AXDriver.Query(identifier: identifier), window: axWindow) != nil,
+                      "\(identifier) not in the AX tree of the panel")
+        }
+        let startLabel = record.texts.first ?? ""
+        try check(await ax.press(record), "AXPress on msr.quick.record failed")
+        try check(await ax.waitUntil(timeout: 5) { self.viewModel.isRecording },
+                  "isRecording false 5 s after pressing the panel's Record (\(viewModel.statusMessage))")
+        var stopQuery = recordQuery
+        stopQuery.exactText = "Stop Recording"
+        try check(await ax.waitFor(stopQuery, window: axWindow, timeout: 2) != nil,
+                  "panel Record button label did not become 'Stop Recording'")
+        try check(viewModel.sourcePickerDisabled, "source picker is not disabled while recording")
+        let sourceEnabled = await ax.find(AXDriver.Query(identifier: "msr.quick.source"), window: axWindow)
+            .flatMap { ax.bool($0, kAXEnabledAttribute) }
+        try check(sourceEnabled != true, "panel source picker is enabled in AX while recording")
+        let secondary = try require(await ax.find(AXDriver.Query(identifier: "msr.quick.secondary"), window: axWindow),
+                                    "msr.quick.secondary missing while recording")
+        try check(ax.bool(secondary, kAXEnabledAttribute) != false, "panel Pause button is disabled while recording")
+        try check(await ax.waitUntil(timeout: 3) { self.viewModel.live.recordingElapsed >= 1 },
+                  "elapsed time did not advance (\(viewModel.live.recordingElapsed))")
+        var menuTitle = "item hidden"
+        if controller.isStatusItemInserted {
+            try check(await ax.waitUntil(timeout: 2) { !controller.statusItemTitle.isEmpty || !self.viewModel.settings.showMenuBarTimer },
+                      "menu-bar item shows no elapsed time while recording")
+            menuTitle = "'\(controller.statusItemTitle.trimmingCharacters(in: .whitespaces))'"
+        }
+
+        let stop = try require(await ax.find(recordQuery, window: axWindow), "msr.quick.record missing while recording")
+        try check(await ax.press(stop), "AXPress on the panel's Stop Recording failed")
+        try check(await ax.waitUntil(timeout: 20) {
+            !self.viewModel.isRecording && self.viewModel.recordings.contains { !existing.contains($0.id) }
+        }, "recording did not finish from the panel (\(viewModel.statusMessage))")
+        let recording = try require(viewModel.recordings.first { !existing.contains($0.id) }, "new recording missing")
+        try check(FileManager.default.fileExists(atPath: recording.audioURL.path), "new recording has no audio file on disk")
+        var startQuery = recordQuery
+        startQuery.exactText = "Record"
+        try check(await ax.waitFor(startQuery, window: axWindow, timeout: 3) != nil, "panel button did not return to 'Record'")
+        if controller.isStatusItemInserted {
+            try check(await ax.waitUntil(timeout: 2) { controller.statusItemTitle.isEmpty },
+                      "menu-bar item still shows '\(controller.statusItemTitle)' after stopping")
+        }
+        viewModel.hideQuickRecorder()
+        try check(!controller.isQuickRecorderShown, "panel still shown after hideQuickRecorder()")
+        let lookup = axWindow == nil ? "found across all AX windows" : "AX window '\(panelTitle)'"
+        return "main window hidden; panel (\(lookup)) '\(startLabel)' → isRecording, label 'Stop Recording', source locked, menu bar \(menuTitle); stop → new recording '\(recording.displayName.prefix(30))' on disk; panel closed"
+    }
+
+    // MARK: Onboarding
+
+    /// Opens the first-run sheet (`Onboarding.present()`, what "Set up MSR…"
+    /// calls), walks Next/Back through all four steps via AXPress, flips
+    /// auto-transcribe on step 4 and presses Finish.
+    private func onboarding() async throws -> String {
+        settingsWindow()?.performClose(nil)
+        let main = try require(mainWindow(), "no main window")
+        viewModel.settings.hasCompletedOnboarding = false
+        Onboarding.present()
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet != nil }, "onboarding sheet did not open")
+        var path = [try await expectOnboardingStep(1)]
+        try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.back")) == nil, "Back is shown on step 1")
+
+        try await pressOnboarding("next")
+        path.append(try await expectOnboardingStep(2))
+        try check(!viewModel.onboardingPermissionItems.isEmpty, "Permissions step has no microphone/system audio rows")
+        for item in viewModel.onboardingPermissionItems {
+            try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.fix.\(item.id)")) != nil,
+                      "no Open Privacy Settings button for \(item.id)")
+        }
+        try await pressOnboarding("back")
+        path.append(try await expectOnboardingStep(1))
+        for number in 2...4 {
+            try await pressOnboarding("next")
+            path.append(try await expectOnboardingStep(number))
+            if number == 3 {
+                let status = try require(await ax.find(AXDriver.Query(identifier: "msr.onboarding.keyStatus.elevenLabs")),
+                                         "ElevenLabs key status chip not in AX tree")
+                let expected = OnboardingView.chipTitle(
+                    saved: viewModel.hasSavedCredential(.elevenLabs),
+                    drafted: !viewModel.elevenLabsKeyDraft.isEmpty,
+                    remembered: viewModel.settings.rememberCredentials
+                )
+                let nodes = await ax.snapshot()
+                let texts = status.texts + ax.descendants(of: status, in: nodes).flatMap(\.texts)
+                try check(texts.contains(expected), "ElevenLabs key status reads \(texts), expected \(expected)")
+            }
+        }
+        try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.next")) == nil, "Next is still shown on step 4")
+
+        let toggle = try require(await ax.waitFor(AXDriver.Query(identifier: "msr.onboarding.autoTranscribe"), timeout: 2),
+                                 "auto-transcribe toggle (msr.onboarding.autoTranscribe) not in AX tree")
+        let before = viewModel.settings.autoTranscribe
+        try check(await ax.press(toggle), "AXPress on the auto-transcribe toggle failed")
+        try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoTranscribe == !before },
+                  "autoTranscribe is still \(before) after pressing the toggle")
+        let summarize = try require(await ax.find(AXDriver.Query(identifier: "msr.onboarding.autoSummarize")),
+                                    "auto-summarize toggle not in AX tree")
+        let summarizeEnabled = ax.bool(summarize, kAXEnabledAttribute)
+        try check(summarizeEnabled == viewModel.canSummarize,
+                  "auto-summarize enabled=\(summarizeEnabled.map(String.init) ?? "nil") but canSummarize=\(viewModel.canSummarize)")
+
+        try await pressOnboarding("finish")
+        try check(await ax.waitUntil(timeout: 3) { self.viewModel.settings.hasCompletedOnboarding },
+                  "hasCompletedOnboarding is still false after Finish")
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet == nil }, "sheet still attached after Finish")
+        try check(await ax.waitForAbsence(AXDriver.Query(identifier: "msr.onboarding.finish"), timeout: 2),
+                  "onboarding controls still in the AX tree after Finish")
+        return "sheet opened; steps " + path.joined(separator: "→")
+            + "; auto-transcribe \(before)→\(!before); auto-summarize enabled=\(viewModel.canSummarize); Finish → hasCompletedOnboarding=true, sheet gone"
+    }
+
+    /// Esc (the Skip button's cancel shortcut) closes the sheet and still marks it done.
+    private func onboardingEscape() async throws -> String {
+        let main = try require(mainWindow(), "no main window")
+        if main.attachedSheet != nil {
+            // Left open by a failed step 13: close it so this step starts on Welcome.
+            try? await pressOnboarding("skip")
+            _ = await ax.waitUntil(timeout: 2) { main.attachedSheet == nil }
+        }
+        viewModel.settings.hasCompletedOnboarding = false
+        Onboarding.present()
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet != nil }, "onboarding sheet did not open")
+        _ = try await expectOnboardingStep(1)
+        let sheet = try require(main.attachedSheet, "no sheet")
+        sheet.makeKeyAndOrderFront(nil)
+        _ = await ax.waitUntil(timeout: 1) { sheet.isKeyWindow }
+        await ax.sendKey(.escape, to: sheet)
+        var method = "Esc (posted key event)"
+        if !(await ax.waitUntil(timeout: 1.5) { main.attachedSheet == nil }) {
+            // An inactive app may not route the key to the sheet; Skip is the same action.
+            method = "Skip (AXPress; Esc not delivered, sheet key=\(sheet.isKeyWindow) active=\(NSApp.isActive))"
+            try await pressOnboarding("skip")
+        }
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet == nil }, "sheet still attached after \(method)")
+        try check(viewModel.settings.hasCompletedOnboarding, "hasCompletedOnboarding is false after \(method)")
+        return "\(method) → sheet closed, hasCompletedOnboarding=true"
+    }
+
+    private func pressOnboarding(_ control: String) async throws {
+        let identifier = "msr.onboarding.\(control)"
+        let button = try require(await ax.waitFor(AXDriver.Query(identifier: identifier), timeout: 2),
+                                 "\(identifier) not in AX tree")
+        try check(await ax.press(button), "AXPress on \(identifier) failed")
+    }
+
+    @discardableResult
+    private func expectOnboardingStep(_ number: Int) async throws -> String {
+        try check(await ax.waitFor(AXDriver.Query(identifier: "msr.onboarding.step.\(number)"), timeout: 2) != nil,
+                  "msr.onboarding.step.\(number) not in AX tree")
+        return String(number)
     }
 
     // MARK: Empty library

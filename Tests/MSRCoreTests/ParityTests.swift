@@ -19,6 +19,8 @@ struct ParityTests {
         #expect(!settings.autoSummarize)
         #expect(settings.summaryProvider == .openAI)
         #expect(settings.transcriptionLanguage == .automatic)
+        // Settings written before onboarding existed belong to an existing user.
+        #expect(settings.hasCompletedOnboarding)
     }
 
     @Test func releaseOnePointTwoSettingsRoundTripAndUnknownValuesFallBack() throws {

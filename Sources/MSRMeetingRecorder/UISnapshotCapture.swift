@@ -15,11 +15,18 @@ import Foundation
 /// - `MSR_UI_SNAPSHOT_TAB`: `review`, `notes` or `export`.
 /// - `MSR_UI_SNAPSHOT_SEARCH`: a recording search query to type before capture.
 /// - `MSR_UI_SNAPSHOT_TRANSCRIPT_MODE`: `read` or `edit` for the Notes tab.
-/// - `MSR_UI_SNAPSHOT_WINDOW`: `main` (default) or `settings`.
+/// - `MSR_UI_SNAPSHOT_WINDOW`: `main` (default), `settings`, or `quick` (the
+///   menu-bar quick recorder panel, drawn on a transparent margin with a shadow).
+/// - `MSR_UI_SNAPSHOT_QUICK_RECORDING`: with `quick`, start a recording first and
+///   capture the panel after this many seconds (needs `MSR_FAKE_RECORDER_CLIP`
+///   to avoid real capture); the recording is stopped and saved afterwards.
 /// - `MSR_UI_SNAPSHOT_SETTINGS_TAB`: `general`, `transcription`, `advanced` or `health`.
 /// - `MSR_UI_SNAPSHOT_SETTINGS_SCROLL`: `bottom` scrolls the settings form to its end.
 /// - `MSR_UI_SNAPSHOT_SPEAKER_POPOVER`: segment index whose speaker-name popover
 ///   opens in the Notes tab's Read mode; `MSR_UI_SNAPSHOT_SPEAKER_DRAFT` prefills it.
+/// - `MSR_UI_SNAPSHOT_ONBOARDING`: `1` opens the first-run onboarding sheet and
+///   captures that sheet instead of the window; `MSR_UI_SNAPSHOT_ONBOARDING_STEP`
+///   (`1`...`4`) picks its step. Without it, snapshot runs never show the sheet.
 /// - `MSR_UI_SNAPSHOT_KEEP_RUNNING`: when set, the app stays open after capturing.
 ///
 /// Pair it with `MSR_RECORDINGS_FOLDER` to point the app at a fixture library so
@@ -59,6 +66,17 @@ enum UISnapshotCapture {
         return environment["MSR_UI_SNAPSHOT_SPEAKER_DRAFT"].flatMap { $0.isEmpty ? nil : $0 }
     }
 
+    /// `MSR_UI_SNAPSHOT_ONBOARDING=1`: capture the onboarding sheet.
+    nonisolated static var requestsOnboarding: Bool {
+        isRequested && environment["MSR_UI_SNAPSHOT_ONBOARDING"] == "1"
+    }
+
+    /// Onboarding step (1...4) to open on while snapshotting; `nil` outside onboarding snapshot runs.
+    nonisolated static var requestedOnboardingStep: Int? {
+        guard requestsOnboarding else { return nil }
+        return environment["MSR_UI_SNAPSHOT_ONBOARDING_STEP"].flatMap { Int($0) }
+    }
+
     /// Runs before `bootstrap()` in snapshot runs only.
     ///
     /// A `swift run` build is unsigned, so reading the real app's Keychain items
@@ -72,6 +90,9 @@ enum UISnapshotCapture {
         viewModel.settingsPersistenceSuspended = true
         viewModel.settings.rememberCredentials = false
         viewModel.settings.localAPIEnabled = false
+        // The first-run sheet would cover every other snapshot; only an
+        // onboarding snapshot shows it (as on a first launch).
+        viewModel.settings.hasCompletedOnboarding = !requestsOnboarding
         // A key exported in the environment is real and already wins over the
         // Keychain, so only providers without one get a placeholder.
         if environment["ELEVENLABS_API_KEY"]?.isEmpty != false {
@@ -114,6 +135,9 @@ enum UISnapshotCapture {
         }
 
         applyState(to: viewModel, environment: environment)
+        if requestsOnboarding {
+            Onboarding.present()
+        }
 
         let delay = Double(environment["MSR_UI_SNAPSHOT_DELAY"] ?? "") ?? 1.5
         try? await Task.sleep(for: .seconds(max(0, delay)))
@@ -122,6 +146,11 @@ enum UISnapshotCapture {
             if environment["MSR_UI_SNAPSHOT_KEEP_RUNNING"] == nil {
                 NSApp.terminate(nil)
             }
+        }
+
+        if environment["MSR_UI_SNAPSHOT_WINDOW"]?.lowercased() == "quick" {
+            await captureQuickRecorder(viewModel: viewModel, environment: environment, to: path)
+            return
         }
 
         let window: NSWindow?
@@ -133,12 +162,19 @@ enum UISnapshotCapture {
                 scrollToBottomIfRequested(window)
                 try? await Task.sleep(for: .milliseconds(400))
             }
+        } else if requestsOnboarding {
+            window = mainWindow()?.attachedSheet
+            if window == nil {
+                FileHandle.standardError.write(Data("MSR snapshot: onboarding sheet is not open\n".utf8))
+            }
         } else {
             window = mainWindow()
         }
 
-        // Capture the theme frame so the title bar (traffic lights, title) is included.
-        guard let window, let view = window.contentView?.superview ?? window.contentView else {
+        // Capture the theme frame so the title bar (traffic lights, title) is
+        // included; a sheet has no title bar, so only its content.
+        let isSheet = window?.sheetParent != nil
+        guard let window, let view = isSheet ? window.contentView : (window.contentView?.superview ?? window.contentView) else {
             FileHandle.standardError.write(Data("MSR snapshot: no window found\n".utf8))
             return
         }
@@ -241,7 +277,7 @@ enum UISnapshotCapture {
     }
 
     private static func mainWindow() -> NSWindow? {
-        let candidates = NSApp.windows.filter { $0.canBecomeMain && $0.title != "MSR Settings" }
+        let candidates = NSApp.windows.filter { $0.canBecomeMain && $0.title != "MSR Settings" && $0.sheetParent == nil }
         return candidates.first(where: { $0.isVisible }) ?? candidates.first
     }
 
@@ -250,6 +286,84 @@ enum UISnapshotCapture {
         let parts = value.lowercased().split(separator: "x").compactMap { Double($0) }
         guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
         return NSSize(width: parts[0], height: parts[1])
+    }
+
+    /// `MSR_UI_SNAPSHOT_WINDOW=quick`: opens the quick-recorder panel (optionally
+    /// while recording) and renders it. The panel's menu material does not
+    /// render through `cacheDisplay`, so a rounded window-background panel
+    /// with a shadow stands in for it, as for popovers.
+    private static func captureQuickRecorder(viewModel: AppViewModel, environment: [String: String], to path: String) async {
+        let recordSeconds = Double(environment["MSR_UI_SNAPSHOT_QUICK_RECORDING"] ?? "")
+        if let recordSeconds {
+            await viewModel.toggleRecording()
+            try? await Task.sleep(for: .seconds(max(0, recordSeconds)))
+        }
+        viewModel.showQuickRecorder()
+        try? await Task.sleep(for: .milliseconds(600))
+        // Every exit of the render (panel missing, bitmap failure, written)
+        // comes back here, so the recording started above is always stopped;
+        // a `defer` could not await the save.
+        renderQuickRecorderPanel(viewModel: viewModel, to: path)
+        if recordSeconds != nil, viewModel.isRecording {
+            await viewModel.toggleRecording()
+        }
+    }
+
+    private static func renderQuickRecorderPanel(viewModel: AppViewModel, to path: String) {
+        defer {
+            viewModel.hideQuickRecorder()
+        }
+        guard let panel = viewModel.quickRecorder?.panelWindow,
+              let content = panel.contentView?.subviews.first else {
+            FileHandle.standardError.write(Data("MSR snapshot: quick recorder panel not shown\n".utf8))
+            return
+        }
+        panel.displayIfNeeded()
+        let scale = panel.backingScaleFactor
+        let margin: CGFloat = 16
+        let panelSize = content.bounds.size
+        let size = NSSize(width: panelSize.width + margin * 2, height: panelSize.height + margin * 2)
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
+              let output = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+              ),
+              let context = NSGraphicsContext(bitmapImageRep: output) else {
+            FileHandle.standardError.write(Data("MSR snapshot: could not create bitmap\n".utf8))
+            return
+        }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        let rect = NSRect(x: margin * scale, y: margin * scale, width: panelSize.width * scale, height: panelSize.height * scale)
+        panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+            let radius = QuickRecorderContainerView.cornerRadius * scale
+            let shape = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+            shadow.shadowBlurRadius = 12 * scale
+            shadow.shadowOffset = NSSize(width: 0, height: -3 * scale)
+            shadow.set()
+            NSColor.windowBackgroundColor.setFill()
+            shape.fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSColor.separatorColor.setStroke()
+            shape.lineWidth = scale
+            shape.stroke()
+        }
+        rep.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        NSGraphicsContext.restoreGraphicsState()
+
+        if let data = output.representation(using: .png, properties: [:]) {
+            do {
+                try data.write(to: URL(fileURLWithPath: path))
+                FileHandle.standardError.write(Data("MSR snapshot: wrote \(path) (\(Int(size.width))x\(Int(size.height)))\n".utf8))
+            } catch {
+                FileHandle.standardError.write(Data("MSR snapshot: write failed: \(error.localizedDescription)\n".utf8))
+            }
+        }
     }
 
     private static func capture(view: NSView, window: NSWindow, to path: String) {
