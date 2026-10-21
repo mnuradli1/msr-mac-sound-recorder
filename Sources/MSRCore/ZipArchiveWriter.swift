@@ -120,10 +120,17 @@ public struct ZipArchiveWriter {
 
     static func dosTimestamp(_ date: Date, calendar: Calendar) -> (time: UInt16, date: UInt16) {
         let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-        let year = min(max((parts.year ?? 1980) - 1980, 0), 127)
-        let time = UInt16((parts.hour ?? 0) << 11 | (parts.minute ?? 0) << 5 | (parts.second ?? 0) / 2)
-        let day = UInt16(year << 9 | (parts.month ?? 1) << 5 | (parts.day ?? 1))
-        return (time, day)
+        // Kept as separate typed steps: Swift 6.0 cannot type-check the folded
+        // expression in reasonable time.
+        let year: Int = min(max((parts.year ?? 1980) - 1980, 0), 127)
+        let hour: Int = parts.hour ?? 0
+        let minute: Int = parts.minute ?? 0
+        let second: Int = (parts.second ?? 0) / 2
+        let month: Int = parts.month ?? 1
+        let dayOfMonth: Int = parts.day ?? 1
+        let timeBits: Int = (hour << 11) | (minute << 5) | second
+        let dateBits: Int = (year << 9) | (month << 5) | dayOfMonth
+        return (UInt16(timeBits), UInt16(dateBits))
     }
 }
 
