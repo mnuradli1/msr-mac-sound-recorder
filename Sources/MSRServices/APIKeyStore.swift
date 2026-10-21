@@ -9,7 +9,7 @@ protocol KeychainStoring: Sendable {
     func delete(service: String, account: String) throws
 }
 
-/// Resolves provider API keys with precedence: session value > environment
+/// Resolves provider API keys (ElevenLabs, OpenAI, DeepSeek) with precedence: session value > environment
 /// variable > Keychain. A key entered in Settings (saved or session-only) is
 /// also held as the session value, so it wins over an exported variable for the
 /// rest of this run; on the next launch an exported variable wins over the
@@ -19,7 +19,7 @@ public final class APIKeyStore: @unchecked Sendable {
     private let environment: [String: String]
     private let keychain: KeychainStoring
     private let lock = NSLock()
-    private var sessionValues: [AIProvider: String] = [:]
+    private var sessionValues: [CredentialProvider: String] = [:]
 
     public convenience init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.init(environment: environment, keychain: SystemKeychain())
@@ -30,17 +30,24 @@ public final class APIKeyStore: @unchecked Sendable {
         self.keychain = keychain
     }
 
-    public func apiKey(for provider: AIProvider) -> String? {
-        if let sessionValue = lock.withLock({ sessionValues[provider] }) {
+    // MARK: Credential-based API (ElevenLabs, OpenAI, DeepSeek)
+    //
+    // `@_disfavoredOverload` keeps `apiKey(for: .openAI)` resolving to the
+    // `AIProvider` overload (both enums have `.openAI` / `.elevenLabs`); both
+    // overloads read the same credential, so the choice never changes behavior.
+
+    @_disfavoredOverload
+    public func apiKey(for credential: CredentialProvider) -> String? {
+        if let sessionValue = lock.withLock({ sessionValues[credential] }) {
             return sessionValue
         }
         // Environment before Keychain: an exported key never triggers a Keychain
         // access prompt (which blocks unsigned developer builds), and a shell
         // that exports a key means to use it.
-        if let environmentValue = environment[Self.environmentVariableName(for: provider)].flatMap(APIKeyNormalizer.normalized) {
+        if let environmentValue = environment[credential.environmentVariableName].flatMap(APIKeyNormalizer.normalized) {
             return environmentValue
         }
-        if let keychainValue = keychain.read(service: serviceName, account: provider.rawValue),
+        if let keychainValue = keychain.read(service: serviceName, account: credential.keychainAccount),
            let normalized = APIKeyNormalizer.normalized(keychainValue) {
             return normalized
         }
@@ -48,37 +55,54 @@ public final class APIKeyStore: @unchecked Sendable {
     }
 
     /// Uses `apiKey` for this app run only (not persisted).
-    public func setSession(apiKey: String, for provider: AIProvider) throws {
+    @_disfavoredOverload
+    public func setSession(apiKey: String, for credential: CredentialProvider) throws {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else { throw KeyStoreError.emptyAPIKey }
-        lock.withLock { sessionValues[provider] = normalized }
+        lock.withLock { sessionValues[credential] = normalized }
     }
 
-    /// Removes the session value and the Keychain item for `provider`. An
-    /// exported environment variable (`ELEVENLABS_API_KEY`, `OPENAI_API_KEY`)
-    /// still applies afterwards; it can only be removed from the environment.
-    public func forget(_ provider: AIProvider) throws {
-        lock.withLock { _ = sessionValues.removeValue(forKey: provider) }
-        try keychain.delete(service: serviceName, account: provider.rawValue)
+    /// Removes the session value and the Keychain item for `credential`. An
+    /// exported environment variable (`ELEVENLABS_API_KEY`, `OPENAI_API_KEY`,
+    /// `DEEPSEEK_API_KEY`) still applies afterwards; it can only be removed
+    /// from the environment.
+    @_disfavoredOverload
+    public func forget(_ credential: CredentialProvider) throws {
+        lock.withLock { _ = sessionValues.removeValue(forKey: credential) }
+        try keychain.delete(service: serviceName, account: credential.keychainAccount)
     }
 
     /// Persists `apiKey` in the Keychain and also makes it the session value, so
     /// the key the user just entered takes effect immediately, even over an
     /// exported environment variable. A failed Keychain write changes nothing.
-    public func save(apiKey: String, for provider: AIProvider) throws {
+    @_disfavoredOverload
+    public func save(apiKey: String, for credential: CredentialProvider) throws {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else {
             throw KeyStoreError.emptyAPIKey
         }
-        try keychain.write(normalized, service: serviceName, account: provider.rawValue)
-        lock.withLock { sessionValues[provider] = normalized }
+        try keychain.write(normalized, service: serviceName, account: credential.keychainAccount)
+        lock.withLock { sessionValues[credential] = normalized }
+    }
+
+    // MARK: Transcription-provider overloads (unchanged API)
+
+    public func apiKey(for provider: AIProvider) -> String? {
+        apiKey(for: provider.credentialProvider)
+    }
+
+    public func setSession(apiKey: String, for provider: AIProvider) throws {
+        try setSession(apiKey: apiKey, for: provider.credentialProvider)
+    }
+
+    public func forget(_ provider: AIProvider) throws {
+        try forget(provider.credentialProvider)
+    }
+
+    public func save(apiKey: String, for provider: AIProvider) throws {
+        try save(apiKey: apiKey, for: provider.credentialProvider)
     }
 
     static func environmentVariableName(for provider: AIProvider) -> String {
-        switch provider {
-        case .elevenLabs:
-            return "ELEVENLABS_API_KEY"
-        case .openAI:
-            return "OPENAI_API_KEY"
-        }
+        provider.credentialProvider.environmentVariableName
     }
 }
 

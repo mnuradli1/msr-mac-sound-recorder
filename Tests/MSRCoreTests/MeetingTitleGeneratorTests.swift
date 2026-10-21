@@ -187,7 +187,15 @@ struct AutoTranscribeContractTests {
         let job = try decoder.decode(TranscriptionJob.self, from: data)
         #expect(job.origin == .manual)
         #expect(!job.autoTitleRequested)
+        #expect(!job.autoSummarizeRequested)
         #expect(TranscriptionJob.queue(recordingID: UUID(), recordingName: "M", audioFileName: "a.m4a", provider: .openAI).origin == .manual)
+        let requested = TranscriptionJob.queue(
+            recordingID: UUID(), recordingName: "M", audioFileName: "a.m4a", provider: .openAI, autoSummarizeRequested: true
+        )
+        #expect(requested.autoSummarizeRequested)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        #expect(try decoder.decode(TranscriptionJob.self, from: encoder.encode(requested)).autoSummarizeRequested)
     }
 
     @Test func jobRoundTripPreservesOriginAndAutoTitleRequest() throws {

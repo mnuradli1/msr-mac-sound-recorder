@@ -19,7 +19,7 @@ temporary storage requirements, and the physical lid-close acceptance checklist.
 - TXT, Markdown, SRT, and DOCX export
 - Optional auto-transcribe after every finished recording, and auto-title from the transcript
 
-The default transcription provider is ElevenLabs. Summary generation uses OpenAI.
+The default transcription provider is ElevenLabs. Summaries and remote titles use OpenAI or DeepSeek (see API Keys).
 
 ## Auto-Transcribe and Auto-Title
 
@@ -54,9 +54,12 @@ Keys are never stored in source. New keys are session-only by default; enable â€
 
 ```bash
 export ELEVENLABS_API_KEY="..."
-export OPENAI_API_KEY="..."
+export OPENAI_API_KEY="..."     # transcription (optional), summaries, titles
+export DEEPSEEK_API_KEY="..."   # summaries and titles (optional alternative to OpenAI)
 swift run MSRMeetingRecorder
 ```
+
+Summaries and remote titles use the selected text-model provider (OpenAI or DeepSeek). If that provider has no key, the other one is used when it has a key; with neither, summaries are unavailable and titles fall back to the on-device heuristic. DeepSeek uses `deepseek-chat` via `https://api.deepseek.com/chat/completions` (override the model with `DEEPSEEK_SUMMARY_MODEL`, like `OPENAI_SUMMARY_MODEL` for OpenAI). The DeepSeek key is stored under the Keychain account `deepseek`; the existing `elevenlabs` and `openai` accounts are unchanged.
 
 ## Verify
 

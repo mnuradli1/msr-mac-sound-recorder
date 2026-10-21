@@ -16,6 +16,24 @@ struct ParityTests {
         #expect(settings.autoTitle)
         #expect(!settings.autoTranscribe)
         #expect(!settings.localAPIEnabled)
+        #expect(!settings.autoSummarize)
+        #expect(settings.summaryProvider == .openAI)
+        #expect(settings.transcriptionLanguage == .automatic)
+    }
+
+    @Test func releaseOnePointTwoSettingsRoundTripAndUnknownValuesFallBack() throws {
+        var settings = AppSettings.default
+        settings.autoSummarize = true
+        settings.summaryProvider = .deepSeek
+        settings.transcriptionLanguage = .indonesian
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        #expect(decoded == settings)
+
+        let future = Data(#"{"provider":"elevenlabs","summaryProvider":"claude","transcriptionLanguage":"fr","autoSummarize":true}"#.utf8)
+        let fallback = try JSONDecoder().decode(AppSettings.self, from: future)
+        #expect(fallback.autoSummarize)
+        #expect(fallback.summaryProvider == .openAI)
+        #expect(fallback.transcriptionLanguage == .automatic)
     }
 
     @Test func jobsHaveIndependentIdentityAndPreservePublicationCheckpointAcrossRestart() throws {

@@ -16,6 +16,12 @@ public struct TranscriptPublishResult: Sendable {
     public var job: TranscriptionJob
     /// Why auto-title fell back or was skipped, for diagnostics only. Never fatal.
     public var titleNote: String?
+    /// The summary written by the auto-summarize step, or `nil` when it did not
+    /// run or failed.
+    public var summaryMarkdown: String?
+    /// Why the auto-summarize step failed. Never fatal: the job is already
+    /// completed and the transcript published when this is set.
+    public var summaryError: Error?
 
     public init(
         recording: RecordingItem,
@@ -23,7 +29,9 @@ public struct TranscriptPublishResult: Sendable {
         generatedTitle: String?,
         titleSource: RecordingTitleSource,
         job: TranscriptionJob,
-        titleNote: String? = nil
+        titleNote: String? = nil,
+        summaryMarkdown: String? = nil,
+        summaryError: Error? = nil
     ) {
         self.recording = recording
         self.segments = segments
@@ -31,6 +39,8 @@ public struct TranscriptPublishResult: Sendable {
         self.titleSource = titleSource
         self.job = job
         self.titleNote = titleNote
+        self.summaryMarkdown = summaryMarkdown
+        self.summaryError = summaryError
     }
 }
 
@@ -45,12 +55,17 @@ public struct TranscriptPublishResult: Sendable {
 /// 3. the transcript bundle is written, and the summary cleared when replacing;
 /// 4. the job is marked completed and checkpointed BEFORE any title work, so a
 ///    title failure can never fail or re-bill the job;
-/// 5. auto-title runs last and is best-effort.
+/// 5. auto-title runs next and is best-effort;
+/// 6. auto-summarize (when the job requested it and a summarizer is supplied)
+///    runs last, on the final (possibly renamed) recording, and is best-effort:
+///    a failure is returned in `summaryError`, never thrown.
 @MainActor
 public enum TranscriptPublisher {
     /// Remote title generator. Returning `nil` (or throwing) falls back to the
     /// local heuristic `MeetingTitleGenerator.localTitle(from:segments:)`.
     public typealias TitleGenerator = @MainActor (String) async throws -> String?
+    /// Remote summarizer (e.g. `ProviderAIService.summarize(transcript:)`).
+    public typealias Summarizer = @MainActor (String) async throws -> SummarizeResponse
 
     public static func publish(
         job: TranscriptionJob,
@@ -59,6 +74,7 @@ public enum TranscriptPublisher {
         autoTitleRequested: Bool,
         library: any RecordingLibraryServing,
         titleGenerator: TitleGenerator? = nil,
+        summarizer: Summarizer? = nil,
         checkpoint: (TranscriptionJob) -> Void = { _ in }
     ) async throws -> TranscriptPublishResult {
         let stable = try library.migrateIfNeeded(recording)
@@ -76,6 +92,10 @@ public enum TranscriptPublisher {
         var published = try library.writeTranscriptBundle(decoded.text, segments: segments, for: stable)
         if job.replacingExistingTranscript {
             published = try library.clearSummary(for: published)
+            // Diarized labels of a new transcript need not match the old ones.
+            if let reset = try? library.resetSpeakerNames(for: published) {
+                published = reset
+            }
         }
 
         current.markCompleted(transcriptFileName: published.transcriptURL.lastPathComponent)
@@ -83,36 +103,79 @@ public enum TranscriptPublisher {
         // The caller's snapshot may predate a rename made while the job ran.
         published = onDisk(published, library: library)
 
-        guard autoTitleRequested else {
-            return TranscriptPublishResult(
-                recording: published,
+        var finalRecording = published
+        var generatedTitle: String?
+        var titleNote: String?
+        if autoTitleRequested {
+            let outcome = await applyAutoTitle(
+                to: published,
+                transcript: decoded.text,
                 segments: segments,
-                generatedTitle: nil,
-                titleSource: published.effectiveTitleSource,
-                job: current
+                library: library,
+                titleGenerator: titleGenerator
             )
+            if let renamed = outcome.renamed {
+                current.recordingName = renamed.displayName
+                checkpoint(current)
+                finalRecording = renamed
+                generatedTitle = renamed.displayName
+            }
+            titleNote = outcome.note
         }
 
-        let outcome = await applyAutoTitle(
-            to: published,
-            transcript: decoded.text,
-            segments: segments,
-            library: library,
-            titleGenerator: titleGenerator
-        )
-        if let renamed = outcome.renamed {
-            current.recordingName = renamed.displayName
-            checkpoint(current)
+        var summaryMarkdown: String?
+        var summaryError: Error?
+        // An empty transcript has nothing to summarize: skipped, not an error.
+        if job.autoSummarizeRequested, let summarizer,
+           !decoded.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            switch await applyAutoSummary(to: finalRecording, transcript: decoded.text, library: library, summarizer: summarizer) {
+            case let .success(written):
+                // Re-read: the user may have renamed while the summary ran.
+                finalRecording = onDisk(written.recording, library: library)
+                summaryMarkdown = written.markdown
+            case let .failure(error):
+                summaryError = error
+            }
         }
-        let finalRecording = outcome.renamed ?? published
+
         return TranscriptPublishResult(
             recording: finalRecording,
             segments: segments,
-            generatedTitle: outcome.renamed?.displayName,
+            generatedTitle: generatedTitle,
             titleSource: finalRecording.effectiveTitleSource,
             job: current,
-            titleNote: outcome.note
+            titleNote: titleNote,
+            summaryMarkdown: summaryMarkdown,
+            summaryError: summaryError
         )
+    }
+
+    /// Error used when a summarizer returns only whitespace.
+    public struct EmptySummaryError: Error, LocalizedError {
+        public init() {}
+        public var errorDescription: String? { "The summary provider returned an empty summary." }
+    }
+
+    private struct WrittenSummary {
+        var recording: RecordingItem
+        var markdown: String
+    }
+
+    private static func applyAutoSummary(
+        to recording: RecordingItem,
+        transcript: String,
+        library: any RecordingLibraryServing,
+        summarizer: Summarizer
+    ) async -> Result<WrittenSummary, Error> {
+        do {
+            let response = try await summarizer(transcript.trimmingCharacters(in: .whitespacesAndNewlines))
+            let markdown = response.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !markdown.isEmpty else { return .failure(EmptySummaryError()) }
+            let written = try library.writeSummary(markdown, for: recording)
+            return .success(WrittenSummary(recording: written, markdown: markdown))
+        } catch {
+            return .failure(error)
+        }
     }
 
     /// Completes a job whose transcript was already written (the app stopped
@@ -134,6 +197,9 @@ public enum TranscriptPublisher {
         var recovered = onDisk(recording, library: library)
         if job.replacingExistingTranscript, let cleared = try? library.clearSummary(for: recovered) {
             recovered = cleared
+            if let reset = try? library.resetSpeakerNames(for: recovered) {
+                recovered = reset
+            }
         }
         current.markCompleted(transcriptFileName: recovered.transcriptURL.lastPathComponent)
 

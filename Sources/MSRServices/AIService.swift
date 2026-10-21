@@ -3,11 +3,21 @@ import MSRCore
 
 public protocol AIService: AnyObject, Sendable {
     func transcribe(audioURL: URL, provider: AIProvider) async throws -> TranscribeResponse
+    /// Transcribes with an optional ISO-639-1 language hint
+    /// (`TranscriptionLanguage.languageCode`; `nil` = auto-detect). The default
+    /// implementation ignores the hint and calls `transcribe(audioURL:provider:)`.
+    func transcribe(audioURL: URL, provider: AIProvider, languageCode: String?) async throws -> TranscribeResponse
     func summarize(transcript: String) async throws -> SummarizeResponse
     /// A short, descriptive title for the transcript, already cleaned with
     /// `MeetingTitleGenerator.cleaned(_:fallback:)`. Throws when no title could
     /// be produced (for example a missing credential or an empty reply).
     func generateTitle(transcript: String) async throws -> String
+}
+
+extension AIService {
+    public func transcribe(audioURL: URL, provider: AIProvider, languageCode: String?) async throws -> TranscribeResponse {
+        try await transcribe(audioURL: audioURL, provider: provider)
+    }
 }
 
 public enum LocalAPIError: Error, LocalizedError {
