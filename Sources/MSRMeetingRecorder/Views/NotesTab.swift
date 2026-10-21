@@ -129,7 +129,10 @@ struct TranscriptPanel: View {
                 }
                 TranscriptReaderView(
                     segments: readable.segments,
-                    onJump: viewModel.jumpToTranscriptSegment
+                    onJump: viewModel.jumpToTranscriptSegment,
+                    canRenameSpeakers: viewModel.canRenameSpeakers,
+                    originalLabel: viewModel.originalSpeakerLabel(for:),
+                    onRenameSpeaker: viewModel.renameSpeaker(label:to:)
                 )
             }
         case .edit:
@@ -186,20 +189,28 @@ struct TranscriptPanel: View {
 }
 
 /// Speaker-labelled reader with jump-to-time buttons and selectable text.
+/// Clicking a speaker chip names that speaker (see `SpeakerNamePopover`).
 struct TranscriptReaderView: View {
     let segments: [TranscriptSegment]
     let onJump: (TranscriptSegment) -> Void
+    var canRenameSpeakers = false
+    /// The provider's label for a renamed speaker (`nil` when not renamed).
+    var originalLabel: (String) -> String? = { _ in nil }
+    var onRenameSpeaker: ((String, String) -> Void)?
+
+    /// Index of the segment whose speaker popover is open.
+    @State private var editingIndex: Int? = UISnapshotCapture.requestedSpeakerPopoverIndex
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
-                ForEach(segments) { segment in
+                ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
                     VStack(alignment: .leading, spacing: 4) {
                         if !segment.speaker.isEmpty || segment.startTime != nil {
                             HStack(spacing: 8) {
-                                Text(segment.speaker)
-                                    .font(.system(size: 11.5, weight: .semibold))
-                                    .foregroundStyle(Theme.speakerColor(for: segment.speaker))
+                                if !segment.speaker.isEmpty {
+                                    speakerChip(segment.speaker, index: index)
+                                }
                                 if let startTime = segment.startTime {
                                     Button {
                                         onJump(segment)
@@ -228,6 +239,99 @@ struct TranscriptReaderView: View {
             .padding(.vertical, 14)
         }
     }
+
+    @ViewBuilder
+    private func speakerChip(_ speaker: String, index: Int) -> some View {
+        let original = originalLabel(speaker)
+        let editable = canRenameSpeakers && onRenameSpeaker != nil
+        Button {
+            editingIndex = index
+        } label: {
+            Text(speaker)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(Theme.speakerColor(for: original ?? speaker))
+                .padding(.horizontal, 7)
+                .frame(height: 20)
+                .background(Theme.speakerColor(for: original ?? speaker).opacity(0.12), in: Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(!editable)
+        .help(original.map { Text("Originally \($0). Click to rename this speaker.") } ?? Text("Click to rename this speaker."))
+        .accessibilityLabel(Text(speaker))
+        .accessibilityHint(Text("Rename this speaker"))
+        .accessibilityIdentifier("msr.notes.speaker.\(index)")
+        .popover(isPresented: Binding(
+            get: { editingIndex == index },
+            set: { if !$0, editingIndex == index { editingIndex = nil } }
+        ), arrowEdge: .bottom) {
+            SpeakerNamePopover(
+                currentName: speaker,
+                originalLabel: original ?? speaker,
+                onSave: { name in
+                    editingIndex = nil
+                    onRenameSpeaker?(speaker, name)
+                },
+                onCancel: { editingIndex = nil }
+            )
+        }
+    }
+}
+
+/// "Name this speaker": Return saves, Escape cancels, an empty name reverts
+/// to the provider's original label.
+struct SpeakerNamePopover: View {
+    let currentName: String
+    let originalLabel: String
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+
+    @State private var draft: String
+    @FocusState private var focused: Bool
+
+    init(currentName: String, originalLabel: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        self.currentName = currentName
+        self.originalLabel = originalLabel
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _draft = State(initialValue: UISnapshotCapture.requestedSpeakerDraft ?? currentName)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Name this speaker")
+                .font(.system(size: 13, weight: .semibold))
+            TextField("Name this speaker", text: $draft, prompt: Text(verbatim: originalLabel))
+                .textFieldStyle(.roundedBorder)
+                .labelsHidden()
+                .frame(width: 220)
+                .focused($focused)
+                .onSubmit(save)
+                .onExitCommand(perform: onCancel)
+                .accessibilityIdentifier("msr.notes.speakerNameField")
+            Text("Renames \(originalLabel) everywhere in this transcript. Leave empty to use the original label.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 220, alignment: .leading)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("msr.notes.speakerCancel")
+                Button("Save", action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("msr.notes.speakerSave")
+            }
+            .controlSize(.small)
+        }
+        .padding(14)
+        .onAppear { DispatchQueue.main.async { focused = true } }
+    }
+
+    private func save() {
+        onSave(draft.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
 }
 
 struct SummaryPanel: View {
@@ -239,6 +343,13 @@ struct SummaryPanel: View {
                 Text("Summary")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
+                if let provider = viewModel.selectedSummaryProvider {
+                    Text("· via \(provider.displayName)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
+                        .accessibilityIdentifier("msr.notes.summaryProvider")
+                }
                 Spacer()
                 if viewModel.hasSummary {
                     Button {

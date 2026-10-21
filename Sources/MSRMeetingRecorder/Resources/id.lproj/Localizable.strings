@@ -220,7 +220,6 @@
 "Microphone Permission" = "Izin Mikrofon";
 "System Audio Permission" = "Izin Audio Sistem";
 "ElevenLabs Key" = "Kunci ElevenLabs";
-"OpenAI Key" = "Kunci OpenAI";
 "Allowed" = "Diizinkan";
 "Not requested yet" = "Belum diminta";
 "Unknown status" = "Status tidak diketahui";
@@ -228,7 +227,6 @@
 "Screen capture permission looks allowed" = "Izin perekaman layar tampaknya diizinkan";
 "Allow Screen Recording for system audio capture." = "Izinkan Perekaman Layar untuk menangkap audio sistem.";
 "Missing" = "Belum ada";
-"Missing for summaries" = "Belum ada untuk ringkasan";
 "Folder is not writable." = "Folder tidak dapat ditulisi.";
 "Recording selected" = "Rekaman dipilih";
 "Playback paused" = "Pemutaran dijeda";
@@ -248,7 +246,6 @@
 "Auto-title recordings from the transcript" = "Beri judul otomatis dari transkrip";
 "API Keys" = "Kunci API";
 "Paste a key to save or replace it" = "Tempel kunci untuk menyimpan atau menggantinya";
-"ElevenLabs transcribes by default. OpenAI is used for summaries and optional transcription." = "ElevenLabs mentranskripsi secara bawaan. OpenAI dipakai untuk ringkasan dan transkripsi opsional.";
 "Save Keys" = "Simpan Kunci";
 "Menu Bar & Shortcuts" = "Bilah Menu & Pintasan";
 "Local API" = "API Lokal";
@@ -267,4 +264,39 @@
 "Showing your edited text; timestamps come from the original transcript." = "Menampilkan teks yang Anda edit; stempel waktu berasal dari transkrip asli.";
 "Auto" = "Otomatis";
 "Queued automatically by auto-transcribe" = "Diantrekan otomatis oleh transkripsi otomatis";
-"With an OpenAI key saved, the beginning of each transcript is sent to OpenAI to name the recording; without one the title is generated on this Mac." = "Jika kunci OpenAI tersimpan, bagian awal setiap transkrip dikirim ke OpenAI untuk menamai rekaman; tanpa kunci, judul dibuat di Mac ini.";
+
+// MARK: - 1.2: summaries, language, speaker names, meeting notes
+"Transcription language" = "Bahasa transkripsi";
+"The spoken language of your meetings. Automatic lets the provider detect it." = "Bahasa yang diucapkan dalam rapat Anda. Otomatis membiarkan penyedia mendeteksinya.";
+"Automatic" = "Otomatis";
+"DeepSeek" = "DeepSeek";
+"With an OpenAI or DeepSeek key saved, the beginning of each transcript is sent to that provider to name the recording; without one the title is generated on this Mac." = "Jika kunci OpenAI atau DeepSeek tersimpan, bagian awal setiap transkrip dikirim ke penyedia tersebut untuk menamai rekaman; tanpa kunci, judul dibuat di Mac ini.";
+"Summary provider" = "Penyedia ringkasan";
+"Auto-summarize after transcription" = "Ringkas otomatis setelah transkripsi";
+"After each transcription, the transcript is sent to %@ for a summary." = "Setelah setiap transkripsi, transkrip dikirim ke %@ untuk diringkas.";
+"Summaries use %@. Turn this on to summarize every new transcript automatically." = "Ringkasan memakai %@. Aktifkan untuk meringkas setiap transkrip baru secara otomatis.";
+"No %@ key is saved, so %@ is used." = "Belum ada kunci %@, jadi %@ yang dipakai.";
+"Requires an OpenAI or DeepSeek API key." = "Memerlukan kunci API OpenAI atau DeepSeek.";
+"DeepSeek API Key" = "Kunci API DeepSeek";
+"Test DeepSeek Key" = "Uji Kunci DeepSeek";
+"ElevenLabs transcribes by default. OpenAI or DeepSeek writes summaries and titles; OpenAI can also transcribe." = "ElevenLabs mentranskripsi secara bawaan. OpenAI atau DeepSeek menulis ringkasan dan judul; OpenAI juga bisa mentranskripsi.";
+"Summary key" = "Kunci ringkasan";
+"OpenAI saved" = "OpenAI tersimpan";
+"DeepSeek saved" = "DeepSeek tersimpan";
+"Missing: add an OpenAI or DeepSeek key for summaries" = "Belum ada: tambahkan kunci OpenAI atau DeepSeek untuk ringkasan";
+"Originally %@. Click to rename this speaker." = "Semula %@. Klik untuk mengganti nama pembicara ini.";
+"Click to rename this speaker." = "Klik untuk mengganti nama pembicara ini.";
+"Rename this speaker" = "Ganti nama pembicara ini";
+"Name this speaker" = "Beri nama pembicara ini";
+"Renames %@ everywhere in this transcript. Leave empty to use the original label." = "Mengganti nama %@ di seluruh transkrip ini. Kosongkan untuk memakai label aslinya.";
+"· via %@" = "· melalui %@";
+"Copy Meeting Notes" = "Salin Catatan Rapat";
+"Reset speaker names" = "Atur ulang nama pembicara";
+"Export Meeting Notes…" = "Ekspor Catatan Rapat…";
+"Save the title, summary, action items and transcript as one Markdown file" = "Simpan judul, ringkasan, tindak lanjut, dan transkrip sebagai satu file Markdown";
+"Meeting notes copied" = "Catatan rapat disalin";
+"Speaker names reset" = "Nama pembicara diatur ulang";
+"Speaker name reset" = "Nama pembicara dikembalikan";
+"Transcribe or summarize this recording first." = "Transkripsi atau ringkas rekaman ini terlebih dahulu.";
+"Add an OpenAI or DeepSeek API key in Settings to summarize." = "Tambahkan kunci API OpenAI atau DeepSeek di Pengaturan untuk meringkas.";
+"Wait for the transcription to finish before renaming speakers." = "Tunggu transkripsi selesai sebelum mengganti nama pembicara.";

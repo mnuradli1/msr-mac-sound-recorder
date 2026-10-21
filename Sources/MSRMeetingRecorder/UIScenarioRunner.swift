@@ -12,6 +12,11 @@ import MSRServices
 /// - `MSR_UI_SCENARIO_SECONDS`: how long to record (default 3).
 /// - `MSR_UI_SCENARIO_TIMEOUT`: how long to wait for the transcription job (default 180).
 ///
+/// `auto-transcribe` also switches auto-summarize on (in memory); it only runs
+/// with an OpenAI or DeepSeek key, and the result line's `summary` object says
+/// whether it was requested, how many characters were written, by which
+/// provider, and any error (a requested summary that failed fails the run).
+///
 /// Pair it with `MSR_FAKE_RECORDER_CLIP=/path/clip.m4a` (no microphone needed)
 /// and `MSR_RECORDINGS_FOLDER=/tmp/somewhere` (keeps the user's library clean).
 /// The scenario prints one JSON line to stderr, then exits with 0 (ok) or 1,
@@ -40,6 +45,8 @@ enum UIScenarioRunner {
         viewModel.settingsPersistenceSuspended = true
         viewModel.settings.autoTranscribe = true
         viewModel.settings.autoTitle = true
+        // Takes effect only with an OpenAI or DeepSeek key (`autoSummarizeIsEffective`).
+        viewModel.settings.autoSummarize = true
 
         guard viewModel.credentialAvailable(for: viewModel.settings.provider) else {
             emit(["ok": false, "reason": "no credential"])
@@ -77,10 +84,22 @@ enum UIScenarioRunner {
             if let status = job?.status, [.completed, .failed, .cancelled].contains(status) { break }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        // The title is applied right after the job is checkpointed as completed;
-        // give the publisher a moment to finish before reading the final state.
+        // The title (and summary) are applied right after the job is checkpointed
+        // as completed; give the publisher a moment to finish before reading the final state.
         try? await Task.sleep(for: .milliseconds(500))
         job = latestJob(for: recording.id, in: viewModel)
+        report.summaryRequested = job?.autoSummarizeRequested ?? false
+        if report.summaryRequested, job?.status == .completed {
+            while Date() < deadline, viewModel.autoSummaryOutcomes[recording.id] == nil {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if let outcome = viewModel.autoSummaryOutcomes[recording.id] {
+                report.summaryProvider = outcome.provider?.displayName
+                report.summaryError = outcome.error
+            } else {
+                report.summaryError = "no auto-summary outcome after \(Int(timeout)) s"
+            }
+        }
 
         report.jobStatus = job?.status.rawValue
         report.jobOrigin = job?.origin.rawValue
@@ -114,12 +133,16 @@ enum UIScenarioRunner {
                 report.titleSource = recording.effectiveTitleSource.rawValue
                 let transcript = (try? String(contentsOf: recording.transcriptURL, encoding: .utf8)) ?? ""
                 report.transcriptCharacters = transcript.trimmingCharacters(in: .whitespacesAndNewlines).count
+                let summary = (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) ?? ""
+                report.summaryCharacters = summary.trimmingCharacters(in: .whitespacesAndNewlines).count
             }
         }
+        // A requested summary must have been written; it never fails the job itself.
+        let summaryOK = !report.summaryRequested || (report.summaryError == nil && report.summaryCharacters > 0)
         report.ok = report.error == nil && report.jobStatus == TranscriptionJobStatus.completed.rawValue
-            && report.transcriptCharacters > 0
+            && report.transcriptCharacters > 0 && summaryOK
         if report.ok == false, report.error == nil {
-            report.error = "transcript is empty"
+            report.error = report.transcriptCharacters == 0 ? "transcript is empty" : "auto-summary failed: \(report.summaryError ?? "empty summary")"
         }
         emit(report.dictionary)
         if ProcessInfo.processInfo.environment["MSR_UI_SNAPSHOT_PATH"]?.isEmpty == false {
@@ -130,7 +153,7 @@ enum UIScenarioRunner {
 
     private static func emit(_ object: [String: Any]) {
         let keys = ["ok", "reason", "recordingID", "titleBefore", "titleAfter", "titleSource",
-                    "jobStatus", "jobOrigin", "transcriptCharacters", "error"]
+                    "jobStatus", "jobOrigin", "transcriptCharacters", "summary", "error"]
         let parts = keys.compactMap { key -> String? in
             guard let value = object[key] else { return nil }
             return "\"\(key)\":\(jsonLiteral(value))"
@@ -146,6 +169,8 @@ enum UIScenarioRunner {
             return bool ? "true" : "false"
         case let int as Int:
             return String(int)
+        case let pairs as KeyValuePairs<String, Any>:
+            return "{" + pairs.map { "\"\($0.key)\":\(jsonLiteral($0.value))" }.joined(separator: ",") + "}"
         case let string as String:
             let data = (try? JSONSerialization.data(withJSONObject: [string], options: [.withoutEscapingSlashes])) ?? Data("[\"\"]".utf8)
             let array = String(decoding: data, as: UTF8.self)
@@ -164,6 +189,10 @@ enum UIScenarioRunner {
         var jobStatus: String?
         var jobOrigin: String?
         var transcriptCharacters = 0
+        var summaryRequested = false
+        var summaryCharacters = 0
+        var summaryProvider: String?
+        var summaryError: String?
         var error: String?
 
         var dictionary: [String: Any] {
@@ -176,6 +205,12 @@ enum UIScenarioRunner {
                 "jobStatus": jobStatus ?? NSNull(),
                 "jobOrigin": jobOrigin ?? NSNull(),
                 "transcriptCharacters": transcriptCharacters,
+                "summary": [
+                    "requested": summaryRequested,
+                    "characters": summaryCharacters,
+                    "provider": summaryProvider ?? NSNull(),
+                    "error": summaryError ?? NSNull()
+                ] as KeyValuePairs<String, Any>,
                 "error": error ?? NSNull()
             ]
         }

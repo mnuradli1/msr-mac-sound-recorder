@@ -56,6 +56,7 @@ final class AppViewModel: ObservableObject {
     @Published var showingRename = false
     @Published var elevenLabsKeyDraft = ""
     @Published var openAIKeyDraft = ""
+    @Published var deepSeekKeyDraft = ""
     @Published var inputLevel: Float = 0
     @Published var microphoneLevel: Float = 0
     @Published var systemLevel: Float = 0
@@ -91,8 +92,24 @@ final class AppViewModel: ObservableObject {
     @Published var autoTranscribeNotice: String?
     /// Set when auto-title renamed a recording, e.g. `Titled “Launch date and onboarding owner”`.
     @Published var lastAutoTitleNotice: String?
+    /// Set when auto-summarize finished for a recording: `Summary ready via DeepSeek`
+    /// or `Auto-summary failed: …`. Dismissible, like `lastAutoTitleNotice`.
+    @Published var lastAutoSummaryNotice: String?
+    /// Whether `lastAutoSummaryNotice` reports a failure (warning) or a summary (success).
+    @Published private(set) var lastAutoSummaryFailed = false
+    /// Which text model wrote each summary produced in this run (not stored on
+    /// disk), for the Summary panel's "via …" label.
+    @Published private(set) var summaryProviderByRecording: [UUID: TextModelProvider] = [:]
+    /// Credentials with a key available (session, environment or Keychain),
+    /// cached by `refreshSetupHealth()` so views never query the Keychain while rendering.
+    @Published private(set) var savedCredentials: Set<CredentialProvider> = []
+    /// Outcome of the auto-summarize step per recording in this run (scenario diagnostics).
+    private(set) var autoSummaryOutcomes: [UUID: AutoSummaryOutcome] = [:]
     @Published private var recordingSearchDocuments: [RecordingSearchDocument] = []
     @Published private var filteredRecordingIDs: [UUID]?
+    /// The recording whose transcript is being published (auto-title and
+    /// auto-summary run after the job is marked completed).
+    @Published private var publishingRecordingID: UUID?
 
     private let settingsStore = UserDefaultsSettingsStore()
     private let keyStore = APIKeyStore()
@@ -169,7 +186,8 @@ final class AppViewModel: ObservableObject {
         self.recorder = recorder ?? Self.makeDefaultRecorder()
         self.libraryFactory = libraryFactory
         self.recordingsFolderOverride = recordingsFolderOverride
-        aiService = ProviderAIService(keyStore: keyStore)
+        aiService = ProviderAIService(keyStore: keyStore, textModelProvider: loadedSettings.summaryProvider)
+        aiService.textModelProvider = settings.summaryProvider
         selectedSource = settings.preferredSource
         self.recorder.setMicrophoneDeviceUID(settings.microphoneDeviceID)
         if recordingsFolderOverride == nil, let bookmark = settings.recordingsFolderBookmark {
@@ -357,7 +375,7 @@ final class AppViewModel: ObservableObject {
         case .summarize:
             return "Summarize"
         case .copySummary:
-            return "Copy Summary"
+            return "Copy Meeting Notes"
         }
     }
 
@@ -411,7 +429,7 @@ final class AppViewModel: ObservableObject {
 
     var selectedRecordingIsTranscribing: Bool {
         guard let selectedRecording else { return false }
-        return job(for: selectedRecording.id)?.status == .running
+        return publishingRecordingID == selectedRecording.id || job(for: selectedRecording.id)?.status == .running
     }
 
     var selectedRecordingIsQueuedForTranscription: Bool {
@@ -511,6 +529,53 @@ final class AppViewModel: ObservableObject {
 
     func clearAutoTitleNotice() {
         lastAutoTitleNotice = nil
+    }
+
+    func clearAutoSummaryNotice() {
+        lastAutoSummaryNotice = nil
+    }
+
+    // MARK: - Summaries (OpenAI or DeepSeek)
+
+    /// Whether a summary can be requested: an OpenAI or DeepSeek key is available.
+    var canSummarize: Bool {
+        syncTextModelProvider()
+        return aiService.canSummarize
+    }
+
+    /// The text model summaries would use right now (the selected provider when
+    /// it has a key, otherwise the other one), or `nil` without either key.
+    var resolvedSummaryProvider: TextModelProvider? {
+        syncTextModelProvider()
+        return aiService.resolvedTextModelProvider
+    }
+
+    /// Auto-summarize is switched on AND an OpenAI or DeepSeek key is available.
+    var autoSummarizeIsEffective: Bool {
+        settings.autoSummarize && canSummarize
+    }
+
+    /// The provider that wrote the selected recording's summary, when known (this run only).
+    var selectedSummaryProvider: TextModelProvider? {
+        guard hasSummaryText, let id = selectedRecording?.id else { return nil }
+        return summaryProviderByRecording[id]
+    }
+
+    private var hasSummaryText: Bool {
+        !summaryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// `settings` can change (through a binding) before the debounced
+    /// `saveSettings()` runs; summaries always follow the current setting.
+    private func syncTextModelProvider() {
+        if aiService.textModelProvider != settings.summaryProvider {
+            aiService.textModelProvider = settings.summaryProvider
+        }
+    }
+
+    /// Whether a key for `credential` was available at the last `refreshSetupHealth()`.
+    func hasSavedCredential(_ credential: CredentialProvider) -> Bool {
+        savedCredentials.contains(credential)
     }
 
     /// Whether an API key for `provider` is available (session, Keychain or environment).
@@ -1384,7 +1449,8 @@ final class AppViewModel: ObservableObject {
         case .summarize:
             await summarizeSelected()
         case .copySummary:
-            copySummary()
+            // The case keeps its Core name; with a summary the next step is sharing the notes.
+            copyMeetingNotes()
         }
     }
 
@@ -1503,17 +1569,23 @@ final class AppViewModel: ObservableObject {
             statusMessage = "Transcript is empty."
             return
         }
+        guard canSummarize, let provider = resolvedSummaryProvider else {
+            statusMessage = "Add an OpenAI or DeepSeek API key in Settings to summarize."
+            return
+        }
         workflowState = .summarizing
-        statusMessage = "Summarizing"
+        statusMessage = "Summarizing with \(provider.displayName)"
         do {
             let decoded = try await aiService.summarize(transcript: transcript)
             _ = try library().writeSummary(decoded.markdown, for: selectedRecording)
+            summaryProviderByRecording[targetID] = provider
             refreshSearchDocument(for: selectedRecording)
             if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: targetID, selectedID: self.selectedRecording?.id) {
                 summaryText = decoded.markdown
+                updateExportPreview()
             }
             workflowState = .saved
-            statusMessage = "Summary ready"
+            statusMessage = "Summary ready via \(provider.displayName)"
         } catch {
             workflowState = .failed(error.localizedDescription)
             statusMessage = error.localizedDescription
@@ -1526,6 +1598,131 @@ final class AppViewModel: ObservableObject {
 
     func copySummary() {
         copy(summaryText)
+    }
+
+    var canCopyMeetingNotes: Bool {
+        selectedRecording != nil && (hasTranscript || hasSummaryText)
+    }
+
+    /// Shareable Markdown meeting notes (title, details, summary, action
+    /// items, transcript) for the selected recording, from what is on screen.
+    func meetingNotesMarkdown() -> String? {
+        guard let recording = selectedRecording else { return nil }
+        return TranscriptExporter.meetingNotesMarkdown(MeetingNotesExportInput(
+            recording: recording,
+            transcript: transcriptText,
+            segments: transcriptSegments,
+            summary: summaryText
+        ))
+    }
+
+    func copyMeetingNotes() {
+        guard canCopyMeetingNotes, let markdown = meetingNotesMarkdown() else {
+            statusMessage = "Transcribe or summarize this recording first."
+            return
+        }
+        copy(markdown)
+        statusMessage = "Meeting notes copied"
+    }
+
+    func exportMeetingNotes() {
+        guard let recording = selectedRecording, canCopyMeetingNotes else {
+            statusMessage = "Transcribe or summarize this recording first."
+            return
+        }
+        flushTranscriptEdits()
+        flushSummaryEdits()
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = "\(recording.displayName).meeting-notes.md"
+        panel.directoryURL = recordingsFolderURL
+        guard panel.runModal() == .OK, let url = panel.url, let markdown = meetingNotesMarkdown() else { return }
+        do {
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            lastExportURL = url
+            statusMessage = "Exported \(url.lastPathComponent)"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Speaker names
+
+    /// Speaker chips can be renamed: a transcript exists and no transcription
+    /// for this recording is waiting or running (it would overwrite the names).
+    var canRenameSpeakers: Bool {
+        guard let selectedRecording, canMutateRecordingLibrary else { return false }
+        return hasTranscript && !hasPendingTranscription(for: selectedRecording.id)
+    }
+
+    var selectedRecordingHasSpeakerNames: Bool {
+        !(selectedRecording?.speakerNames.isEmpty ?? true)
+    }
+
+    /// The provider's label for a speaker now shown as `displayName`, when it was renamed.
+    func originalSpeakerLabel(for displayName: String) -> String? {
+        selectedRecording?.speakerNames.first { $0.value == displayName }?.key
+    }
+
+    /// Names the diarized speaker `label` (its original label or current name)
+    /// `name` in the transcript, segments and metadata. An empty name reverts
+    /// it to the original label.
+    func renameSpeaker(label: String, to name: String) {
+        guard let recording = selectedRecording else { return }
+        guard canRenameSpeakers else {
+            statusMessage = hasPendingTranscription(for: recording.id)
+                ? "Wait for the transcription to finish before renaming speakers."
+                : "Finish the current recording task first."
+            return
+        }
+        // Unsaved transcript edits would otherwise be overwritten by the reload.
+        flushTranscriptEdits()
+        do {
+            let updated = try library().renameSpeaker(selectedRecording ?? recording, label: label, to: name)
+            reloadAfterSpeakerChange(updated)
+            let cleaned = SpeakerNames.sanitized(name)
+            if !cleaned.isEmpty, updated.speakerNames.values.contains(cleaned) {
+                statusMessage = "Speaker renamed to \(cleaned)"
+            } else {
+                statusMessage = "Speaker name reset"
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    /// Reverts every renamed speaker of the selected recording to its original
+    /// label (transcript, segments and metadata).
+    func resetSpeakerNames() {
+        guard let recording = selectedRecording else { return }
+        guard canRenameSpeakers else {
+            statusMessage = "Finish the current recording task first."
+            return
+        }
+        flushTranscriptEdits()
+        do {
+            let recordingLibrary = library()
+            var current = recording
+            // Renaming back to the original label rewrites the transcript too;
+            // `resetSpeakerNames` alone would only drop the mapping.
+            for original in recording.speakerNames.keys.sorted() {
+                current = try recordingLibrary.renameSpeaker(current, label: original, to: "")
+            }
+            current = try recordingLibrary.resetSpeakerNames(for: current)
+            reloadAfterSpeakerChange(current)
+            statusMessage = "Speaker names reset"
+        } catch {
+            loadRecordings()
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func reloadAfterSpeakerChange(_ updated: RecordingItem) {
+        loadRecordings()
+        selectedRecording = recordings.first(where: { $0.id == updated.id }) ?? updated
+        loadSelectedSidecars()
+        refreshSearchDocument(for: selectedRecording ?? updated)
     }
 
     func copyAllNotes() {
@@ -1750,8 +1947,11 @@ final class AppViewModel: ObservableObject {
                 Task { await self?.toggleRecording() }
             }
         }
-        if folderChanged {
-            startLibraryWatcher()
+        if previous.summaryProvider != settings.summaryProvider {
+            aiService.textModelProvider = settings.summaryProvider
+        }
+        if folderChanged || previous.summaryProvider != settings.summaryProvider {
+            if folderChanged { startLibraryWatcher() }
             refreshSetupHealth()
         }
         if Self.userFacingSettingsDiffer(previous, settings) {
@@ -1804,6 +2004,14 @@ final class AppViewModel: ObservableObject {
                 }
                 openAIKeyDraft = ""
             }
+            if !deepSeekKeyDraft.isEmpty {
+                if settings.rememberCredentials {
+                    try keyStore.save(apiKey: deepSeekKeyDraft, for: CredentialProvider.deepSeek)
+                } else {
+                    try keyStore.setSession(apiKey: deepSeekKeyDraft, for: CredentialProvider.deepSeek)
+                }
+                deepSeekKeyDraft = ""
+            }
             autoTranscribeNotice = nil
             saveSettings()
             refreshSetupHealth()
@@ -1820,6 +2028,7 @@ final class AppViewModel: ObservableObject {
         do {
             try keyStore.forget(.elevenLabs)
             try keyStore.forget(.openAI)
+            try keyStore.forget(CredentialProvider.deepSeek)
             refreshSetupHealth()
             statusMessage = "Saved API keys forgotten"
         } catch {
@@ -1827,22 +2036,30 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    /// Transcription-provider entry point (kept for existing callers).
     func testCredential(provider: AIProvider) async {
+        await testCredential(credential: provider.credentialProvider)
+    }
+
+    /// Tests the drafted key for `credential`, or the stored one when the draft is empty.
+    func testCredential(credential: CredentialProvider) async {
         guard !isTestingCredential else { return }
         isTestingCredential = true
         defer { isTestingCredential = false }
 
         let draft: String
-        switch provider {
+        switch credential {
         case .elevenLabs:
             draft = elevenLabsKeyDraft
         case .openAI:
             draft = openAIKeyDraft
+        case .deepSeek:
+            draft = deepSeekKeyDraft
         }
-        let key = APIKeyNormalizer.normalized(draft) ?? keyStore.apiKey(for: provider) ?? ""
-        credentialStatusMessage = "Testing \(provider.displayName) key..."
+        let key = APIKeyNormalizer.normalized(draft) ?? keyStore.apiKey(for: credential) ?? ""
+        credentialStatusMessage = "Testing \(credential.displayName) key..."
         credentialStatusSeverity = .info
-        let result = await credentialValidator.validate(provider: provider, apiKey: key)
+        let result = await credentialValidator.validate(credential: credential, apiKey: key)
         credentialStatusMessage = result.message
         credentialStatusSeverity = result.isValid ? .success : .error
         statusMessage = result.message
@@ -1906,11 +2123,15 @@ final class AppViewModel: ObservableObject {
             systemImage: "text.quote"
         )
 
-        let openAIItem = SetupHealthItem(
-            id: "openai",
-            title: "OpenAI Key",
-            detail: keyStore.apiKey(for: .openAI) == nil ? "Missing for summaries" : "Saved",
-            severity: keyStore.apiKey(for: .openAI) == nil ? .info : .success,
+        savedCredentials = Set(CredentialProvider.allCases.filter { keyStore.apiKey(for: $0) != nil })
+        // Summaries use the selected text model, else the other one with a key.
+        let summaryProvider: TextModelProvider? = [settings.summaryProvider, settings.summaryProvider.alternative]
+            .first { savedCredentials.contains($0.credentialProvider) }
+        let summaryItem = SetupHealthItem(
+            id: "summary",
+            title: "Summary key",
+            detail: summaryProvider.map { "\($0.displayName) saved" } ?? "Missing: add an OpenAI or DeepSeek key for summaries",
+            severity: summaryProvider == nil ? .info : .success,
             systemImage: "sparkles"
         )
 
@@ -1935,7 +2156,7 @@ final class AppViewModel: ObservableObject {
             )
         }
 
-        setupHealthItems = [microphoneItem, screenItem, elevenLabsItem, openAIItem, folderItem]
+        setupHealthItems = [microphoneItem, screenItem, elevenLabsItem, summaryItem, folderItem]
     }
 
     /// Queues a transcription with the current provider. Refuses (and says why
@@ -1974,7 +2195,9 @@ final class AppViewModel: ObservableObject {
             trimStartSeconds: trimRange?.startSeconds,
             trimEndSeconds: trimRange?.endSeconds,
             origin: origin,
-            autoTitleRequested: autoTitleRequested ?? settings.autoTitle
+            autoTitleRequested: autoTitleRequested ?? settings.autoTitle,
+            // Captured now: only when the switch is on and a summary key exists.
+            autoSummarizeRequested: settings.autoSummarize && canSummarize
         )
 
         do {
@@ -2062,14 +2285,28 @@ final class AppViewModel: ObservableObject {
             running.audioPreparationWarning = prepared.warning
             saveTranscriptionJob(running)
 
-            let decoded = try await aiService.transcribe(audioURL: prepared.url, provider: job.provider)
+            let decoded = try await aiService.transcribe(
+                audioURL: prepared.url,
+                provider: job.provider,
+                languageCode: settings.transcriptionLanguage.languageCode
+            )
             try Task.checkCancellation()
 
+            syncTextModelProvider()
             let service = aiService
             var titleGenerator: TranscriptPublisher.TitleGenerator?
             if service.canGenerateTitlesRemotely {
                 titleGenerator = { transcript -> String? in try await service.generateTitle(transcript: transcript) }
             }
+            // Which text model the summarizer is about to use (for the notice).
+            let summaryProvider = job.autoSummarizeRequested ? service.resolvedTextModelProvider : nil
+            if job.autoSummarizeRequested {
+                statusMessage = "Summarizing \(job.recordingName)"
+            }
+            // Title and summary run inside `publish` after the job is checkpointed
+            // as completed; until it returns the recording still counts as busy.
+            publishingRecordingID = recording.id
+            defer { publishingRecordingID = nil }
             let result = try await TranscriptPublisher.publish(
                 job: running,
                 recording: stableRecording,
@@ -2077,6 +2314,7 @@ final class AppViewModel: ObservableObject {
                 autoTitleRequested: job.autoTitleRequested,
                 library: recordingLibrary,
                 titleGenerator: titleGenerator,
+                summarizer: { transcript in try await service.summarize(transcript: transcript) },
                 checkpoint: { [weak self] checkpointed in
                     running = checkpointed
                     self?.saveTranscriptionJob(checkpointed)
@@ -2086,6 +2324,9 @@ final class AppViewModel: ObservableObject {
             statusMessage = job.replacingExistingTranscript ? "Transcript refreshed" : "Transcript ready"
             if let title = result.generatedTitle {
                 statusMessage += " · titled \u{201C}\(title)\u{201D}"
+            }
+            if job.autoSummarizeRequested {
+                applyAutoSummary(result, provider: summaryProvider)
             }
         } catch let error where error is CancellationError || (error as? URLError)?.code == .cancelled {
             // A cancelled task surfaces from URLSession as `URLError(.cancelled)`.
@@ -2128,8 +2369,41 @@ final class AppViewModel: ObservableObject {
             selectedTranscriptionJob = job(for: finalRecording.id) ?? result.job
             if replacedExisting {
                 summaryText = ""
+                summaryProviderByRecording[finalRecording.id] = nil
             }
             updateExportPreview()
+        }
+    }
+
+    /// Shows the auto-summary (or why it failed) after `TranscriptPublisher`
+    /// ran the summarize step. A failure never fails the job.
+    private func applyAutoSummary(_ result: TranscriptPublishResult, provider: TextModelProvider?) {
+        let recordingID = result.recording.id
+        if let markdown = result.summaryMarkdown {
+            if let provider { summaryProviderByRecording[recordingID] = provider }
+            refreshSearchDocument(for: result.recording)
+            if RecordingInteractionPolicy.shouldApplyAsyncResult(targetID: recordingID, selectedID: selectedRecording?.id) {
+                summaryText = markdown
+                // Our own write: the next library refresh must not reload over it.
+                if lastLoadedSidecarStamp?.recordingID == recordingID, let selectedRecording {
+                    lastLoadedSidecarStamp = sidecarStamp(for: selectedRecording)
+                }
+                updateExportPreview()
+            }
+            let via = provider.map { " via \($0.displayName)" } ?? ""
+            lastAutoSummaryNotice = "Summary ready\(via)"
+            lastAutoSummaryFailed = false
+            statusMessage += " · summary ready"
+            autoSummaryOutcomes[recordingID] = AutoSummaryOutcome(provider: provider, characters: markdown.count, error: nil)
+        } else if let error = result.summaryError {
+            let message = TranscriptionErrorMessage.message(for: error)
+            lastAutoSummaryNotice = "Auto-summary failed: \(message)"
+            lastAutoSummaryFailed = true
+            statusMessage = message
+            autoSummaryOutcomes[recordingID] = AutoSummaryOutcome(provider: provider, characters: 0, error: message)
+        } else {
+            // Requested, but skipped (an empty transcript has nothing to summarize).
+            autoSummaryOutcomes[recordingID] = AutoSummaryOutcome(provider: provider, characters: 0, error: nil)
         }
     }
 
@@ -2177,6 +2451,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func hasPendingTranscription(for recordingID: UUID) -> Bool {
+        if publishingRecordingID == recordingID { return true }
         guard let job = job(for: recordingID) else { return false }
         return job.status == .queued || job.status == .running
     }
@@ -2575,6 +2850,13 @@ final class AppViewModel: ObservableObject {
         ProcessInfo.processInfo.endActivity(sleepPreventionActivity)
         self.sleepPreventionActivity = nil
     }
+}
+
+/// What the auto-summarize step produced for one recording.
+struct AutoSummaryOutcome: Equatable {
+    var provider: TextModelProvider?
+    var characters: Int
+    var error: String?
 }
 
 private enum RecordingSessionError: LocalizedError {

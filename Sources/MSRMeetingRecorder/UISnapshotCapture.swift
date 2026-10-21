@@ -17,6 +17,9 @@ import Foundation
 /// - `MSR_UI_SNAPSHOT_TRANSCRIPT_MODE`: `read` or `edit` for the Notes tab.
 /// - `MSR_UI_SNAPSHOT_WINDOW`: `main` (default) or `settings`.
 /// - `MSR_UI_SNAPSHOT_SETTINGS_TAB`: `general`, `transcription`, `advanced` or `health`.
+/// - `MSR_UI_SNAPSHOT_SETTINGS_SCROLL`: `bottom` scrolls the settings form to its end.
+/// - `MSR_UI_SNAPSHOT_SPEAKER_POPOVER`: segment index whose speaker-name popover
+///   opens in the Notes tab's Read mode; `MSR_UI_SNAPSHOT_SPEAKER_DRAFT` prefills it.
 /// - `MSR_UI_SNAPSHOT_KEEP_RUNNING`: when set, the app stays open after capturing.
 ///
 /// Pair it with `MSR_RECORDINGS_FOLDER` to point the app at a fixture library so
@@ -43,6 +46,19 @@ enum UISnapshotCapture {
         return environment["MSR_UI_SNAPSHOT_TRANSCRIPT_MODE"]?.lowercased()
     }
 
+    /// Notes-tab speaker chip whose rename popover opens while snapshotting
+    /// (`MSR_UI_SNAPSHOT_SPEAKER_POPOVER=<segment index>`); `nil` outside snapshot runs.
+    nonisolated static var requestedSpeakerPopoverIndex: Int? {
+        guard isRequested else { return nil }
+        return environment["MSR_UI_SNAPSHOT_SPEAKER_POPOVER"].flatMap { Int($0) }
+    }
+
+    /// Text typed into that popover (`MSR_UI_SNAPSHOT_SPEAKER_DRAFT`); `nil` keeps the current name.
+    nonisolated static var requestedSpeakerDraft: String? {
+        guard isRequested else { return nil }
+        return environment["MSR_UI_SNAPSHOT_SPEAKER_DRAFT"].flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     /// Runs before `bootstrap()` in snapshot runs only.
     ///
     /// A `swift run` build is unsigned, so reading the real app's Keychain items
@@ -63,6 +79,9 @@ enum UISnapshotCapture {
         }
         if environment["OPENAI_API_KEY"]?.isEmpty != false {
             viewModel.openAIKeyDraft = "snapshot-placeholder-key"
+        }
+        if environment["DEEPSEEK_API_KEY"]?.isEmpty != false {
+            viewModel.deepSeekKeyDraft = "snapshot-placeholder-key"
         }
         viewModel.saveAPIKeys()
         viewModel.statusMessage = "Ready"
@@ -107,6 +126,10 @@ enum UISnapshotCapture {
             viewModel.openSettingsWindow()
             try? await Task.sleep(for: .seconds(1))
             window = NSApp.windows.first { $0.title == "MSR Settings" && $0.isVisible }
+            if let window {
+                scrollToBottomIfRequested(window)
+                try? await Task.sleep(for: .milliseconds(400))
+            }
         } else {
             window = mainWindow()
         }
@@ -146,6 +169,74 @@ enum UISnapshotCapture {
         }
     }
 
+    /// Popovers (e.g. the speaker-name popover) are child windows that a
+    /// view-hierarchy render does not include; draw them on top at their
+    /// position relative to `window`. Returns `nil` when there are none.
+    private static func compositingChildWindows(of window: NSWindow, onto base: NSBitmapImageRep) -> NSBitmapImageRep? {
+        let children = (window.childWindows ?? []).filter { $0.isVisible }
+        guard !children.isEmpty else { return nil }
+        let size = NSSize(width: base.pixelsWide, height: base.pixelsHigh)
+        let scale = size.width / max(1, window.frame.width)
+        guard let output = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: base.pixelsWide, pixelsHigh: base.pixelsHigh,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: output) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        base.draw(in: NSRect(origin: .zero, size: size))
+        for child in children {
+            child.displayIfNeeded()
+            // Only the content: the popover's private frame view does not render
+            // through `cacheDisplay`, so a plain rounded panel stands in for it.
+            guard let content = child.contentView,
+                  let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { continue }
+            content.cacheDisplay(in: content.bounds, to: rep)
+            let inWindow = content.convert(content.bounds, to: nil)
+            let rect = NSRect(
+                x: (child.frame.minX + inWindow.minX - window.frame.minX) * scale,
+                y: (child.frame.minY + inWindow.minY - window.frame.minY) * scale,
+                width: inWindow.width * scale,
+                height: inWindow.height * scale
+            )
+            child.effectiveAppearance.performAsCurrentDrawingAppearance {
+                let panel = NSBezierPath(roundedRect: rect, xRadius: 10 * scale, yRadius: 10 * scale)
+                NSGraphicsContext.saveGraphicsState()
+                let shadow = NSShadow()
+                shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
+                shadow.shadowBlurRadius = 14 * scale
+                shadow.shadowOffset = NSSize(width: 0, height: -4 * scale)
+                shadow.set()
+                NSColor.windowBackgroundColor.setFill()
+                panel.fill()
+                NSGraphicsContext.restoreGraphicsState()
+                NSColor.separatorColor.setStroke()
+                panel.lineWidth = scale
+                panel.stroke()
+            }
+            rep.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        return output
+    }
+
+    /// `MSR_UI_SNAPSHOT_SETTINGS_SCROLL=bottom` scrolls the settings form to its end.
+    private static func scrollToBottomIfRequested(_ window: NSWindow) {
+        guard environment["MSR_UI_SNAPSHOT_SETTINGS_SCROLL"]?.lowercased() == "bottom",
+              let content = window.contentView else { return }
+        var stack = [content]
+        while let view = stack.popLast() {
+            if let scrollView = view as? NSScrollView, let document = scrollView.documentView,
+               document.frame.height > scrollView.contentView.bounds.height {
+                let y = document.isFlipped ? document.frame.height - scrollView.contentView.bounds.height : 0
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+                return
+            }
+            stack.append(contentsOf: view.subviews)
+        }
+    }
+
     private static func mainWindow() -> NSWindow? {
         let candidates = NSApp.windows.filter { $0.canBecomeMain && $0.title != "MSR Settings" }
         return candidates.first(where: { $0.isVisible }) ?? candidates.first
@@ -161,11 +252,14 @@ enum UISnapshotCapture {
     private static func capture(view: NSView, window: NSWindow, to path: String) {
         window.displayIfNeeded()
         let bounds = view.bounds
-        guard let representation = view.bitmapImageRepForCachingDisplay(in: bounds) else {
+        guard var representation = view.bitmapImageRepForCachingDisplay(in: bounds) else {
             FileHandle.standardError.write(Data("MSR snapshot: could not create bitmap\n".utf8))
             return
         }
         view.cacheDisplay(in: bounds, to: representation)
+        if let composited = compositingChildWindows(of: window, onto: representation) {
+            representation = composited
+        }
         guard let data = representation.representation(using: .png, properties: [:]) else {
             FileHandle.standardError.write(Data("MSR snapshot: could not encode PNG\n".utf8))
             return
