@@ -489,6 +489,10 @@ final class UIWalkthrough {
         viewModel.settings.language = .english
         viewModel.settings.sortOrder = .newest
         viewModel.settings.autoTranscribe = false
+        // The first-run sheet would cover the window; step 13 opens it on purpose.
+        if !UISnapshotCapture.requestsOnboarding {
+            viewModel.settings.hasCompletedOnboarding = true
+        }
         if !viewModel.credentialAvailable(for: viewModel.settings.provider),
            viewModel.credentialAvailable(for: .elevenLabs) {
             viewModel.settings.provider = .elevenLabs
@@ -544,6 +548,8 @@ final class UIWalkthrough {
         await step("9a-command-delete-in-text-field") { try await self.commandDeleteInTextField(window: window) }
         await step("9b-menu-delete-with-confirmation") { try await self.deleteWithConfirmation(window: window) }
         await step("10-status-bar") { try await self.statusBar() }
+        await step("13-onboarding") { try await self.onboarding() }
+        await step("13b-onboarding-escape") { try await self.onboardingEscape() }
     }
 
     private func sidebarSelection() async throws -> String {
@@ -1105,6 +1111,106 @@ final class UIWalkthrough {
         }
         try check(reflects, "AX texts \(seen) vs statusMessage '\(viewModel.statusMessage)'")
         return "AX status text == statusMessage '\(viewModel.statusMessage)'"
+    }
+
+    // MARK: Onboarding
+
+    /// Opens the first-run sheet (`Onboarding.present()`, what "Set up MSR…"
+    /// calls), walks Next/Back through all four steps via AXPress, flips
+    /// auto-transcribe on step 4 and presses Finish.
+    private func onboarding() async throws -> String {
+        settingsWindow()?.performClose(nil)
+        let main = try require(mainWindow(), "no main window")
+        viewModel.settings.hasCompletedOnboarding = false
+        Onboarding.present()
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet != nil }, "onboarding sheet did not open")
+        var path = [try await expectOnboardingStep(1)]
+        try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.back")) == nil, "Back is shown on step 1")
+
+        try await pressOnboarding("next")
+        path.append(try await expectOnboardingStep(2))
+        try check(!viewModel.onboardingPermissionItems.isEmpty, "Permissions step has no microphone/system audio rows")
+        for item in viewModel.onboardingPermissionItems {
+            try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.fix.\(item.id)")) != nil,
+                      "no Open Privacy Settings button for \(item.id)")
+        }
+        try await pressOnboarding("back")
+        path.append(try await expectOnboardingStep(1))
+        for number in 2...4 {
+            try await pressOnboarding("next")
+            path.append(try await expectOnboardingStep(number))
+            if number == 3 {
+                let status = try require(await ax.find(AXDriver.Query(identifier: "msr.onboarding.keyStatus.elevenLabs")),
+                                         "ElevenLabs key status chip not in AX tree")
+                let expected = viewModel.hasSavedCredential(.elevenLabs) ? "Saved" : "Missing"
+                let nodes = await ax.snapshot()
+                let texts = status.texts + ax.descendants(of: status, in: nodes).flatMap(\.texts)
+                try check(texts.contains(expected), "ElevenLabs key status reads \(texts), expected \(expected)")
+            }
+        }
+        try check(await ax.find(AXDriver.Query(identifier: "msr.onboarding.next")) == nil, "Next is still shown on step 4")
+
+        let toggle = try require(await ax.waitFor(AXDriver.Query(identifier: "msr.onboarding.autoTranscribe"), timeout: 2),
+                                 "auto-transcribe toggle (msr.onboarding.autoTranscribe) not in AX tree")
+        let before = viewModel.settings.autoTranscribe
+        try check(await ax.press(toggle), "AXPress on the auto-transcribe toggle failed")
+        try check(await ax.waitUntil(timeout: 2) { self.viewModel.settings.autoTranscribe == !before },
+                  "autoTranscribe is still \(before) after pressing the toggle")
+        let summarize = try require(await ax.find(AXDriver.Query(identifier: "msr.onboarding.autoSummarize")),
+                                    "auto-summarize toggle not in AX tree")
+        let summarizeEnabled = ax.bool(summarize, kAXEnabledAttribute)
+        try check(summarizeEnabled == viewModel.canSummarize,
+                  "auto-summarize enabled=\(summarizeEnabled.map(String.init) ?? "nil") but canSummarize=\(viewModel.canSummarize)")
+
+        try await pressOnboarding("finish")
+        try check(await ax.waitUntil(timeout: 3) { self.viewModel.settings.hasCompletedOnboarding },
+                  "hasCompletedOnboarding is still false after Finish")
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet == nil }, "sheet still attached after Finish")
+        try check(await ax.waitForAbsence(AXDriver.Query(identifier: "msr.onboarding.finish"), timeout: 2),
+                  "onboarding controls still in the AX tree after Finish")
+        return "sheet opened; steps " + path.joined(separator: "→")
+            + "; auto-transcribe \(before)→\(!before); auto-summarize enabled=\(viewModel.canSummarize); Finish → hasCompletedOnboarding=true, sheet gone"
+    }
+
+    /// Esc (the Skip button's cancel shortcut) closes the sheet and still marks it done.
+    private func onboardingEscape() async throws -> String {
+        let main = try require(mainWindow(), "no main window")
+        if main.attachedSheet != nil {
+            // Left open by a failed step 13: close it so this step starts on Welcome.
+            try? await pressOnboarding("skip")
+            _ = await ax.waitUntil(timeout: 2) { main.attachedSheet == nil }
+        }
+        viewModel.settings.hasCompletedOnboarding = false
+        Onboarding.present()
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet != nil }, "onboarding sheet did not open")
+        _ = try await expectOnboardingStep(1)
+        let sheet = try require(main.attachedSheet, "no sheet")
+        sheet.makeKeyAndOrderFront(nil)
+        _ = await ax.waitUntil(timeout: 1) { sheet.isKeyWindow }
+        await ax.sendKey(.escape, to: sheet)
+        var method = "Esc (posted key event)"
+        if !(await ax.waitUntil(timeout: 1.5) { main.attachedSheet == nil }) {
+            // An inactive app may not route the key to the sheet; Skip is the same action.
+            method = "Skip (AXPress; Esc not delivered, sheet key=\(sheet.isKeyWindow) active=\(NSApp.isActive))"
+            try await pressOnboarding("skip")
+        }
+        try check(await ax.waitUntil(timeout: 3) { main.attachedSheet == nil }, "sheet still attached after \(method)")
+        try check(viewModel.settings.hasCompletedOnboarding, "hasCompletedOnboarding is false after \(method)")
+        return "\(method) → sheet closed, hasCompletedOnboarding=true"
+    }
+
+    private func pressOnboarding(_ control: String) async throws {
+        let identifier = "msr.onboarding.\(control)"
+        let button = try require(await ax.waitFor(AXDriver.Query(identifier: identifier), timeout: 2),
+                                 "\(identifier) not in AX tree")
+        try check(await ax.press(button), "AXPress on \(identifier) failed")
+    }
+
+    @discardableResult
+    private func expectOnboardingStep(_ number: Int) async throws -> String {
+        try check(await ax.waitFor(AXDriver.Query(identifier: "msr.onboarding.step.\(number)"), timeout: 2) != nil,
+                  "msr.onboarding.step.\(number) not in AX tree")
+        return String(number)
     }
 
     // MARK: Empty library

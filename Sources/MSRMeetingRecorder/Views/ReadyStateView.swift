@@ -28,6 +28,15 @@ struct ReadyStateView: View {
             if !items.isEmpty {
                 ReadinessChecklist(viewModel: viewModel, items: items)
                     .frame(maxWidth: 440)
+            } else if viewModel.recordings.isEmpty {
+                // Empty library, nothing to fix: still offer the guided setup.
+                Button {
+                    Onboarding.present()
+                } label: {
+                    Label("Set up MSR…", systemImage: "sparkles")
+                }
+                .controlSize(.regular)
+                .accessibilityIdentifier("msr.ready.setup")
             }
         }
         .padding(32)
@@ -46,6 +55,13 @@ struct ReadinessChecklist: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.textSecondary)
                 Spacer()
+                Button("Set up MSR…") {
+                    Onboarding.present()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 11.5, weight: .medium))
+                .help("Walk through permissions, API keys and automation")
+                .accessibilityIdentifier("msr.ready.setup")
                 Button {
                     viewModel.refreshSetupHealth()
                 } label: {

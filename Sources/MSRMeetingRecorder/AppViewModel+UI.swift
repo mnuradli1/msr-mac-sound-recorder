@@ -168,6 +168,25 @@ extension AppViewModel {
         }
     }
 
+    // MARK: Onboarding
+
+    /// Microphone and System Audio rows for the onboarding Permissions step,
+    /// from the same `setupHealthItems` the readiness checklist reads.
+    var onboardingPermissionItems: [SetupHealthItem] {
+        ["microphone", "screen"].compactMap { setupHealthItem(id: $0) }
+    }
+
+    /// Whether the selected transcription provider has a key, from the cached
+    /// credential state (never queries the Keychain while rendering).
+    var transcriptionKeyIsSaved: Bool {
+        hasSavedCredential(settings.provider.credentialProvider)
+    }
+
+    /// Any API key typed into a field but not saved yet.
+    var hasUnsavedKeyDrafts: Bool {
+        !elevenLabsKeyDraft.isEmpty || !openAIKeyDraft.isEmpty || !deepSeekKeyDraft.isEmpty
+    }
+
     var queueSummary: QueueSummary? {
         let jobs = visibleTranscriptionJobs
         guard !jobs.isEmpty else { return nil }

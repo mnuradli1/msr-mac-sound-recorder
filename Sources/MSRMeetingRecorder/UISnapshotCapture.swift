@@ -20,6 +20,9 @@ import Foundation
 /// - `MSR_UI_SNAPSHOT_SETTINGS_SCROLL`: `bottom` scrolls the settings form to its end.
 /// - `MSR_UI_SNAPSHOT_SPEAKER_POPOVER`: segment index whose speaker-name popover
 ///   opens in the Notes tab's Read mode; `MSR_UI_SNAPSHOT_SPEAKER_DRAFT` prefills it.
+/// - `MSR_UI_SNAPSHOT_ONBOARDING`: `1` opens the first-run onboarding sheet and
+///   captures that sheet instead of the window; `MSR_UI_SNAPSHOT_ONBOARDING_STEP`
+///   (`1`...`4`) picks its step. Without it, snapshot runs never show the sheet.
 /// - `MSR_UI_SNAPSHOT_KEEP_RUNNING`: when set, the app stays open after capturing.
 ///
 /// Pair it with `MSR_RECORDINGS_FOLDER` to point the app at a fixture library so
@@ -59,6 +62,17 @@ enum UISnapshotCapture {
         return environment["MSR_UI_SNAPSHOT_SPEAKER_DRAFT"].flatMap { $0.isEmpty ? nil : $0 }
     }
 
+    /// `MSR_UI_SNAPSHOT_ONBOARDING=1`: capture the onboarding sheet.
+    nonisolated static var requestsOnboarding: Bool {
+        isRequested && environment["MSR_UI_SNAPSHOT_ONBOARDING"] == "1"
+    }
+
+    /// Onboarding step (1...4) to open on while snapshotting; `nil` outside onboarding snapshot runs.
+    nonisolated static var requestedOnboardingStep: Int? {
+        guard requestsOnboarding else { return nil }
+        return environment["MSR_UI_SNAPSHOT_ONBOARDING_STEP"].flatMap { Int($0) }
+    }
+
     /// Runs before `bootstrap()` in snapshot runs only.
     ///
     /// A `swift run` build is unsigned, so reading the real app's Keychain items
@@ -72,6 +86,9 @@ enum UISnapshotCapture {
         viewModel.settingsPersistenceSuspended = true
         viewModel.settings.rememberCredentials = false
         viewModel.settings.localAPIEnabled = false
+        // The first-run sheet would cover every other snapshot; only an
+        // onboarding snapshot shows it (as on a first launch).
+        viewModel.settings.hasCompletedOnboarding = !requestsOnboarding
         // A key exported in the environment is real and already wins over the
         // Keychain, so only providers without one get a placeholder.
         if environment["ELEVENLABS_API_KEY"]?.isEmpty != false {
@@ -114,6 +131,9 @@ enum UISnapshotCapture {
         }
 
         applyState(to: viewModel, environment: environment)
+        if requestsOnboarding {
+            Onboarding.present()
+        }
 
         let delay = Double(environment["MSR_UI_SNAPSHOT_DELAY"] ?? "") ?? 1.5
         try? await Task.sleep(for: .seconds(max(0, delay)))
@@ -133,12 +153,19 @@ enum UISnapshotCapture {
                 scrollToBottomIfRequested(window)
                 try? await Task.sleep(for: .milliseconds(400))
             }
+        } else if requestsOnboarding {
+            window = mainWindow()?.attachedSheet
+            if window == nil {
+                FileHandle.standardError.write(Data("MSR snapshot: onboarding sheet is not open\n".utf8))
+            }
         } else {
             window = mainWindow()
         }
 
-        // Capture the theme frame so the title bar (traffic lights, title) is included.
-        guard let window, let view = window.contentView?.superview ?? window.contentView else {
+        // Capture the theme frame so the title bar (traffic lights, title) is
+        // included; a sheet has no title bar, so only its content.
+        let isSheet = window?.sheetParent != nil
+        guard let window, let view = isSheet ? window.contentView : (window.contentView?.superview ?? window.contentView) else {
             FileHandle.standardError.write(Data("MSR snapshot: no window found\n".utf8))
             return
         }
@@ -241,7 +268,7 @@ enum UISnapshotCapture {
     }
 
     private static func mainWindow() -> NSWindow? {
-        let candidates = NSApp.windows.filter { $0.canBecomeMain && $0.title != "MSR Settings" }
+        let candidates = NSApp.windows.filter { $0.canBecomeMain && $0.title != "MSR Settings" && $0.sheetParent == nil }
         return candidates.first(where: { $0.isVisible }) ?? candidates.first
     }
 
