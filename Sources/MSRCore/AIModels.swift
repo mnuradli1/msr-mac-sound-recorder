@@ -205,6 +205,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var localAPIEnabled: Bool
     public var windowWidth: Double
     public var windowHeight: Double
+    /// Set once the first-run onboarding sheet was finished or skipped; it is
+    /// presented at launch while this is `false`. Settings saved before this
+    /// key existed decode as `false`.
+    public var hasCompletedOnboarding: Bool
 
     public static let `default` = AppSettings(
         provider: .elevenLabs,
@@ -229,7 +233,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         globalShortcutEnabled: true,
         localAPIEnabled: false,
         windowWidth: 1_180,
-        windowHeight: 760
+        windowHeight: 760,
+        hasCompletedOnboarding: false
     )
 
     public init(
@@ -255,7 +260,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         globalShortcutEnabled: Bool = true,
         localAPIEnabled: Bool = false,
         windowWidth: Double = 1_180,
-        windowHeight: Double = 760
+        windowHeight: Double = 760,
+        hasCompletedOnboarding: Bool = false
     ) {
         self.provider = provider
         self.recordingsFolderPath = recordingsFolderPath
@@ -280,6 +286,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.localAPIEnabled = localAPIEnabled
         self.windowWidth = windowWidth
         self.windowHeight = windowHeight
+        self.hasCompletedOnboarding = hasCompletedOnboarding
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -288,6 +295,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case autoTranscribe, autoSummarize, summaryProvider, transcriptionLanguage
         case rememberCredentials, showMenuBarControl, globalShortcutEnabled, localAPIEnabled, windowWidth, windowHeight
         case showMenuBarTimer
+        case hasCompletedOnboarding
     }
 
     public init(from decoder: Decoder) throws {
@@ -317,6 +325,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         localAPIEnabled = try c.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? defaults.localAPIEnabled
         windowWidth = try c.decodeIfPresent(Double.self, forKey: .windowWidth) ?? defaults.windowWidth
         windowHeight = try c.decodeIfPresent(Double.self, forKey: .windowHeight) ?? defaults.windowHeight
+        hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? defaults.hasCompletedOnboarding
     }
 }
 

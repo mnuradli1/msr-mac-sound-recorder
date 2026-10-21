@@ -19,6 +19,7 @@ struct ParityTests {
         #expect(!settings.autoSummarize)
         #expect(settings.summaryProvider == .openAI)
         #expect(settings.transcriptionLanguage == .automatic)
+        #expect(!settings.hasCompletedOnboarding)
     }
 
     @Test func releaseOnePointTwoSettingsRoundTripAndUnknownValuesFallBack() throws {

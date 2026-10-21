@@ -8,6 +8,7 @@ struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
     @FocusState private var recordingSearchFocused: Bool
     @State private var pendingDelete: RecordingItem?
+    @State private var showingOnboarding = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,6 +56,14 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .requestDeleteRecording)) { _ in
             requestDelete(viewModel.selectedRecording)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showOnboarding)) { _ in
+            showingOnboarding = true
+        }
+        .onAppear {
+            if Onboarding.shouldPresentAtLaunch(settings: viewModel.settings, environment: ProcessInfo.processInfo.environment) {
+                showingOnboarding = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { notification in
             if let window = notification.object as? NSWindow, window.isMainWindow {
@@ -148,6 +157,13 @@ struct ContentView: View {
                 .frame(minWidth: 600, maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxHeight: .infinity)
+        // On its own view (not next to the rename sheet) so both sheets work.
+        .sheet(isPresented: $showingOnboarding, onDismiss: {
+            // Any way out (Finish, Skip, Esc) counts as having seen it once.
+            if !viewModel.settings.hasCompletedOnboarding { Onboarding.complete(viewModel, saveKeys: false) }
+        }) {
+            OnboardingView(viewModel: viewModel) { showingOnboarding = false }
+        }
     }
 
     @ViewBuilder
