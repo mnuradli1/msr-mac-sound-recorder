@@ -198,6 +198,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var transcriptionLanguage: TranscriptionLanguage
     public var rememberCredentials: Bool
     public var showMenuBarControl: Bool
+    /// Shows the elapsed time next to the menu-bar icon while a recording is
+    /// running or paused (only when `showMenuBarControl` is on). Defaults to `true`.
+    public var showMenuBarTimer: Bool
     public var globalShortcutEnabled: Bool
     public var localAPIEnabled: Bool
     public var windowWidth: Double
@@ -222,6 +225,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         transcriptionLanguage: .automatic,
         rememberCredentials: false,
         showMenuBarControl: true,
+        showMenuBarTimer: true,
         globalShortcutEnabled: true,
         localAPIEnabled: false,
         windowWidth: 1_180,
@@ -247,6 +251,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         transcriptionLanguage: TranscriptionLanguage = .automatic,
         rememberCredentials: Bool = false,
         showMenuBarControl: Bool = true,
+        showMenuBarTimer: Bool = true,
         globalShortcutEnabled: Bool = true,
         localAPIEnabled: Bool = false,
         windowWidth: Double = 1_180,
@@ -270,6 +275,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.transcriptionLanguage = transcriptionLanguage
         self.rememberCredentials = rememberCredentials
         self.showMenuBarControl = showMenuBarControl
+        self.showMenuBarTimer = showMenuBarTimer
         self.globalShortcutEnabled = globalShortcutEnabled
         self.localAPIEnabled = localAPIEnabled
         self.windowWidth = windowWidth
@@ -281,6 +287,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case sortOrder, silenceThreshold, playbackSpeed, theme, language, compressUploads, autoTitle
         case autoTranscribe, autoSummarize, summaryProvider, transcriptionLanguage
         case rememberCredentials, showMenuBarControl, globalShortcutEnabled, localAPIEnabled, windowWidth, windowHeight
+        case showMenuBarTimer
     }
 
     public init(from decoder: Decoder) throws {
@@ -305,6 +312,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         transcriptionLanguage = (try? c.decodeIfPresent(TranscriptionLanguage.self, forKey: .transcriptionLanguage)) ?? defaults.transcriptionLanguage
         rememberCredentials = try c.decodeIfPresent(Bool.self, forKey: .rememberCredentials) ?? defaults.rememberCredentials
         showMenuBarControl = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarControl) ?? defaults.showMenuBarControl
+        showMenuBarTimer = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarTimer) ?? defaults.showMenuBarTimer
         globalShortcutEnabled = try c.decodeIfPresent(Bool.self, forKey: .globalShortcutEnabled) ?? defaults.globalShortcutEnabled
         localAPIEnabled = try c.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? defaults.localAPIEnabled
         windowWidth = try c.decodeIfPresent(Double.self, forKey: .windowWidth) ?? defaults.windowWidth

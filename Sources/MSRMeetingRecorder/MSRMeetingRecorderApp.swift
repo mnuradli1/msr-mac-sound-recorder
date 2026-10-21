@@ -9,8 +9,9 @@ struct MSRMeetingRecorderApp: App {
     @StateObject private var viewModel = AppViewModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: Self.mainWindowID) {
             ContentView(viewModel: viewModel)
+                .background(QuickRecorderInstaller(viewModel: viewModel))
                 .task {
                     UISnapshotCapture.prepareIfRequested(viewModel: viewModel)
                     viewModel.startLocalAPI()
@@ -161,19 +162,11 @@ struct MSRMeetingRecorderApp: App {
                 .environment(\.locale, preferredLocale)
         }
 
-        MenuBarExtra(isInserted: .constant(viewModel.settings.showMenuBarControl)) {
-            Button("Show MSR") { viewModel.showMainWindow() }
-            Button(viewModel.isRecording ? "Stop Recording" : "Start Recording") {
-                Task { await viewModel.toggleRecording() }
-            }
-            .disabled(!viewModel.canToggleRecording)
-            Divider()
-            Button("Quit") { NSApp.terminate(nil) }
-        } label: {
-            Image(systemName: viewModel.isRecording ? "record.circle.fill" : "waveform.circle")
-        }
-        .menuBarExtraStyle(.menu)
+        // The menu-bar quick recorder is an AppKit status item + panel
+        // (`QuickRecorderController`), installed by `QuickRecorderInstaller`.
     }
+
+    static let mainWindowID = "main"
 
     private var preferredColorScheme: ColorScheme? {
         switch viewModel.settings.theme {
@@ -189,6 +182,36 @@ struct MSRMeetingRecorderApp: App {
         case .english: Locale(identifier: "en")
         case .indonesian: Locale(identifier: "id")
         }
+    }
+}
+
+/// Installs the menu-bar quick recorder as soon as the main window's content
+/// exists, and hands it the scene's `openWindow` so "Open MSR" can re-create
+/// the main window after it was closed.
+private struct QuickRecorderInstaller: View {
+    let viewModel: AppViewModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onAppear {
+                let openWindow = openWindow
+                viewModel.installQuickRecorder {
+                    // An open (or minimized) main window is brought forward;
+                    // only a closed one is re-created. The panel and the
+                    // Settings window are not main-window candidates.
+                    if let window = NSApp.windows.first(where: {
+                        $0.canBecomeMain && $0.title != "MSR Settings" && ($0.isVisible || $0.isMiniaturized)
+                    }) {
+                        if window.isMiniaturized { window.deminiaturize(nil) }
+                        window.makeKeyAndOrderFront(nil)
+                    } else {
+                        openWindow(id: MSRMeetingRecorderApp.mainWindowID)
+                    }
+                }
+            }
     }
 }
 

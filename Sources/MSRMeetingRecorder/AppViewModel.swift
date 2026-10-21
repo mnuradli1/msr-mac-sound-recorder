@@ -84,6 +84,9 @@ final class AppViewModel: ObservableObject {
     /// separate for the same reason (4 Hz while playing, continuous while a
     /// trim slider is dragged).
     let playback = PlaybackState()
+    /// The menu-bar quick recorder (status item + panel). Installed by the app
+    /// scene (`installQuickRecorder()`); `nil` in tests and other hosts.
+    private(set) var quickRecorder: QuickRecorderController?
     @Published var selectedExportFormat: TranscriptExportFormat = .markdown
     @Published var exportPreview = ""
     @Published var transcriptSaveMessage = ""
@@ -2327,7 +2330,25 @@ final class AppViewModel: ObservableObject {
 
     func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+        NSApp.windows.first(where: { $0.canBecomeMain && $0 !== settingsWindow })?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Creates the menu-bar quick recorder once per process; later calls only
+    /// refresh `openMainWindow` (the scene's action to re-create a closed main window).
+    @discardableResult
+    func installQuickRecorder(openMainWindow: (() -> Void)? = nil) -> QuickRecorderController {
+        let controller = quickRecorder ?? QuickRecorderController(viewModel: self)
+        quickRecorder = controller
+        if let openMainWindow { controller.openMainWindow = openMainWindow }
+        return controller
+    }
+
+    func showQuickRecorder() {
+        installQuickRecorder().showQuickRecorder()
+    }
+
+    func hideQuickRecorder() {
+        quickRecorder?.hideQuickRecorder()
     }
 
     private func startLibraryWatcher() {

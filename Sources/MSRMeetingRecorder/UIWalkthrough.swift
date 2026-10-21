@@ -544,6 +544,7 @@ final class UIWalkthrough {
         await step("9a-command-delete-in-text-field") { try await self.commandDeleteInTextField(window: window) }
         await step("9b-menu-delete-with-confirmation") { try await self.deleteWithConfirmation(window: window) }
         await step("10-status-bar") { try await self.statusBar() }
+        await step("12-quick-recorder") { try await self.quickRecorder(window: window) }
     }
 
     private func sidebarSelection() async throws -> String {
@@ -1105,6 +1106,87 @@ final class UIWalkthrough {
         }
         try check(reflects, "AX texts \(seen) vs statusMessage '\(viewModel.statusMessage)'")
         return "AX status text == statusMessage '\(viewModel.statusMessage)'"
+    }
+
+    /// Menu-bar quick recorder: with the main window hidden, opens the panel
+    /// (`showQuickRecorder()`), presses its Record button through AX, waits for
+    /// `isRecording`, presses it again and checks the new recording on disk.
+    /// Auto-transcribe is switched off for the step (no extra provider call).
+    private func quickRecorder(window: NSWindow) async throws -> String {
+        try check(!viewModel.isRecording && !viewModel.workflowState.isPaused, "a recording session is already active")
+        try check(viewModel.canToggleRecording, "recording cannot start now (\(viewModel.workflowState))")
+        let savedAutoTranscribe = viewModel.settings.autoTranscribe
+        viewModel.settings.autoTranscribe = false
+        defer {
+            viewModel.settings.autoTranscribe = savedAutoTranscribe
+            viewModel.hideQuickRecorder()
+            // Bring the main window back without activating the app.
+            window.makeKeyAndOrderFront(nil)
+        }
+        let existing = Set(viewModel.recordings.map(\.id))
+
+        // The panel must work with the main window closed (shared view model).
+        window.orderOut(nil)
+        try check(await ax.waitUntil(timeout: 2) { self.mainWindow() == nil }, "main window still visible after orderOut")
+        viewModel.showQuickRecorder()
+        let controller = try require(viewModel.quickRecorder, "no quick recorder controller after showQuickRecorder()")
+        try check(await ax.waitUntil(timeout: 2) { controller.isQuickRecorderShown }, "quick recorder panel did not open")
+
+        let panelTitle = QuickRecorderController.panelTitle
+        let recordQuery = AXDriver.Query(identifier: "msr.quick.record")
+        var axWindow: String? = panelTitle
+        if await ax.waitFor(recordQuery, window: panelTitle, timeout: 5) == nil {
+            // Borderless panels may not expose their title; search every window.
+            axWindow = nil
+        }
+        let record = try require(await ax.waitFor(recordQuery, window: axWindow, timeout: 3),
+                                 "msr.quick.record not in the AX tree of the panel")
+        for identifier in ["msr.quick.source", "msr.quick.secondary", "msr.quick.open"] {
+            try check(await ax.find(AXDriver.Query(identifier: identifier), window: axWindow) != nil,
+                      "\(identifier) not in the AX tree of the panel")
+        }
+        let startLabel = record.texts.first ?? ""
+        try check(await ax.press(record), "AXPress on msr.quick.record failed")
+        try check(await ax.waitUntil(timeout: 5) { self.viewModel.isRecording },
+                  "isRecording false 5 s after pressing the panel's Record (\(viewModel.statusMessage))")
+        var stopQuery = recordQuery
+        stopQuery.exactText = "Stop Recording"
+        try check(await ax.waitFor(stopQuery, window: axWindow, timeout: 2) != nil,
+                  "panel Record button label did not become 'Stop Recording'")
+        try check(viewModel.sourcePickerDisabled, "source picker is not disabled while recording")
+        let sourceEnabled = await ax.find(AXDriver.Query(identifier: "msr.quick.source"), window: axWindow)
+            .flatMap { ax.bool($0, kAXEnabledAttribute) }
+        try check(sourceEnabled != true, "panel source picker is enabled in AX while recording")
+        let secondary = try require(await ax.find(AXDriver.Query(identifier: "msr.quick.secondary"), window: axWindow),
+                                    "msr.quick.secondary missing while recording")
+        try check(ax.bool(secondary, kAXEnabledAttribute) != false, "panel Pause button is disabled while recording")
+        try check(await ax.waitUntil(timeout: 3) { self.viewModel.live.recordingElapsed >= 1 },
+                  "elapsed time did not advance (\(viewModel.live.recordingElapsed))")
+        var menuTitle = "item hidden"
+        if controller.isStatusItemInserted {
+            try check(await ax.waitUntil(timeout: 2) { !controller.statusItemTitle.isEmpty || !self.viewModel.settings.showMenuBarTimer },
+                      "menu-bar item shows no elapsed time while recording")
+            menuTitle = "'\(controller.statusItemTitle.trimmingCharacters(in: .whitespaces))'"
+        }
+
+        let stop = try require(await ax.find(recordQuery, window: axWindow), "msr.quick.record missing while recording")
+        try check(await ax.press(stop), "AXPress on the panel's Stop Recording failed")
+        try check(await ax.waitUntil(timeout: 20) {
+            !self.viewModel.isRecording && self.viewModel.recordings.contains { !existing.contains($0.id) }
+        }, "recording did not finish from the panel (\(viewModel.statusMessage))")
+        let recording = try require(viewModel.recordings.first { !existing.contains($0.id) }, "new recording missing")
+        try check(FileManager.default.fileExists(atPath: recording.audioURL.path), "new recording has no audio file on disk")
+        var startQuery = recordQuery
+        startQuery.exactText = "Record"
+        try check(await ax.waitFor(startQuery, window: axWindow, timeout: 3) != nil, "panel button did not return to 'Record'")
+        if controller.isStatusItemInserted {
+            try check(await ax.waitUntil(timeout: 2) { controller.statusItemTitle.isEmpty },
+                      "menu-bar item still shows '\(controller.statusItemTitle)' after stopping")
+        }
+        viewModel.hideQuickRecorder()
+        try check(!controller.isQuickRecorderShown, "panel still shown after hideQuickRecorder()")
+        let lookup = axWindow == nil ? "found across all AX windows" : "AX window '\(panelTitle)'"
+        return "main window hidden; panel (\(lookup)) '\(startLabel)' → isRecording, label 'Stop Recording', source locked, menu bar \(menuTitle); stop → new recording '\(recording.displayName.prefix(30))' on disk; panel closed"
     }
 
     // MARK: Empty library
