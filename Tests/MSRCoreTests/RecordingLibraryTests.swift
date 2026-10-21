@@ -373,6 +373,77 @@ struct RecordingTitleProvenanceTests {
         )
     }
 
+    @Test func segmentsSidecarsAreSkippedByNameButLegacyLookalikesStillLoad() throws {
+        let folder = try TemporaryFolder()
+        let library = RecordingLibrary(folderURL: folder.url)
+        let source = folder.url.appendingPathComponent("capture.m4a")
+        try Data("audio".utf8).write(to: source)
+        let item = try library.finishRecording(
+            temporaryAudioURL: source,
+            requestedName: "Weekly Sync",
+            source: .microphone,
+            startedAt: Date(timeIntervalSince1970: 10),
+            endedAt: Date(timeIntervalSince1970: 20)
+        )
+        _ = try library.writeTranscriptBundle(
+            "Speaker 1: Hi",
+            segments: [TranscriptSegment(speaker: "Speaker 1", startTime: 0, endTime: 1, text: "Hi")],
+            for: item
+        )
+        // A legacy recording whose own name ends in ".transcript.segments" has no
+        // "<base>.json" sibling, so its metadata is still decoded.
+        let legacyName = "Notes.transcript.segments"
+        try Data("audio".utf8).write(to: folder.url.appendingPathComponent("\(legacyName).m4a"))
+        let legacy = """
+        {
+          "id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+          "displayName" : "\(legacyName)",
+          "source" : "microphone",
+          "audioFileName" : "\(legacyName).m4a",
+          "startedAt" : "1970-01-01T00:00:05Z",
+          "endedAt" : "1970-01-01T00:00:06Z",
+          "durationSeconds" : 1,
+          "createdAt" : "1970-01-01T00:00:06Z",
+          "updatedAt" : "1970-01-01T00:00:06Z"
+        }
+        """
+        try legacy.write(to: folder.url.appendingPathComponent("\(legacyName).json"), atomically: true, encoding: .utf8)
+        // Unknown JSON is still ignored.
+        try Data("[1, 2]".utf8).write(to: folder.url.appendingPathComponent("stray.json"))
+
+        let loaded = try library.loadRecordings()
+        #expect(loaded.map(\.displayName) == ["Weekly Sync", legacyName])
+        #expect(RecordingLibrary.isSegmentsSidecar(item.transcriptSegmentsURL.lastPathComponent, among: [item.metadataURL.lastPathComponent]))
+        #expect(!RecordingLibrary.isSegmentsSidecar("\(legacyName).json", among: ["\(legacyName).json"]))
+        #expect(!RecordingLibrary.isSegmentsSidecar(".transcript.segments.json", among: [".json"]))
+    }
+
+    @Test func finishRecordingStillRejectsAnExistingIDAndDeduplicatesNames() throws {
+        let folder = try TemporaryFolder()
+        let library = RecordingLibrary(folderURL: folder.url)
+        let first = folder.url.appendingPathComponent("a.m4a")
+        let second = folder.url.appendingPathComponent("b.m4a")
+        let third = folder.url.appendingPathComponent("c.m4a")
+        for url in [first, second, third] { try Data("audio".utf8).write(to: url) }
+        let item = try library.finishRecording(
+            temporaryAudioURL: first, requestedName: "Sync", source: .microphone,
+            startedAt: Date(timeIntervalSince1970: 10), endedAt: Date(timeIntervalSince1970: 20)
+        )
+        let again = try library.finishRecording(
+            temporaryAudioURL: second, requestedName: "sync", source: .microphone,
+            startedAt: Date(timeIntervalSince1970: 30), endedAt: Date(timeIntervalSince1970: 40)
+        )
+        #expect(again.displayName == "sync 2")
+        #expect(throws: RecordingLibraryError.duplicateRecordingID(item.id)) {
+            try library.finishRecording(
+                temporaryAudioURL: third, requestedName: "Other", source: .microphone,
+                startedAt: Date(timeIntervalSince1970: 50), endedAt: Date(timeIntervalSince1970: 60),
+                recordingID: item.id
+            )
+        }
+        #expect(FileManager.default.fileExists(atPath: third.path))
+    }
+
     private func writeMetadata(_ metadata: RecordingMetadata, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

@@ -11,7 +11,6 @@ temporary storage requirements, and the physical lid-close acceptance checklist.
 - Native SwiftUI app target: `MSRMeetingRecorder`
 - Core library/history target: `MSRCore`
 - Audio/provider/local API services target: `MSRServices`
-- Coordinated recording, library, playback, queue, notes/export, and settings models: `MSRPresentation`
 - SwiftPM unit/integration tests plus the `MSRTestRunner` E2E fake-provider harness
 - Immutable recording storage with lazy migration from pre-1.0 libraries
 - Review waveform, seeking, playback speeds, non-destructive trim, and selected-range transcription

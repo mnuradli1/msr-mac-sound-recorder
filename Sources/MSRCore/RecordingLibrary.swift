@@ -83,8 +83,13 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
-        let candidates = urls
-            .filter { $0.pathExtension.lowercased() == "json" }
+        let jsonURLs = urls.filter { $0.pathExtension.lowercased() == "json" }
+        // Hidden files (job, session and journal JSON) are already skipped by
+        // `.skipsHiddenFiles`. A recording's segments sidecar is never metadata:
+        // skip it by name instead of failing to decode it (three reads each).
+        let jsonNames = Set(jsonURLs.map(\.lastPathComponent))
+        let candidates = jsonURLs
+            .filter { !Self.isSegmentsSidecar($0.lastPathComponent, among: jsonNames) }
             .compactMap(readRecording)
         let duplicateIDs = Dictionary(grouping: candidates, by: \.id)
             .filter { $0.value.count > 1 }
@@ -92,6 +97,16 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         return candidates
             .filter { !duplicateIDs.contains($0.id) }
             .sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// `<base>.transcript.segments.json` next to a `<base>.json`: the segments
+    /// file of that recording. Without the sibling (an orphan, or a legacy
+    /// recording literally named `… .transcript.segments`) it is still decoded
+    /// and ignored when it is not valid metadata, as before.
+    static func isSegmentsSidecar(_ fileName: String, among jsonNames: Set<String>) -> Bool {
+        let suffix = ".transcript.segments.json"
+        guard fileName.hasSuffix(suffix), fileName.count > suffix.count else { return false }
+        return jsonNames.contains(String(fileName.dropLast(suffix.count)) + ".json")
     }
 
     /// Publishes a finished capture. The title is recorded as
@@ -115,9 +130,11 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         guard fileManager.fileExists(atPath: temporaryAudioURL.path) else {
             throw RecordingLibraryError.audioMissing(temporaryAudioURL.lastPathComponent)
         }
-        let displayName = try uniqueDisplayName(FileNameSanitizer.sanitizedBaseName(requestedName))
+        // One listing serves both checks (nothing is written in between).
+        let existing = try loadRecordings()
+        let displayName = uniqueDisplayName(FileNameSanitizer.sanitizedBaseName(requestedName), excluding: nil, among: existing)
         let id = recordingID ?? UUID()
-        try ensureRecordingIDAvailable(id)
+        try ensureRecordingIDAvailable(id, among: existing)
         let storageKey = Self.storageKey(for: id)
         let ext = temporaryAudioURL.pathExtension.isEmpty ? "m4a" : temporaryAudioURL.pathExtension.lowercased()
         let destination = try StoragePath.containedURL(in: folderURL, fileName: "\(storageKey).\(ext)")
@@ -637,8 +654,8 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         [recording.audioURL, recording.metadataURL, recording.transcriptURL, recording.transcriptSegmentsURL, recording.summaryURL]
     }
 
-    private func ensureRecordingIDAvailable(_ id: UUID) throws {
-        if try loadRecordings().contains(where: { $0.id == id }) {
+    private func ensureRecordingIDAvailable(_ id: UUID, among recordings: [RecordingItem]) throws {
+        if recordings.contains(where: { $0.id == id }) {
             throw RecordingLibraryError.duplicateRecordingID(id)
         }
     }

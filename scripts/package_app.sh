@@ -21,8 +21,10 @@ ENTITLEMENTS_PATH="$ROOT_DIR/Config/MSRMeetingRecorder.entitlements"
 cd "$ROOT_DIR"
 
 echo "==> Building release executable"
-swift build -c release --product "$PRODUCT_NAME"
-BIN_DIR="$(swift build -c release --show-bin-path)"
+# -Osize: about 25 % less machine code than -O for this UI-bound app.
+RELEASE_FLAGS=(-c release -Xswiftc -Osize)
+swift build "${RELEASE_FLAGS[@]}" --product "$PRODUCT_NAME"
+BIN_DIR="$(swift build "${RELEASE_FLAGS[@]}" --show-bin-path)"
 EXECUTABLE_PATH="$BIN_DIR/$EXECUTABLE_NAME"
 
 if [[ ! -x "$EXECUTABLE_PATH" ]]; then
@@ -36,15 +38,24 @@ mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$EXECUTABLE_PATH" "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
 cp "$INFO_PLIST" "$APP_PATH/Contents/Info.plist"
 cp "$ICON_PATH" "$APP_PATH/Contents/Resources/MSRMeetingRecorder.icns"
+# Localizations are looked up in Bundle.main (`AppViewModel.L`, SwiftUI `Text`);
+# nothing uses the SwiftPM resource bundle (`Bundle.module`), so only its
+# *.lproj folders are copied, once, into Contents/Resources.
 RESOURCE_BUNDLE="$(find "$BIN_DIR" -maxdepth 1 -type d -name '*MSRMeetingRecorder*.bundle' -print -quit)"
-if [[ -n "$RESOURCE_BUNDLE" ]]; then
-  cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
-  for localization in "$RESOURCE_BUNDLE"/*.lproj; do
-    [[ -d "$localization" ]] || continue
-    cp -R "$localization" "$APP_PATH/Contents/Resources/"
-  done
+if [[ -z "$RESOURCE_BUNDLE" ]] || ! compgen -G "$RESOURCE_BUNDLE/*.lproj" > /dev/null; then
+  echo "Missing localized resources in $BIN_DIR" >&2
+  exit 1
 fi
+for localization in "$RESOURCE_BUNDLE"/*.lproj; do
+  cp -R "$localization" "$APP_PATH/Contents/Resources/"
+done
 chmod +x "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
+
+echo "==> Stripping executable (symbols kept in dist/$EXECUTABLE_NAME.dSYM)"
+rm -rf "$DIST_DIR/$EXECUTABLE_NAME.dSYM"
+dsymutil "$EXECUTABLE_PATH" -o "$DIST_DIR/$EXECUTABLE_NAME.dSYM"
+# Before signing: stripping afterwards would invalidate the signature.
+strip -x "$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE_NAME" "$APP_PATH/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_PATH/Contents/Info.plist"

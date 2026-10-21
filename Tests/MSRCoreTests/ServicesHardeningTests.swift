@@ -882,3 +882,34 @@ private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         return String(data: data, encoding: .utf8)
     }
 }
+
+// MARK: - Folder snapshot (folder-watcher self-write suppression)
+
+@Suite("Library folder snapshot")
+struct LibraryFolderSnapshotTests {
+    @Test func ownWritesPatchedIntoTheSnapshotMatchAFreshListing() throws {
+        let folder = try HardeningTestFolder()
+        let transcript = folder.url.appendingPathComponent("recording-a.transcript.txt")
+        try DurableFile.write(Data("one".utf8), to: transcript)
+        var kept = try #require(LibraryFolderSnapshot.capture(folderURL: folder.url))
+        #expect(kept == LibraryFolderSnapshot.capture(folderURL: folder.url))
+
+        // The app's own durable rewrite (file + .bak), patched in: equal again.
+        try DurableFile.write(Data("two, longer".utf8), to: transcript)
+        #expect(kept != LibraryFolderSnapshot.capture(folderURL: folder.url))
+        kept.refresh(fileNames: [transcript.lastPathComponent, DurableFile.backupURL(for: transcript).lastPathComponent], in: folder.url)
+        #expect(kept == LibraryFolderSnapshot.capture(folderURL: folder.url))
+        #expect(kept.contains(transcript.lastPathComponent))
+
+        // Anything else (an external file) still shows as a change.
+        try Data("x".utf8).write(to: folder.url.appendingPathComponent("external.m4a"))
+        #expect(kept != LibraryFolderSnapshot.capture(folderURL: folder.url))
+
+        // A removed file is dropped by `refresh`.
+        try FileManager.default.removeItem(at: folder.url.appendingPathComponent("external.m4a"))
+        try FileManager.default.removeItem(at: transcript)
+        kept.refresh(fileNames: [transcript.lastPathComponent], in: folder.url)
+        #expect(!kept.contains(transcript.lastPathComponent))
+        #expect(kept == LibraryFolderSnapshot.capture(folderURL: folder.url))
+    }
+}

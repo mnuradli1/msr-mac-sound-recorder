@@ -11,8 +11,7 @@ let package = Package(
     products: [
         .executable(name: "MSRMeetingRecorder", targets: ["MSRMeetingRecorder"]),
         .library(name: "MSRCore", targets: ["MSRCore"]),
-        .library(name: "MSRServices", targets: ["MSRServices"]),
-        .library(name: "MSRPresentation", targets: ["MSRPresentation"])
+        .library(name: "MSRServices", targets: ["MSRServices"])
     ],
     dependencies: [
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", exact: "0.9.20"),
@@ -27,13 +26,9 @@ let package = Package(
             name: "MSRServices",
             dependencies: ["MSRCore"]
         ),
-        .target(
-            name: "MSRPresentation",
-            dependencies: ["MSRCore"]
-        ),
         .executableTarget(
             name: "MSRMeetingRecorder",
-            dependencies: ["MSRCore", "MSRServices", "MSRPresentation"],
+            dependencies: ["MSRCore", "MSRServices"],
             resources: [.process("Resources")]
         ),
         .executableTarget(
