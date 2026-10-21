@@ -1,6 +1,21 @@
 # MSR Future Plan
 
-Date: 2026-07-03
+Date: 2026-07-03 (status updated 2026-10-21)
+
+## Status as of 1.1A (2026-10-21)
+
+Done in 1.0B / 1.1A, so the lanes below are historical where they overlap:
+
+- Lane 1 (recording reliability): sleep-safe durable capture (1.0B), per-manifest and partial crash recovery, recorder failure reporting, device restore on failed start (1.1A).
+- Lane 2 (local API): token auth, parser crash fixes, proper status codes, readiness wait.
+- Lane 4 (long transcription): retry/backoff limited to connection-level failures, actionable error messages, resampling fix for low-rate audio, cancel-safe compression.
+- Lane 5 (trust-first UI): full redesign — compact recording bar, native sidebar, dominant transcript with Read/Edit modes, readiness checklist, status bar, light/dark theme tokens, tabbed Settings.
+- New: optional auto-transcribe after each recording and auto-title from the transcript (OpenAI or local heuristic), with title provenance so user titles are never overwritten.
+- Testing: 131 swift-testing tests, 45 runner scenarios, live ElevenLabs E2E, in-app scripted scenarios, accessibility-driven UI walkthrough (`scripts/ui_walkthrough.sh`), packaged smoke test.
+
+Planned for 1.2: optional auto-summarize after transcription (requires an OpenAI or DeepSeek key), DeepSeek as a text-model provider, transcription language setting, one-click "Copy Meeting Notes" (lane 6), per-recording speaker rename. Still open: Developer ID signing and notarization (lane 7).
+
+---
 
 This plan summarizes the seven-lane review of MSR Meeting Recorder across UI/UX, recording reliability, transcription, architecture, testing, release/security, and product roadmap.
 
