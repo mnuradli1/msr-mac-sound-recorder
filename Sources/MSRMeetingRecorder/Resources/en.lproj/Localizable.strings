@@ -313,3 +313,8 @@
 "Writing the summary… You can edit it when it is ready." = "Writing the summary… You can edit it when it is ready.";
 "Wait for the transcription to finish (or cancel it) before deleting this recording." = "Wait for the transcription to finish (or cancel it) before deleting this recording.";
 "Wait for the summary to finish before deleting this recording." = "Wait for the summary to finish before deleting this recording.";
+
+// MARK: - Quick recorder
+"Quick Recorder" = "Quick Recorder";
+"Show timer in menu bar" = "Show timer in menu bar";
+"Open MSR" = "Open MSR";

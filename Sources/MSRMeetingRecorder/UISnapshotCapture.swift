@@ -15,7 +15,11 @@ import Foundation
 /// - `MSR_UI_SNAPSHOT_TAB`: `review`, `notes` or `export`.
 /// - `MSR_UI_SNAPSHOT_SEARCH`: a recording search query to type before capture.
 /// - `MSR_UI_SNAPSHOT_TRANSCRIPT_MODE`: `read` or `edit` for the Notes tab.
-/// - `MSR_UI_SNAPSHOT_WINDOW`: `main` (default) or `settings`.
+/// - `MSR_UI_SNAPSHOT_WINDOW`: `main` (default), `settings`, or `quick` (the
+///   menu-bar quick recorder panel, drawn on a transparent margin with a shadow).
+/// - `MSR_UI_SNAPSHOT_QUICK_RECORDING`: with `quick`, start a recording first and
+///   capture the panel after this many seconds (needs `MSR_FAKE_RECORDER_CLIP`
+///   to avoid real capture); the recording is stopped and saved afterwards.
 /// - `MSR_UI_SNAPSHOT_SETTINGS_TAB`: `general`, `transcription`, `advanced` or `health`.
 /// - `MSR_UI_SNAPSHOT_SETTINGS_SCROLL`: `bottom` scrolls the settings form to its end.
 /// - `MSR_UI_SNAPSHOT_SPEAKER_POPOVER`: segment index whose speaker-name popover
@@ -122,6 +126,11 @@ enum UISnapshotCapture {
             if environment["MSR_UI_SNAPSHOT_KEEP_RUNNING"] == nil {
                 NSApp.terminate(nil)
             }
+        }
+
+        if environment["MSR_UI_SNAPSHOT_WINDOW"]?.lowercased() == "quick" {
+            await captureQuickRecorder(viewModel: viewModel, environment: environment, to: path)
+            return
         }
 
         let window: NSWindow?
@@ -250,6 +259,77 @@ enum UISnapshotCapture {
         let parts = value.lowercased().split(separator: "x").compactMap { Double($0) }
         guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
         return NSSize(width: parts[0], height: parts[1])
+    }
+
+    /// `MSR_UI_SNAPSHOT_WINDOW=quick`: opens the quick-recorder panel (optionally
+    /// while recording) and renders it. The panel's menu material does not
+    /// render through `cacheDisplay`, so a rounded window-background panel
+    /// with a shadow stands in for it, as for popovers.
+    private static func captureQuickRecorder(viewModel: AppViewModel, environment: [String: String], to path: String) async {
+        let recordSeconds = Double(environment["MSR_UI_SNAPSHOT_QUICK_RECORDING"] ?? "")
+        if let recordSeconds {
+            await viewModel.toggleRecording()
+            try? await Task.sleep(for: .seconds(max(0, recordSeconds)))
+        }
+        viewModel.showQuickRecorder()
+        try? await Task.sleep(for: .milliseconds(600))
+        defer {
+            viewModel.hideQuickRecorder()
+        }
+        guard let panel = viewModel.quickRecorder?.panelWindow,
+              let content = panel.contentView?.subviews.first else {
+            FileHandle.standardError.write(Data("MSR snapshot: quick recorder panel not shown\n".utf8))
+            return
+        }
+        panel.displayIfNeeded()
+        let scale = panel.backingScaleFactor
+        let margin: CGFloat = 16
+        let panelSize = content.bounds.size
+        let size = NSSize(width: panelSize.width + margin * 2, height: panelSize.height + margin * 2)
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds),
+              let output = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+              ),
+              let context = NSGraphicsContext(bitmapImageRep: output) else {
+            FileHandle.standardError.write(Data("MSR snapshot: could not create bitmap\n".utf8))
+            return
+        }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        let rect = NSRect(x: margin * scale, y: margin * scale, width: panelSize.width * scale, height: panelSize.height * scale)
+        panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+            let radius = QuickRecorderContainerView.cornerRadius * scale
+            let shape = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+            shadow.shadowBlurRadius = 12 * scale
+            shadow.shadowOffset = NSSize(width: 0, height: -3 * scale)
+            shadow.set()
+            NSColor.windowBackgroundColor.setFill()
+            shape.fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSColor.separatorColor.setStroke()
+            shape.lineWidth = scale
+            shape.stroke()
+        }
+        rep.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        NSGraphicsContext.restoreGraphicsState()
+
+        if let data = output.representation(using: .png, properties: [:]) {
+            do {
+                try data.write(to: URL(fileURLWithPath: path))
+                FileHandle.standardError.write(Data("MSR snapshot: wrote \(path) (\(Int(size.width))x\(Int(size.height)))\n".utf8))
+            } catch {
+                FileHandle.standardError.write(Data("MSR snapshot: write failed: \(error.localizedDescription)\n".utf8))
+            }
+        }
+        if recordSeconds != nil, viewModel.isRecording {
+            await viewModel.toggleRecording()
+        }
     }
 
     private static func capture(view: NSView, window: NSWindow, to path: String) {

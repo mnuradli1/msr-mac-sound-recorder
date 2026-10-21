@@ -313,3 +313,8 @@
 "Writing the summary… You can edit it when it is ready." = "Sedang menulis ringkasan… Anda dapat mengeditnya setelah siap.";
 "Wait for the transcription to finish (or cancel it) before deleting this recording." = "Tunggu transkripsi selesai (atau batalkan) sebelum menghapus rekaman ini.";
 "Wait for the summary to finish before deleting this recording." = "Tunggu ringkasan selesai sebelum menghapus rekaman ini.";
+
+// MARK: - Quick recorder
+"Quick Recorder" = "Perekam Cepat";
+"Show timer in menu bar" = "Tampilkan timer di bilah menu";
+"Open MSR" = "Buka MSR";
