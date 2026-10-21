@@ -160,7 +160,7 @@ struct AppViewModelSleepTests {
         let oldFailure = try #require(fixture.recorder.onCaptureFailure)
         await fixture.model.pauseRecording()
         await fixture.model.toggleRecording()
-        oldFailure("Synthetic delayed failure from previous segment")
+        oldFailure(RecordingError.captureInterrupted("Synthetic delayed failure from previous segment"))
         await settleActor()
         #expect(fixture.model.isRecording)
         #expect(fixture.recorder.stopCount == 1)
@@ -248,7 +248,7 @@ private final class SleepFixtureRecorder: AudioRecording, @unchecked Sendable {
     var failStartAfterWriting = false
     var onLevelUpdate: (@Sendable (Float) -> Void)?
     var onSourceLevelUpdate: (@Sendable (AudioSignalChannel, Float) -> Void)?
-    var onCaptureFailure: (@Sendable (String) -> Void)?
+    var onCaptureFailure: (@Sendable (Error) -> Void)?
     var isRecording: Bool { lock.withLock { recording } }
     var startCount: Int { lock.withLock { starts } }
     var stopCount: Int { lock.withLock { stops } }

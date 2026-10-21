@@ -10,6 +10,8 @@ struct MSRTestRunner {
             try testCreatesMetadataAndReloads()
             try testRecordingLibraryIgnoresNonMetadataJSONSidecars()
             try testRenamesSidecarsTogether()
+            try testAutoTitleOnlyReplacesDefaultTitles()
+            try testMeetingTitleGeneratorAndAutoTranscribePolicy()
             testDefaultsProviderToElevenLabs()
             try await testTranscribeEndpointDelegates()
             try await testElevenLabsTranscriptionUsesLongRequestTimeout()
@@ -49,8 +51,12 @@ struct MSRTestRunner {
             try await testRecoveryImportsSingleValidSideFromInterruptedMicAndSystem()
             try await testAudioTrackMixerConcatenatesSegmentsSequentially()
             try await testAudioTrackMixerExportsSingleTrack()
+            try await testTranscriptPublisherAutoTitlesDefaultRecording()
+            try await testLiveElevenLabsAutoTranscribeAndTitle()
+            TemporaryFolder.removeAll()
             print("MSRTestRunner: all tests passed")
         } catch {
+            TemporaryFolder.removeAll()
             fputs("MSRTestRunner failed: \(error)\n", stderr)
             Foundation.exit(1)
         }
@@ -80,6 +86,66 @@ private func testCreatesMetadataAndReloads() throws {
     try expect(reloaded.map(\.displayName) == ["Weekly Sync"], "history should reload from metadata")
     try expect(reloaded.first?.durationSeconds == 60, "duration should be persisted")
     try expect(reloaded.first?.source == .micAndSystem, "source should be persisted")
+}
+
+private func testAutoTitleOnlyReplacesDefaultTitles() throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let audioURL = folder.url.appendingPathComponent("capture.m4a")
+    FileManager.default.createFile(atPath: audioURL.path, contents: Data("audio".utf8))
+    let recording = try library.finishRecording(
+        temporaryAudioURL: audioURL,
+        requestedName: "Meeting 2026-06-29 14.05",
+        source: .micAndSystem,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 160)
+    )
+    try expect(recording.effectiveTitleSource == .default, "finished captures should carry a default title")
+
+    // The user renames while transcription runs; auto-title holds a stale snapshot.
+    let userRenamed = try library.rename(recording, to: "Client Demo")
+    try expect(userRenamed.metadata.titleSource == .user, "manual rename should record a user title")
+    let refused = try library.renameIfTitleIsDefault(recording, to: "Generated Title")
+    try expect(refused == nil, "auto-title must not replace a user title")
+    let reloaded = try library.loadRecordings()
+    try expect(reloaded.first?.displayName == "Client Demo", "user title should survive auto-title")
+
+    let second = folder.url.appendingPathComponent("second.m4a")
+    FileManager.default.createFile(atPath: second.path, contents: Data("audio".utf8))
+    let untouched = try library.finishRecording(
+        temporaryAudioURL: second,
+        requestedName: "Meeting 2026-06-30 09.00",
+        source: .microphone,
+        startedAt: Date(timeIntervalSince1970: 200),
+        endedAt: Date(timeIntervalSince1970: 260)
+    )
+    let migrated = try library.migrateIfNeeded(untouched)
+    try expect(migrated.displayName == untouched.displayName, "migrateIfNeeded should not rename")
+    let titled = try library.renameIfTitleIsDefault(untouched, to: "\"Launch Readiness Review.\"")
+    try expect(titled?.metadata.titleSource == .generated, "auto-title should record a generated title")
+    try expect(titled?.displayName == "Launch Readiness Review", "auto-title should sanitize the generated name: \(String(describing: titled?.displayName))")
+}
+
+private func testMeetingTitleGeneratorAndAutoTranscribePolicy() throws {
+    try expect(MeetingTitleGenerator.isDefaultName("Meeting 2026-06-29 14.05 2"), "suffixed default names should be recognised")
+    try expect(!MeetingTitleGenerator.isDefaultName("Meeting with Bob"), "user names should not be treated as default")
+    try expect(
+        MeetingTitleGenerator.cleaned("**Title:** \"Roadmap Sync.\"", fallback: "Fallback") == "Roadmap Sync",
+        "cleaned should strip markdown, prefixes, quotes and trailing periods"
+    )
+    let transcript = "Speaker 1:\nHalo, oke.\n\nSpeaker 2:\nHari ini kita membahas rencana peluncuran aplikasi mobile."
+    let title = MeetingTitleGenerator.localTitle(from: transcript, segments: TranscriptParser.segments(from: transcript))
+    try expect(title == "Rencana peluncuran aplikasi mobile", "local title should skip filler and lead-ins: \(String(describing: title))")
+    try expect(MeetingTitleGenerator.localTitle(from: "[music] Okay. Um, yeah.") == nil, "filler-only transcripts should have no local title")
+
+    let silent = RecordingConfidenceReport(
+        checkedAt: Date(), durationSeconds: 0, peakLevel: 0, averageLevel: 0,
+        issues: [RecordingConfidenceIssue(kind: .emptyAudio, severity: .error, message: "empty")]
+    )
+    let healthy = RecordingConfidenceReport(checkedAt: Date(), durationSeconds: 120, peakLevel: 0.6, averageLevel: 0.2, issues: [])
+    try expect(!RecordingInteractionPolicy.shouldAutoTranscribe(report: silent), "empty audio should not be auto-transcribed")
+    try expect(RecordingInteractionPolicy.shouldAutoTranscribe(report: healthy), "healthy audio should be auto-transcribed")
+    try expect(RecordingInteractionPolicy.shouldAutoTranscribe(report: nil), "missing reports should not block auto-transcribe")
 }
 
 private func testRecordingLibraryIgnoresNonMetadataJSONSidecars() throws {
@@ -1106,6 +1172,138 @@ private func testAudioTrackMixerExportsSingleTrack() async throws {
     try expect(duration.seconds > 0.2, "mixed output should keep audio duration")
 }
 
+@MainActor
+private func testTranscriptPublisherAutoTitlesDefaultRecording() async throws {
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let wav = folder.url.appendingPathComponent("capture.wav")
+    try writeToneWAV(to: wav, frequency: 440, duration: 1)
+    let recording = try library.finishRecording(
+        temporaryAudioURL: wav,
+        requestedName: "Meeting 2026-06-29 14.05",
+        source: .micAndSystem,
+        startedAt: Date(timeIntervalSince1970: 100),
+        endedAt: Date(timeIntervalSince1970: 160)
+    )
+    let service = FakeAIService()
+    let decoded = try await service.transcribe(audioURL: recording.audioURL, provider: .elevenLabs)
+    var job = TranscriptionJob.queue(
+        recordingID: recording.id,
+        recordingName: recording.displayName,
+        audioFileName: recording.audioURL.lastPathComponent,
+        provider: .elevenLabs,
+        origin: .automatic,
+        autoTitleRequested: true
+    )
+    job.markRunning()
+    let result = try await TranscriptPublisher.publish(
+        job: job,
+        recording: recording,
+        decoded: decoded,
+        autoTitleRequested: job.autoTitleRequested,
+        library: library,
+        titleGenerator: { transcript in try await service.generateTitle(transcript: transcript) }
+    )
+    try expect(result.job.status == .completed, "publisher should complete the job")
+    try expect(result.job.origin == .automatic, "publisher should keep the job origin")
+    try expect(result.generatedTitle == "Fake Generated Title", "publisher should apply the remote title: \(String(describing: result.generatedTitle))")
+    try expect(result.titleSource == .generated, "auto-title should record a generated title")
+    let reloaded = try library.loadRecordings().first
+    try expect(reloaded?.displayName == "Fake Generated Title", "rename should be persisted")
+    try expect(
+        (try? String(contentsOf: result.recording.transcriptURL, encoding: .utf8)) == decoded.text,
+        "transcript should be written next to the renamed recording"
+    )
+}
+
+/// Real ElevenLabs round trip. Runs only with `MSR_LIVE_E2E=1` and
+/// `ELEVENLABS_API_KEY` set; never prints the key.
+@MainActor
+private func testLiveElevenLabsAutoTranscribeAndTitle() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["MSR_LIVE_E2E"] == "1" else { return }
+    guard let key = environment["ELEVENLABS_API_KEY"], !key.isEmpty else {
+        print("live E2E skipped: ELEVENLABS_API_KEY is not set")
+        return
+    }
+    // Default: the synthetic `say` clip checked in at Tests/Fixtures/meeting-en.m4a.
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // MSRTestRunner
+        .deletingLastPathComponent() // Sources
+        .deletingLastPathComponent()
+    let clip = environment["MSR_LIVE_E2E_CLIP"].map { URL(fileURLWithPath: $0) }
+        ?? packageRoot.appendingPathComponent("Tests/Fixtures/meeting-en.m4a")
+    guard FileManager.default.fileExists(atPath: clip.path) else {
+        print("live E2E skipped: clip not found at \(clip.path)")
+        return
+    }
+
+    let folder = try TemporaryFolder()
+    let library = RecordingLibrary(folderURL: folder.url)
+    let capture = folder.url.appendingPathComponent(".in-progress-live.m4a")
+    try FileManager.default.copyItem(at: clip, to: capture)
+    let startedAt = Date()
+    let recording = try library.finishRecording(
+        temporaryAudioURL: capture,
+        requestedName: "Meeting 2026-10-21 10.00",
+        source: .microphone,
+        startedAt: startedAt,
+        endedAt: startedAt.addingTimeInterval(28)
+    )
+    let titleBefore = recording.displayName
+
+    // Seed session values from the environment so the run uses exactly these
+    // keys and never reaches the Keychain (a Keychain read from this unsigned
+    // CLI binary blocks on a macOS authorization prompt).
+    let keyStore = APIKeyStore()
+    try keyStore.setSession(apiKey: key, for: .elevenLabs)
+    let remoteTitles: Bool
+    if let openAIKey = environment["OPENAI_API_KEY"], APIKeyNormalizer.normalized(openAIKey) != nil {
+        try keyStore.setSession(apiKey: openAIKey, for: .openAI)
+        remoteTitles = true
+    } else {
+        remoteTitles = false
+    }
+    let service = ProviderAIService(keyStore: keyStore)
+    var job = TranscriptionJob.queue(
+        recordingID: recording.id,
+        recordingName: recording.displayName,
+        audioFileName: recording.audioURL.lastPathComponent,
+        provider: .elevenLabs,
+        origin: .automatic,
+        autoTitleRequested: true
+    )
+    job.markRunning()
+    let prepared = try await TranscriptionAudioPreparer.prepare(
+        sourceURL: recording.audioURL,
+        durationSeconds: recording.durationSeconds,
+        trimRange: nil,
+        compressionEnabled: true
+    )
+    defer { prepared.cleanUp() }
+    let decoded = try await service.transcribe(audioURL: prepared.url, provider: .elevenLabs)
+    var titleGenerator: TranscriptPublisher.TitleGenerator?
+    if remoteTitles {
+        titleGenerator = { transcript -> String? in try await service.generateTitle(transcript: transcript) }
+    }
+    let result = try await TranscriptPublisher.publish(
+        job: job,
+        recording: recording,
+        decoded: decoded,
+        autoTitleRequested: true,
+        library: library,
+        titleGenerator: titleGenerator
+    )
+
+    print("live E2E: transcript \(decoded.text.count) chars, \(result.segments.count) segments")
+    print("live E2E: title \"\(titleBefore)\" -> \"\(result.recording.displayName)\" (source: \(result.titleSource.rawValue), remote: \(titleGenerator != nil))")
+    if let note = result.titleNote { print("live E2E: title note: \(note)") }
+    try expect(decoded.text.lowercased().contains("launch"), "live transcript should mention the launch")
+    try expect(result.job.status == .completed, "live job should complete")
+    try expect(result.recording.displayName != titleBefore, "live recording should be retitled away from the default")
+    try expect(result.titleSource == .generated, "live title should be recorded as generated")
+}
+
 private func writeToneWAV(to url: URL, frequency: Double, duration: Double = 0.35, amplitude: Double = 0.2) throws {
     let sampleRate = 16_000
     let sampleCount = Int(Double(sampleRate) * duration)
@@ -1170,13 +1368,30 @@ private struct TestFailure: Error, CustomStringConvertible {
     }
 }
 
+/// A `msr-tests-*` folder in the temporary directory. Every folder created
+/// during a run is removed by `removeAll()` when the runner exits.
 private struct TemporaryFolder {
     let url: URL
+
+    nonisolated(unsafe) private static var created: [URL] = []
+    private static let lock = NSLock()
 
     init() throws {
         url = FileManager.default.temporaryDirectory
             .appendingPathComponent("msr-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let url = url
+        Self.lock.withLock { Self.created.append(url) }
+    }
+
+    static func removeAll() {
+        let urls = lock.withLock {
+            defer { created = [] }
+            return created
+        }
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }
 
@@ -1227,6 +1442,10 @@ private final class FakeAIService: AIService, @unchecked Sendable {
             - Confirm launch checklist.
             """
         )
+    }
+
+    func generateTitle(transcript: String) async throws -> String {
+        "Fake Generated Title"
     }
 }
 

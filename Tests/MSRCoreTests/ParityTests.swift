@@ -14,6 +14,7 @@ struct ParityTests {
         #expect(settings.sortOrder == .newest)
         #expect(settings.compressUploads)
         #expect(settings.autoTitle)
+        #expect(!settings.autoTranscribe)
         #expect(!settings.localAPIEnabled)
     }
 
@@ -180,6 +181,7 @@ private final class ParityFakeAIService: AIService, @unchecked Sendable {
         TranscribeResponse(text: "ok", provider: provider, languageCode: "en")
     }
     func summarize(transcript: String) async throws -> SummarizeResponse { SummarizeResponse(markdown: transcript) }
+    func generateTitle(transcript: String) async throws -> String { "Fake Generated Title" }
 }
 
 private final class TestFolder: @unchecked Sendable {

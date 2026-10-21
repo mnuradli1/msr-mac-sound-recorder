@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MSRCore
 import MSRServices
@@ -11,12 +12,16 @@ struct MSRMeetingRecorderApp: App {
         WindowGroup {
             ContentView(viewModel: viewModel)
                 .task {
+                    UISnapshotCapture.prepareIfRequested(viewModel: viewModel)
                     viewModel.startLocalAPI()
                     await viewModel.bootstrap()
+                    await UIScenarioRunner.runIfRequested(viewModel: viewModel)
+                    await UISnapshotCapture.runIfRequested(viewModel: viewModel)
                 }
         }
         .defaultSize(width: viewModel.settings.windowWidth, height: viewModel.settings.windowHeight)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button(viewModel.isRecording ? "Stop Recording" : "Start Recording") {
@@ -86,6 +91,12 @@ struct MSRMeetingRecorderApp: App {
                 }
                 .disabled(!viewModel.hasTranscript)
 
+                Button("Copy Transcript") { viewModel.copyTranscript() }
+                    .disabled(!viewModel.hasTranscript)
+
+                Button("Copy Summary") { viewModel.copySummary() }
+                    .disabled(!viewModel.hasSummary)
+
                 Button("Save Notes") { viewModel.flushTranscriptEdits() }
                     .keyboardShortcut("s", modifiers: [.command])
                     .disabled(viewModel.selectedRecording == nil)
@@ -121,6 +132,22 @@ struct MSRMeetingRecorderApp: App {
                 Button("Refresh History") {
                     viewModel.loadRecordings()
                 }
+
+                Divider()
+
+                Button("Delete Recording…") {
+                    // ⌘⌫ means "delete to line start" while editing text; keep
+                    // that behavior for the keystroke instead of deleting the
+                    // recording. Choosing the item from the menu bar always asks.
+                    if let textView = DeleteRecordingCommand.textViewToEdit(for: NSApp.currentEvent) {
+                        textView.deleteToBeginningOfLine(nil)
+                        return
+                    }
+                    // ContentView confirms, then calls `viewModel.delete(_:)`.
+                    NotificationCenter.default.post(name: .requestDeleteRecording, object: nil)
+                }
+                .keyboardShortcut(.delete, modifiers: [.command])
+                .disabled(viewModel.selectedRecording == nil || !viewModel.canMutateRecordingLibrary)
             }
 
             CommandGroup(after: .appInfo) {
@@ -162,5 +189,21 @@ struct MSRMeetingRecorderApp: App {
         case .english: Locale(identifier: "en")
         case .indonesian: Locale(identifier: "id")
         }
+    }
+}
+
+/// Routing for Recording → Delete Recording… (⌘⌫).
+enum DeleteRecordingCommand {
+    /// The editable text view that should get "delete to line start" instead
+    /// of the recording being deleted: only when the command came from a
+    /// keystroke typed into a text view. A menu-bar click (a mouse event, or
+    /// no key event) always asks to delete the recording, even while a text
+    /// field such as the search field still has focus.
+    @MainActor
+    static func textViewToEdit(for event: NSEvent?) -> NSTextView? {
+        guard let event, event.type == .keyDown else { return nil }
+        let window = event.window ?? NSApp.keyWindow
+        guard let textView = window?.firstResponder as? NSTextView, textView.isEditable else { return nil }
+        return textView
     }
 }

@@ -61,7 +61,18 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var theme: AppTheme
     public var language: AppLanguage
     public var compressUploads: Bool
+    /// When `true`, every recording is renamed from its transcript once a
+    /// transcription finishes, for ANY transcription provider (ElevenLabs or
+    /// OpenAI). Only recordings whose title is still machine-generated
+    /// (`RecordingTitleSource.default`) are renamed; a user-chosen title is
+    /// never overwritten. The title comes from the OpenAI title endpoint when an
+    /// OpenAI credential is available, otherwise from
+    /// `MeetingTitleGenerator.localTitle(from:segments:)`.
     public var autoTitle: Bool
+    /// When `true`, a transcription job is queued automatically as soon as a
+    /// recording finishes (see `RecordingInteractionPolicy.shouldAutoTranscribe`).
+    /// Defaults to `false`; settings saved before this key existed decode as `false`.
+    public var autoTranscribe: Bool
     public var rememberCredentials: Bool
     public var showMenuBarControl: Bool
     public var globalShortcutEnabled: Bool
@@ -82,6 +93,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         language: .system,
         compressUploads: true,
         autoTitle: true,
+        autoTranscribe: false,
         rememberCredentials: false,
         showMenuBarControl: true,
         globalShortcutEnabled: true,
@@ -103,6 +115,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         language: AppLanguage = .system,
         compressUploads: Bool = true,
         autoTitle: Bool = true,
+        autoTranscribe: Bool = false,
         rememberCredentials: Bool = false,
         showMenuBarControl: Bool = true,
         globalShortcutEnabled: Bool = true,
@@ -122,6 +135,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.language = language
         self.compressUploads = compressUploads
         self.autoTitle = autoTitle
+        self.autoTranscribe = autoTranscribe
         self.rememberCredentials = rememberCredentials
         self.showMenuBarControl = showMenuBarControl
         self.globalShortcutEnabled = globalShortcutEnabled
@@ -133,6 +147,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case provider, recordingsFolderPath, recordingsFolderBookmark, preferredSource, microphoneDeviceID
         case sortOrder, silenceThreshold, playbackSpeed, theme, language, compressUploads, autoTitle
+        case autoTranscribe
         case rememberCredentials, showMenuBarControl, globalShortcutEnabled, localAPIEnabled, windowWidth, windowHeight
     }
 
@@ -151,6 +166,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         language = try c.decodeIfPresent(AppLanguage.self, forKey: .language) ?? defaults.language
         compressUploads = try c.decodeIfPresent(Bool.self, forKey: .compressUploads) ?? defaults.compressUploads
         autoTitle = try c.decodeIfPresent(Bool.self, forKey: .autoTitle) ?? defaults.autoTitle
+        autoTranscribe = try c.decodeIfPresent(Bool.self, forKey: .autoTranscribe) ?? defaults.autoTranscribe
         rememberCredentials = try c.decodeIfPresent(Bool.self, forKey: .rememberCredentials) ?? defaults.rememberCredentials
         showMenuBarControl = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarControl) ?? defaults.showMenuBarControl
         globalShortcutEnabled = try c.decodeIfPresent(Bool.self, forKey: .globalShortcutEnabled) ?? defaults.globalShortcutEnabled

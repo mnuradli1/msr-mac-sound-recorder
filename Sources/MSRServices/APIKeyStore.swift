@@ -2,58 +2,103 @@ import Foundation
 import Security
 import MSRCore
 
-public final class APIKeyStore {
+/// Minimal Keychain seam so key precedence and clearing can be tested without touching the real Keychain.
+protocol KeychainStoring: Sendable {
+    func read(service: String, account: String) -> String?
+    func write(_ value: String, service: String, account: String) throws
+    func delete(service: String, account: String) throws
+}
+
+/// Resolves provider API keys with precedence: session value > environment
+/// variable > Keychain. A key entered in Settings (saved or session-only) is
+/// also held as the session value, so it wins over an exported variable for the
+/// rest of this run; on the next launch an exported variable wins over the
+/// Keychain again.
+public final class APIKeyStore: @unchecked Sendable {
     private let serviceName = "MSRMeetingRecorder"
     private let environment: [String: String]
+    private let keychain: KeychainStoring
     private let lock = NSLock()
     private var sessionValues: [AIProvider: String] = [:]
 
-    public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+    public convenience init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.init(environment: environment, keychain: SystemKeychain())
+    }
+
+    init(environment: [String: String], keychain: KeychainStoring) {
         self.environment = environment
+        self.keychain = keychain
     }
 
     public func apiKey(for provider: AIProvider) -> String? {
-        lock.lock()
-        let sessionValue = sessionValues[provider]
-        lock.unlock()
-        if let sessionValue { return sessionValue }
-        if let keychainValue = keychainValue(for: provider),
+        if let sessionValue = lock.withLock({ sessionValues[provider] }) {
+            return sessionValue
+        }
+        // Environment before Keychain: an exported key never triggers a Keychain
+        // access prompt (which blocks unsigned developer builds), and a shell
+        // that exports a key means to use it.
+        if let environmentValue = environment[Self.environmentVariableName(for: provider)].flatMap(APIKeyNormalizer.normalized) {
+            return environmentValue
+        }
+        if let keychainValue = keychain.read(service: serviceName, account: provider.rawValue),
            let normalized = APIKeyNormalizer.normalized(keychainValue) {
             return normalized
         }
-        let envName: String
-        switch provider {
-        case .elevenLabs:
-            envName = "ELEVENLABS_API_KEY"
-        case .openAI:
-            envName = "OPENAI_API_KEY"
-        }
-        return environment[envName].flatMap(APIKeyNormalizer.normalized)
+        return nil
     }
 
+    /// Uses `apiKey` for this app run only (not persisted).
     public func setSession(apiKey: String, for provider: AIProvider) throws {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else { throw KeyStoreError.emptyAPIKey }
-        lock.lock()
-        sessionValues[provider] = normalized
-        lock.unlock()
+        lock.withLock { sessionValues[provider] = normalized }
     }
 
+    /// Removes the session value and the Keychain item for `provider`. An
+    /// exported environment variable (`ELEVENLABS_API_KEY`, `OPENAI_API_KEY`)
+    /// still applies afterwards; it can only be removed from the environment.
     public func forget(_ provider: AIProvider) throws {
-        lock.lock()
-        sessionValues.removeValue(forKey: provider)
-        lock.unlock()
-        let status = SecItemDelete(keychainQuery(for: provider) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeyStoreError.writeFailed(status)
-        }
+        lock.withLock { _ = sessionValues.removeValue(forKey: provider) }
+        try keychain.delete(service: serviceName, account: provider.rawValue)
     }
 
+    /// Persists `apiKey` in the Keychain and also makes it the session value, so
+    /// the key the user just entered takes effect immediately, even over an
+    /// exported environment variable. A failed Keychain write changes nothing.
     public func save(apiKey: String, for provider: AIProvider) throws {
         guard let normalized = APIKeyNormalizer.normalized(apiKey) else {
             throw KeyStoreError.emptyAPIKey
         }
-        let data = Data(normalized.utf8)
-        let query = keychainQuery(for: provider)
+        try keychain.write(normalized, service: serviceName, account: provider.rawValue)
+        lock.withLock { sessionValues[provider] = normalized }
+    }
+
+    static func environmentVariableName(for provider: AIProvider) -> String {
+        switch provider {
+        case .elevenLabs:
+            return "ELEVENLABS_API_KEY"
+        case .openAI:
+            return "OPENAI_API_KEY"
+        }
+    }
+}
+
+struct SystemKeychain: KeychainStoring {
+    func read(service: String, account: String) -> String? {
+        var query = Self.query(service: service, account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func write(_ value: String, service: String, account: String) throws {
+        let data = Data(value.utf8)
+        let query = Self.query(service: service, account: account)
         let status = SecItemCopyMatching(query as CFDictionary, nil)
         if status == errSecSuccess {
             let attributes = [kSecValueData: data] as CFDictionary
@@ -73,24 +118,18 @@ public final class APIKeyStore {
         }
     }
 
-    private func keychainValue(for provider: AIProvider) -> String? {
-        var query = keychainQuery(for: provider)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else {
-            return nil
+    func delete(service: String, account: String) throws {
+        let status = SecItemDelete(Self.query(service: service, account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeyStoreError.writeFailed(status)
         }
-        return String(data: data, encoding: .utf8)
     }
 
-    private func keychainQuery(for provider: AIProvider) -> [String: Any] {
+    private static func query(service: String, account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: provider.rawValue
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
         ]
     }
 }

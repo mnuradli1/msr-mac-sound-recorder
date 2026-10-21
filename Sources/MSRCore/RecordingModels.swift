@@ -19,6 +19,19 @@ public enum AudioSource: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Who chose a recording's current title.
+///
+/// Persisted on `RecordingMetadata.titleSource`. Auto-titling only ever replaces
+/// a `.default` title, so a name the user typed is never overwritten.
+public enum RecordingTitleSource: String, Codable, Sendable {
+    /// Machine-generated placeholder such as "Meeting 2026-06-29 14.05".
+    case `default` = "default"
+    /// Chosen by the user (manual rename, or the file name of an imported file).
+    case user = "user"
+    /// Generated from the transcript by auto-title.
+    case generated = "generated"
+}
+
 public struct RecordingMetadata: Codable, Equatable, Sendable {
     public static let currentSchema = "msr.recording"
     public static let minimumSupportedSchemaVersion = 1
@@ -41,6 +54,10 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
     public var segmentCount: Int?
     public var importedAt: Date?
     public var confidenceReport: RecordingConfidenceReport?
+    /// Provenance of `displayName`. `nil` in metadata written before this field
+    /// existed; use `effectiveTitleSource` to read it with a legacy fallback.
+    /// Adding it did not bump `schemaVersion`, so older builds still open the file.
+    public var titleSource: RecordingTitleSource?
 
     public init(
         schema: String = RecordingMetadata.currentSchema,
@@ -59,7 +76,8 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         recoveryNote: String? = nil,
         segmentCount: Int? = nil,
         importedAt: Date? = nil,
-        confidenceReport: RecordingConfidenceReport? = nil
+        confidenceReport: RecordingConfidenceReport? = nil,
+        titleSource: RecordingTitleSource? = nil
     ) {
         self.schema = schema
         self.schemaVersion = schemaVersion
@@ -78,12 +96,14 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         self.segmentCount = segmentCount
         self.importedAt = importedAt
         self.confidenceReport = confidenceReport
+        self.titleSource = titleSource
     }
 
     private enum CodingKeys: String, CodingKey {
         case schema, schemaVersion, id, storageKey, displayName, source, audioFileName
         case startedAt, endedAt, durationSeconds, createdAt, updatedAt
         case recoveredAt, recoveryNote, segmentCount, importedAt, confidenceReport
+        case titleSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -105,6 +125,15 @@ public struct RecordingMetadata: Codable, Equatable, Sendable {
         segmentCount = try container.decodeIfPresent(Int.self, forKey: .segmentCount)
         importedAt = try container.decodeIfPresent(Date.self, forKey: .importedAt)
         confidenceReport = try container.decodeIfPresent(RecordingConfidenceReport.self, forKey: .confidenceReport)
+        titleSource = try? container.decodeIfPresent(RecordingTitleSource.self, forKey: .titleSource)
+    }
+
+    /// `titleSource` when recorded; otherwise inferred from the name itself:
+    /// a default-looking name (`MeetingTitleGenerator.isDefaultName`) is
+    /// `.default`, anything else is treated as the user's choice.
+    public var effectiveTitleSource: RecordingTitleSource {
+        if let titleSource { return titleSource }
+        return MeetingTitleGenerator.isDefaultName(displayName) ? .default : .user
     }
 }
 
@@ -120,6 +149,8 @@ public struct RecordingItem: Equatable, Identifiable, Sendable {
     public var durationSeconds: TimeInterval { metadata.durationSeconds }
     public var isRecovered: Bool { metadata.recoveredAt != nil }
     public var isImported: Bool { metadata.importedAt != nil }
+    /// See `RecordingMetadata.effectiveTitleSource`.
+    public var effectiveTitleSource: RecordingTitleSource { metadata.effectiveTitleSource }
     public var storageBaseName: String {
         let value = metadata.storageKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? displayName : value

@@ -8,6 +8,14 @@ public enum TranscriptionJobStatus: String, Codable, Equatable, Sendable {
     case cancelled
 }
 
+/// Why a transcription job was queued.
+public enum TranscriptionJobOrigin: String, Codable, Sendable {
+    /// The user asked for it (Transcribe / Re-transcribe).
+    case manual
+    /// Queued by auto-transcribe right after a recording finished.
+    case automatic
+}
+
 public struct TranscriptionJob: Codable, Equatable, Sendable {
     public var id: UUID
     public var recordingID: UUID
@@ -29,6 +37,12 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
     public var publicationStartedAt: Date?
     public var usedUncompressedAudioFallback: Bool
     public var audioPreparationWarning: String?
+    /// Who queued the job. Jobs saved before this field existed decode as `.manual`.
+    public var origin: TranscriptionJobOrigin
+    /// Whether the recording should be auto-titled from the transcript once this
+    /// job completes (captured when the job is queued, so a later settings change
+    /// does not retroactively apply). Decodes as `false` when absent.
+    public var autoTitleRequested: Bool
 
     public init(
         id: UUID = UUID(),
@@ -50,7 +64,9 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         transcriptContentSHA256: String? = nil,
         publicationStartedAt: Date? = nil,
         usedUncompressedAudioFallback: Bool = false,
-        audioPreparationWarning: String? = nil
+        audioPreparationWarning: String? = nil,
+        origin: TranscriptionJobOrigin = .manual,
+        autoTitleRequested: Bool = false
     ) {
         self.id = id
         self.recordingID = recordingID
@@ -72,6 +88,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         self.publicationStartedAt = publicationStartedAt
         self.usedUncompressedAudioFallback = usedUncompressedAudioFallback
         self.audioPreparationWarning = audioPreparationWarning
+        self.origin = origin
+        self.autoTitleRequested = autoTitleRequested
     }
 
     enum CodingKeys: String, CodingKey {
@@ -95,6 +113,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         case publicationStartedAt
         case usedUncompressedAudioFallback
         case audioPreparationWarning
+        case origin
+        case autoTitleRequested
     }
 
     public init(from decoder: Decoder) throws {
@@ -119,6 +139,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         publicationStartedAt = try container.decodeIfPresent(Date.self, forKey: .publicationStartedAt)
         usedUncompressedAudioFallback = try container.decodeIfPresent(Bool.self, forKey: .usedUncompressedAudioFallback) ?? false
         audioPreparationWarning = try container.decodeIfPresent(String.self, forKey: .audioPreparationWarning)
+        origin = (try? container.decodeIfPresent(TranscriptionJobOrigin.self, forKey: .origin)) ?? .manual
+        autoTitleRequested = try container.decodeIfPresent(Bool.self, forKey: .autoTitleRequested) ?? false
     }
 
     public static func start(
@@ -150,6 +172,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         previousAttemptCount: Int = 0,
         trimStartSeconds: TimeInterval? = nil,
         trimEndSeconds: TimeInterval? = nil,
+        origin: TranscriptionJobOrigin = .manual,
+        autoTitleRequested: Bool = false,
         at date: Date = Date()
     ) -> TranscriptionJob {
         TranscriptionJob(
@@ -163,7 +187,9 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
             updatedAt: date,
             replacingExistingTranscript: replacingExistingTranscript,
             trimStartSeconds: trimStartSeconds.flatMap { $0 > 0 ? $0 : nil },
-            trimEndSeconds: trimEndSeconds.flatMap { $0 > 0 ? $0 : nil }
+            trimEndSeconds: trimEndSeconds.flatMap { $0 > 0 ? $0 : nil },
+            origin: origin,
+            autoTitleRequested: autoTitleRequested
         )
     }
 

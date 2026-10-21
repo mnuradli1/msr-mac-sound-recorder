@@ -5,6 +5,7 @@ public enum RecordingLibraryError: Error, LocalizedError, Equatable {
     case unsupportedAudioType(String)
     case duplicateRecordingID(UUID)
     case invalidMetadata(String)
+    case recordingNotFound(UUID)
 
     public var errorDescription: String? {
         switch self {
@@ -12,6 +13,7 @@ public enum RecordingLibraryError: Error, LocalizedError, Equatable {
         case let .unsupportedAudioType(ext): "Only WAV, MP3, and M4A files can be imported (received .\(ext))."
         case let .duplicateRecordingID(id): "A recording with ID \(id.uuidString) already exists."
         case let .invalidMetadata(message): message
+        case .recordingNotFound: "The recording is no longer in the library."
         }
     }
 }
@@ -30,7 +32,21 @@ public protocol RecordingLibraryServing: Sendable {
         startedAt: Date, durationSeconds: TimeInterval, importedAt: Date,
         confidenceReport: RecordingConfidenceReport?
     ) throws -> RecordingItem
+    /// Renames as the user (`titleSource = .user`). See `rename(_:to:source:)`.
     func rename(_ recording: RecordingItem, to requestedName: String) throws -> RecordingItem
+    /// Re-reads the recording from disk, applies the new title and its provenance
+    /// on top of the on-disk metadata, and writes it durably. Renaming to the
+    /// current name is a no-op that keeps `titleSource`.
+    @discardableResult
+    func rename(_ recording: RecordingItem, to requestedName: String, source: RecordingTitleSource) throws -> RecordingItem
+    /// Cleans `newName` with `MeetingTitleGenerator.cleaned(_:fallback:)` and renames
+    /// with `source: .generated` only when the on-disk title is still a default
+    /// one; returns `nil` and changes nothing otherwise.
+    @discardableResult
+    func renameIfTitleIsDefault(_ recording: RecordingItem, to newName: String) throws -> RecordingItem?
+    /// Moves a legacy recording to immutable storage if needed and returns it.
+    @discardableResult
+    func migrateIfNeeded(_ recording: RecordingItem) throws -> RecordingItem
     func writeTranscript(_ transcript: String, for recording: RecordingItem) throws -> RecordingItem
     func writeTranscriptBundle(_ transcript: String, segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem
     func loadTranscriptSegments(for recording: RecordingItem) -> [TranscriptSegment]
@@ -67,6 +83,9 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             .sorted { $0.startedAt > $1.startedAt }
     }
 
+    /// Publishes a finished capture. The title is recorded as
+    /// `RecordingTitleSource.default`: captures (and crash recoveries) are named
+    /// by the app, so auto-title may later replace the name.
     @discardableResult
     public func finishRecording(
         temporaryAudioURL: URL,
@@ -106,7 +125,8 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             recoveredAt: recoveredAt,
             recoveryNote: recoveryNote?.trimmingCharacters(in: .whitespacesAndNewlines),
             segmentCount: segmentCount,
-            confidenceReport: confidenceReport
+            confidenceReport: confidenceReport,
+            titleSource: .default
         )
         let item = RecordingItem(metadata: metadata, folderURL: folderURL)
         let journal = PublicationJournal(metadata: metadata, sourcePath: temporaryAudioURL.path)
@@ -137,6 +157,9 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         }
     }
 
+    /// Copies an external audio file into the library. The title (the source
+    /// file name) is recorded as `RecordingTitleSource.user`, because the file
+    /// name is the user's choice; auto-title never replaces it.
     @discardableResult
     public func importRecording(
         sourceURL: URL,
@@ -171,7 +194,8 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             createdAt: importedAt,
             updatedAt: importedAt,
             importedAt: importedAt,
-            confidenceReport: confidenceReport
+            confidenceReport: confidenceReport,
+            titleSource: .user
         )
         let item = RecordingItem(metadata: metadata, folderURL: folderURL)
         let journalURL = try publicationJournalURL(id)
@@ -191,18 +215,62 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         }
     }
 
+    /// Renames on behalf of the user; equivalent to `rename(_:to:source: .user)`.
     @discardableResult
     public func rename(_ recording: RecordingItem, to requestedName: String) throws -> RecordingItem {
-        let migrated = try ensureImmutableStorage(recording)
-        var metadata = migrated.metadata
-        metadata.displayName = try uniqueDisplayName(
-            FileNameSanitizer.sanitizedBaseName(requestedName),
-            allowing: migrated.displayName
-        )
-        metadata.updatedAt = Date()
-        let renamed = RecordingItem(metadata: metadata, folderURL: folderURL)
-        try write(metadata: metadata, to: renamed.metadataURL)
-        return renamed
+        try rename(recording, to: requestedName, source: .user)
+    }
+
+    /// Renames `recording` and records who chose the title.
+    ///
+    /// Only `recording.id` (and its folder) is taken from the caller: the
+    /// metadata is re-read from disk and the rename is applied on top of it, so
+    /// a stale in-memory snapshot can never overwrite newer on-disk edits. The
+    /// recording is moved to immutable storage first if needed. Renaming to the
+    /// current on-disk name (after sanitizing) is a no-op that returns the
+    /// stored recording: no " 2" suffix, no write, and `titleSource` is kept.
+    /// Otherwise the name is made unique among the other recordings (matched by
+    /// ID, case-insensitively) and `titleSource` is set to `source`.
+    ///
+    /// - Throws: `RecordingLibraryError.recordingNotFound` when the recording is
+    ///   no longer in the library.
+    @discardableResult
+    public func rename(
+        _ recording: RecordingItem,
+        to requestedName: String,
+        source: RecordingTitleSource
+    ) throws -> RecordingItem {
+        let (current, recordings) = try onDiskRecording(for: recording)
+        return try applyRename(try ensureImmutableStorage(current), to: requestedName, source: source, among: recordings)
+    }
+
+    /// Auto-title entry point: renames with `source: .generated` only when the
+    /// title on disk is still a default one (`effectiveTitleSource == .default`).
+    ///
+    /// `newName` is first normalized with `MeetingTitleGenerator.cleaned(_:fallback:)`
+    /// (quotes, `Title:` prefixes, trailing periods, 8-word / 80-character cap).
+    /// Returns `nil`, without touching disk, when the user (or an earlier
+    /// auto-title) already chose a title, for example a manual rename made while
+    /// the transcription was running, or when the cleaned name is empty or
+    /// itself a default-looking name.
+    ///
+    /// - Throws: `RecordingLibraryError.recordingNotFound` when the recording is
+    ///   no longer in the library.
+    @discardableResult
+    public func renameIfTitleIsDefault(_ recording: RecordingItem, to newName: String) throws -> RecordingItem? {
+        let sanitized = MeetingTitleGenerator.cleaned(newName, fallback: "")
+        guard !sanitized.isEmpty, !MeetingTitleGenerator.isDefaultName(sanitized) else { return nil }
+        let (current, recordings) = try onDiskRecording(for: recording)
+        guard current.effectiveTitleSource == .default else { return nil }
+        return try applyRename(try ensureImmutableStorage(current), to: sanitized, source: .generated, among: recordings)
+    }
+
+    /// Moves a legacy (name-keyed) recording to immutable storage if needed and
+    /// returns the recording as stored. Use this instead of renaming a recording
+    /// to its own name just to obtain stable file URLs.
+    @discardableResult
+    public func migrateIfNeeded(_ recording: RecordingItem) throws -> RecordingItem {
+        try ensureImmutableStorage(recording)
     }
 
     @discardableResult
@@ -266,6 +334,38 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         try completeDelete(operation, journalURL: journalURL)
     }
 
+    /// The current on-disk state of `recording` plus the whole library listing
+    /// (reused for name de-duplication).
+    private func onDiskRecording(for recording: RecordingItem) throws -> (RecordingItem, [RecordingItem]) {
+        guard recording.folderURL.standardizedFileURL == folderURL else {
+            throw StorageIntegrityError.pathEscapesLibrary(recording.audioURL.path)
+        }
+        let recordings = try loadRecordings()
+        guard let current = recordings.first(where: { $0.id == recording.id }) else {
+            throw RecordingLibraryError.recordingNotFound(recording.id)
+        }
+        return (current, recordings)
+    }
+
+    private func applyRename(
+        _ current: RecordingItem,
+        to requestedName: String,
+        source: RecordingTitleSource,
+        among recordings: [RecordingItem]
+    ) throws -> RecordingItem {
+        let requested = FileNameSanitizer.sanitizedBaseName(requestedName)
+        // Same name: nothing to rename, and confirming a title does not change
+        // who chose it (a default title stays replaceable by auto-title).
+        guard requested != current.displayName else { return current }
+        var metadata = current.metadata
+        metadata.displayName = uniqueDisplayName(requested, excluding: current.id, among: recordings)
+        metadata.titleSource = source
+        metadata.updatedAt = Date()
+        let renamed = RecordingItem(metadata: metadata, folderURL: folderURL)
+        try write(metadata: metadata, to: renamed.metadataURL)
+        return renamed
+    }
+
     public static func storageKey(for id: UUID) -> String {
         "recording-" + id.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
@@ -302,14 +402,26 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         return item
     }
 
-    private func ensureImmutableStorage(_ recording: RecordingItem) throws -> RecordingItem {
-        guard recording.folderURL.standardizedFileURL == folderURL else {
-            throw StorageIntegrityError.pathEscapesLibrary(recording.audioURL.path)
+    private func ensureImmutableStorage(_ snapshot: RecordingItem) throws -> RecordingItem {
+        guard snapshot.folderURL.standardizedFileURL == folderURL else {
+            throw StorageIntegrityError.pathEscapesLibrary(snapshot.audioURL.path)
         }
-        if recording.usesImmutableStorage { return recording }
+        if snapshot.usesImmutableStorage { return snapshot }
+
+        let storageKey = Self.storageKey(for: snapshot.id)
+        // A stale legacy snapshot of a recording that was already migrated:
+        // return the migrated on-disk state. Re-running the migration would
+        // overwrite newer metadata with the snapshot.
+        if let migratedURL = try? StoragePath.containedURL(in: folderURL, fileName: "\(storageKey).json"),
+           let onDisk = readRecording(migratedURL),
+           onDisk.id == snapshot.id {
+            return onDisk
+        }
+        // Migrate from the legacy metadata as it is on disk now, not from the snapshot.
+        let recording = readRecording(snapshot.metadataURL)
+            .flatMap { $0.id == snapshot.id && !$0.usesImmutableStorage ? $0 : nil } ?? snapshot
 
         var metadata = recording.metadata
-        let storageKey = Self.storageKey(for: recording.id)
         metadata.storageKey = storageKey
         metadata.schema = RecordingMetadata.currentSchema
         metadata.schemaVersion = RecordingMetadata.currentSchemaVersion
@@ -406,8 +518,14 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         }
     }
 
-    private func uniqueDisplayName(_ requested: String, allowing current: String? = nil) throws -> String {
-        let used = Set(try loadRecordings().filter { $0.displayName != current }.map { $0.displayName.lowercased() })
+    private func uniqueDisplayName(_ requested: String) throws -> String {
+        uniqueDisplayName(requested, excluding: nil, among: try loadRecordings())
+    }
+
+    /// `requested`, or `requested N` when another recording (by ID, not by
+    /// name) already uses that name case-insensitively.
+    private func uniqueDisplayName(_ requested: String, excluding id: UUID?, among recordings: [RecordingItem]) -> String {
+        let used = Set(recordings.filter { $0.id != id }.map { $0.displayName.lowercased() })
         var candidate = requested
         var index = 2
         while used.contains(candidate.lowercased()) {
