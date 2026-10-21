@@ -14,13 +14,11 @@ let package = Package(
         .library(name: "MSRServices", targets: ["MSRServices"])
     ],
     dependencies: [
-        .package(url: "https://github.com/weichsel/ZIPFoundation.git", exact: "0.9.20"),
         .package(url: "https://github.com/swiftlang/swift-testing.git", exact: "0.12.0")
     ],
     targets: [
         .target(
-            name: "MSRCore",
-            dependencies: ["ZIPFoundation"]
+            name: "MSRCore"
         ),
         .target(
             name: "MSRServices",

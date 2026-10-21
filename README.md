@@ -15,7 +15,7 @@ temporary storage requirements, and the physical lid-close acceptance checklist.
 - Immutable recording storage with lazy migration from pre-1.0 libraries
 - Review waveform, seeking, playback speeds, non-destructive trim, and selected-range transcription
 - English/Indonesian UI resources, themes, menu-bar control, and Control–Option–R global recording shortcut
-- TXT, Markdown, SRT, and DOCX export
+- TXT, Markdown, SRT, and DOCX export (DOCX is written by a small built-in ZIP writer; the app has no third-party runtime dependencies, and swift-testing is used by the test target only)
 - Optional auto-transcribe after every finished recording, auto-title from the transcript, and auto-summarize
 - Transcription language hint (Automatic, English, Bahasa Indonesia)
 - Named speakers: click a speaker in the transcript to rename it everywhere
