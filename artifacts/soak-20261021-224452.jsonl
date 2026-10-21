@@ -1,0 +1,7 @@
+{"soak":"start","cycles":5,"recordSeconds":60.0,"pause":true,"sleep":true,"transcribe":true,"rssBaselineMB":123.0}
+{"soak":"cycle","cycle":1,"ok":true,"recordingID":"1B5EEFB3-5725-4A4C-995F-6CCD0FBD929E","jobStatus":"completed","transcriptCharacters":1016,"seconds":67.8,"rssMB":136.5,"libraryFiles":26,"recordings":7,"leftoverFiles":0,"error":null}
+{"soak":"cycle","cycle":2,"ok":true,"recordingID":"42E0414D-5DC3-4193-AE89-BD452FC0B2BF","jobStatus":"completed","transcriptCharacters":1018,"seconds":67.9,"rssMB":130.2,"libraryFiles":34,"recordings":8,"leftoverFiles":0,"error":null}
+{"soak":"cycle","cycle":3,"ok":true,"recordingID":"33FB6756-C106-46CA-B834-EEDB107A6B80","jobStatus":"completed","transcriptCharacters":1016,"seconds":67.8,"rssMB":131.3,"libraryFiles":42,"recordings":9,"leftoverFiles":0,"error":null}
+{"soak":"cycle","cycle":4,"ok":true,"recordingID":"EE299620-C337-4955-BC8D-6C2509B70444","jobStatus":"completed","transcriptCharacters":1016,"seconds":68.4,"rssMB":132.6,"libraryFiles":50,"recordings":10,"leftoverFiles":0,"error":null}
+{"soak":"cycle","cycle":5,"ok":true,"recordingID":"78BCB462-B54E-488C-9B7E-620BD3F9DDEA","jobStatus":"completed","transcriptCharacters":1018,"seconds":67.8,"rssMB":133.7,"libraryFiles":58,"recordings":11,"leftoverFiles":0,"error":null}
+{"soak":"done","cycles":5,"rssStartMB":136.5,"rssEndMB":133.7,"rssPeakMB":136.5,"leftoverFiles":0,"failures":0,"minutes":5.7,"ok":true,"reason":null}

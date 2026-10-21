@@ -233,8 +233,8 @@ public enum TranscriptExporter {
     }
 
     private static func writeDOCX(_ input: MeetingNotesExportInput, to url: URL) throws {
-        // Stored (uncompressed) entries: every DOCX reader accepts them, and the
-        // parts are a few kilobytes. `[Content_Types].xml` comes first.
+        // The writer deflates parts that shrink (word/document.xml for any real
+        // transcript) and stores the tiny ones. `[Content_Types].xml` comes first.
         var archive = ZipArchiveWriter()
         try archive.addEntry("[Content_Types].xml", text: """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
