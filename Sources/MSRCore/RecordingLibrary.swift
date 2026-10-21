@@ -75,6 +75,10 @@ public protocol RecordingLibraryServing: Sendable {
     /// Stores `samples` as the review waveform of the recording's audio file as
     /// it is now (`RecordingItem.waveformURL`).
     func storeWaveformCache(_ samples: [Float], for recording: RecordingItem) throws
+    /// Stores `samples` only when the audio file still matches `scannedAudio`
+    /// (its stamp taken before the scan); returns whether it stored.
+    @discardableResult
+    func storeWaveformCache(_ samples: [Float], for recording: RecordingItem, scannedAudio: WaveformCacheFile.AudioStamp) throws -> Bool
 }
 
 public extension RecordingLibraryServing {
@@ -84,6 +88,11 @@ public extension RecordingLibraryServing {
 
     func storeWaveformCache(_ samples: [Float], for recording: RecordingItem) throws {
         try WaveformCacheFile.write(samples, for: recording)
+    }
+
+    @discardableResult
+    func storeWaveformCache(_ samples: [Float], for recording: RecordingItem, scannedAudio: WaveformCacheFile.AudioStamp) throws -> Bool {
+        try WaveformCacheFile.write(samples, for: recording, scannedAudio: scannedAudio)
     }
 }
 
@@ -174,8 +183,15 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     /// folder re-stamped. Otherwise, or when the write throws, it is dropped.
     /// An external change landing during the write itself is absorbed; the
     /// folder watcher's reload rebuilds the index for it.
+    ///
+    /// The `changed` items are never stored as given: a sidecar write returns
+    /// the caller's copy, which may predate a rename made through another
+    /// instance. With `preservesMetadata` (transcript, segments, summary) an
+    /// indexed entry whose metadata file is unchanged is kept as it is;
+    /// everything else is re-read from its metadata file before it is stored.
     private func indexedWrite<T>(
         removed: [UUID] = [],
+        preservesMetadata: Bool = false,
         changed: (T) -> [RecordingItem],
         _ body: () throws -> T
     ) throws -> T {
@@ -199,16 +215,23 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         }
         for item in changed(result) {
             let path = item.metadataURL.path
-            guard let stamp = FileStamp(path: path) else {
+            let stamp = FileStamp(path: path)
+            if preservesMetadata, let stamp,
+               let indexed = index.metadataFiles[item.id], indexed.path == path, indexed.stamp == stamp,
+               index.recordings.contains(where: { $0.id == item.id }) {
+                continue
+            }
+            // Stamped before the read, as in `loadRecordings()`.
+            guard let stamp, let stored = readRecording(item.metadataURL), stored.id == item.id else {
                 MetadataIndex.drop(for: folderURL)
                 return result
             }
             if let position = index.recordings.firstIndex(where: { $0.id == item.id }) {
-                index.recordings[position] = item
+                index.recordings[position] = stored
             } else {
-                index.recordings.append(item)
-                index.recordings.sort { $0.startedAt > $1.startedAt }
+                index.recordings.append(stored)
             }
+            index.recordings.sort { $0.startedAt > $1.startedAt }
             index.metadataFiles[item.id] = StampedFile(path: path, stamp: stamp)
         }
         MetadataIndex.store(index, for: folderURL)
@@ -441,7 +464,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     @discardableResult
     public func writeTranscript(_ transcript: String, for recording: RecordingItem) throws -> RecordingItem {
         LibraryIO.begin(); defer { LibraryIO.end() }
-        return try indexedWrite(changed: { [$0] }) {
+        return try indexedWrite(preservesMetadata: true, changed: { [$0] }) {
             let item = try ensureImmutableStorage(recording)
             try DurableFile.write(Data(transcript.utf8), to: item.transcriptURL, fileManager: fileManager)
             return item
@@ -451,7 +474,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     @discardableResult
     public func writeTranscriptSegments(_ segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem {
         LibraryIO.begin(); defer { LibraryIO.end() }
-        return try indexedWrite(changed: { [$0] }) {
+        return try indexedWrite(preservesMetadata: true, changed: { [$0] }) {
             let item = try ensureImmutableStorage(recording)
             try DurableFile.write(segments, to: item.transcriptSegmentsURL, encoder: Self.makeEncoder(), fileManager: fileManager)
             return item
@@ -461,7 +484,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     @discardableResult
     public func writeTranscriptBundle(_ transcript: String, segments: [TranscriptSegment], for recording: RecordingItem) throws -> RecordingItem {
         LibraryIO.begin(); defer { LibraryIO.end() }
-        return try indexedWrite(changed: { [$0] }) {
+        return try indexedWrite(preservesMetadata: true, changed: { [$0] }) {
             let item = try ensureImmutableStorage(recording)
             try DurableFile.write(Data(transcript.utf8), to: item.transcriptURL, fileManager: fileManager)
             do {
@@ -487,7 +510,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     @discardableResult
     public func writeSummary(_ summary: String, for recording: RecordingItem) throws -> RecordingItem {
         LibraryIO.begin(); defer { LibraryIO.end() }
-        return try indexedWrite(changed: { [$0] }) {
+        return try indexedWrite(preservesMetadata: true, changed: { [$0] }) {
             let item = try ensureImmutableStorage(recording)
             try DurableFile.write(Data(summary.utf8), to: item.summaryURL, fileManager: fileManager)
             return item
@@ -497,11 +520,13 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     @discardableResult
     public func clearSummary(for recording: RecordingItem) throws -> RecordingItem {
         LibraryIO.begin(); defer { LibraryIO.end() }
-        return try indexedWrite(changed: { [$0] }) {
+        return try indexedWrite(preservesMetadata: true, changed: { [$0] }) {
             let item = try ensureImmutableStorage(recording)
-            for url in [item.summaryURL, DurableFile.backupURL(for: item.summaryURL)] where fileManager.fileExists(atPath: url.path) {
+            let files = [item.summaryURL, DurableFile.backupURL(for: item.summaryURL)]
+            for url in files where fileManager.fileExists(atPath: url.path) {
                 try fileManager.removeItem(at: url)
             }
+            OwnFileWrites.record(files)
             return item
         }
     }
@@ -683,6 +708,17 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         }
     }
 
+    @discardableResult
+    public func storeWaveformCache(_ samples: [Float], for recording: RecordingItem, scannedAudio: WaveformCacheFile.AudioStamp) throws -> Bool {
+        guard recording.folderURL.standardizedFileURL == folderURL else {
+            throw StorageIntegrityError.pathEscapesLibrary(recording.waveformURL.path)
+        }
+        LibraryIO.begin(); defer { LibraryIO.end() }
+        return try indexedWrite(changed: { _ in [] }) {
+            try WaveformCacheFile.write(samples, for: recording, scannedAudio: scannedAudio)
+        }
+    }
+
     /// The current on-disk state of `recording` plus the whole library listing
     /// (reused for name de-duplication). The listing comes from the metadata
     /// index when it is current (`validIndex()`, no folder listing, no
@@ -798,8 +834,12 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
             moves: moves
         )
         let journalURL = try migrationJournalURL(recording.id)
+        let audioBeforeMove = WaveformCacheFile.AudioStamp(audioURL: recording.audioURL)
         try write(operation, to: journalURL)
         try completeMigration(operation, journalURL: journalURL)
+        if let audioBeforeMove {
+            WaveformCacheFile.restamp(migrated.waveformURL, from: audioBeforeMove, audioURL: migrated.audioURL)
+        }
         return migrated
     }
 
@@ -958,16 +998,21 @@ private struct DeleteJournal: Codable {
 
 /// `stat` identity of a file or folder: device, inode, size, modification and
 /// status-change times (nanoseconds). Any write, replace or rename changes it.
-struct FileStamp: Equatable, Sendable {
-    var device: Int64
-    var inode: UInt64
-    var size: Int64
-    var modified: timespec
-    var changed: timespec
+public struct FileStamp: Equatable, Sendable {
+    public var device: Int64
+    public var inode: UInt64
+    public var size: Int64
+    public var modified: timespec
+    public var changed: timespec
 
-    init?(path: String) {
+    /// `lstat` of `path` (a symlink itself, not its target); `nil` when missing.
+    public init?(path: String) {
         var info = stat()
         guard lstat(path, &info) == 0 else { return nil }
+        self.init(info)
+    }
+
+    public init(_ info: stat) {
         device = Int64(info.st_dev)
         inode = UInt64(info.st_ino)
         size = Int64(info.st_size)
@@ -975,7 +1020,7 @@ struct FileStamp: Equatable, Sendable {
         changed = info.st_ctimespec
     }
 
-    static func == (lhs: FileStamp, rhs: FileStamp) -> Bool {
+    public static func == (lhs: FileStamp, rhs: FileStamp) -> Bool {
         lhs.device == rhs.device && lhs.inode == rhs.inode && lhs.size == rhs.size
             && lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec
             && lhs.changed.tv_sec == rhs.changed.tv_sec && lhs.changed.tv_nsec == rhs.changed.tv_nsec

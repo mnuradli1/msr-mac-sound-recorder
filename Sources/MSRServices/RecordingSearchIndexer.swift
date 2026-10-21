@@ -52,6 +52,10 @@ public actor RecordingSearchIndexer {
         /// `nil` until the transcript and summary were read (or after the app changed them).
         var sketch: SearchSketch?
         var stamps: SidecarStamps?
+        /// Bumped whenever the entry's content changes (`refresh`, a read
+        /// that saw new stamps, moved files). A read started at an older
+        /// version is not applied: a newer read already replaced its result.
+        var version: UInt64 = 0
     }
 
     private var entries: [UUID: Entry] = [:]
@@ -62,10 +66,44 @@ public actor RecordingSearchIndexer {
     private var contentBytes = 0
     private var diskReads = 0
     private let byteBudget: Int
-    private let dates = SearchDateText()
+    /// Date text in the zone of the last check (see `refreshDateTextIfZoneChanged`).
+    private var dates: SearchDateText
+    private let currentTimeZone: @Sendable () -> TimeZone
+    /// Tests: called on the reading thread after each document's files were read.
+    private let afterRead: (@Sendable (UUID) -> Void)?
 
     public init(byteBudget: Int = RecordingSearchIndexer.defaultByteBudget) {
+        self.init(byteBudget: byteBudget, timeZone: { TimeZone.current }, afterRead: nil)
+    }
+
+    init(
+        byteBudget: Int = RecordingSearchIndexer.defaultByteBudget,
+        timeZone: @escaping @Sendable () -> TimeZone,
+        afterRead: (@Sendable (UUID) -> Void)?
+    ) {
         self.byteBudget = max(0, byteBudget)
+        currentTimeZone = timeZone
+        self.afterRead = afterRead
+        dates = Self.dateText(in: timeZone())
+    }
+
+    private static func dateText(in zone: TimeZone) -> SearchDateText {
+        var calendar = Calendar.current
+        calendar.timeZone = zone
+        return SearchDateText(calendar: calendar)
+    }
+
+    /// Date text is written in the current time zone: after the zone changed
+    /// (travel, a settings change), every recording's metadata text is
+    /// rebuilt once, lazily, before the next query or update uses it.
+    private func refreshDateTextIfZoneChanged() {
+        let zone = currentTimeZone()
+        guard zone.identifier != dates.timeZone.identifier else { return }
+        dates = Self.dateText(in: zone)
+        for var entry in entries.values {
+            entry.metadata = RecordingSearch.metadataText(for: entry.recording, dates: dates)
+            setEntry(entry)
+        }
     }
 
     /// Number of recordings whose text is cached (diagnostics and tests).
@@ -93,6 +131,7 @@ public actor RecordingSearchIndexer {
     /// (no disk access), changed ones are re-folded, missing ones dropped. A
     /// recording whose sidecar files moved (migration) is read again later.
     public func update(_ recordings: [RecordingItem]) {
+        refreshDateTextIfZoneChanged()
         var seen = Set<UUID>()
         for recording in recordings {
             seen.insert(recording.id)
@@ -105,6 +144,7 @@ public actor RecordingSearchIndexer {
                 if moved {
                     entry.sketch = nil
                     entry.stamps = nil
+                    entry.version += 1
                     dropContent(recording.id)
                 }
                 setEntry(entry)
@@ -121,6 +161,7 @@ public actor RecordingSearchIndexer {
     /// Re-reads `recording`'s transcript and summary now (the app just wrote
     /// them), adding the recording when it is new.
     public func refresh(_ recording: RecordingItem) {
+        refreshDateTextIfZoneChanged()
         let entry = entries[recording.id]
         if entry == nil { order.insert(recording.id, at: 0) }
         var updated = entry ?? Entry(recording: recording, metadata: [])
@@ -128,11 +169,29 @@ public actor RecordingSearchIndexer {
             updated.recording = recording
             updated.metadata = RecordingSearch.metadataText(for: recording, dates: dates)
         }
+        // Reads still in flight for this entry predate the app's write.
+        updated.version += 1
         setEntry(updated)
-        if let loaded = Self.load(LoadRequest(recording: recording)) {
+        if let loaded = Self.load(request(for: updated)) {
             apply(loaded)
         }
         evictOverBudget()
+    }
+
+    private func request(
+        for entry: Entry,
+        knownStamps: SidecarStamps? = nil,
+        skipIfUnchanged: Bool = false,
+        tokens: [[UInt8]]? = nil
+    ) -> LoadRequest {
+        LoadRequest(
+            recording: entry.recording,
+            knownStamps: knownStamps,
+            skipIfUnchanged: skipIfUnchanged,
+            tokens: tokens,
+            version: entry.version,
+            afterRead: afterRead
+        )
     }
 
     public func remove(_ id: UUID) {
@@ -145,14 +204,15 @@ public actor RecordingSearchIndexer {
     /// parallel chunks; cancellable between chunks. Memory stays within the
     /// budget (the oldest cached text is evicted; sketches stay).
     public func indexContent() async {
-        let targets = order.compactMap { entries[$0] }.map { IndexTarget(recording: $0.recording, stamps: $0.sketch == nil ? nil : $0.stamps) }
+        let targets = order.compactMap { entries[$0] }.map {
+            request(for: $0, knownStamps: $0.sketch == nil ? nil : $0.stamps, skipIfUnchanged: true)
+        }
         for chunk in stride(from: 0, to: targets.count, by: Self.chunkSize).map({ Array(targets[$0..<min($0 + Self.chunkSize, targets.count)]) }) {
             if Task.isCancelled { return }
             // A background pass: a few workers leave the other cores (and
             // less transient scratch memory) to the app.
-            let loaded = await Self.loadInParallel(chunk.map {
-                LoadRequest(recording: $0.recording, knownStamps: $0.stamps, skipIfUnchanged: true)
-            }, maxWorkers: Self.indexingWorkers)
+            let loaded = await Self.loadInParallel(chunk, maxWorkers: Self.indexingWorkers)
+            if Task.isCancelled { return }
             for item in loaded.compactMap({ $0 }) { apply(item) }
             evictOverBudget()
         }
@@ -169,6 +229,7 @@ public actor RecordingSearchIndexer {
     /// `isComplete`. A blank query delivers every recording. Cancelling the
     /// calling task stops between chunks without a final delivery.
     public func search(_ query: String, deliver: @Sendable (Progress) -> Void) async {
+        refreshDateTextIfZoneChanged()
         let parsed = RecordingSearchQuery(query)
         guard !parsed.isEmpty else {
             deliver(Progress(matches: order, isComplete: true))
@@ -194,11 +255,7 @@ public actor RecordingSearchIndexer {
                     continue
                 }
             }
-            pending.append(LoadRequest(
-                recording: entry.recording,
-                knownStamps: entry.sketch == nil ? nil : entry.stamps,
-                tokens: missing
-            ))
+            pending.append(request(for: entry, knownStamps: entry.sketch == nil ? nil : entry.stamps, tokens: missing))
         }
         matched.formUnion(await Self.verifyInParallel(resident))
         if Task.isCancelled { return }
@@ -216,6 +273,8 @@ public actor RecordingSearchIndexer {
             let averageText = contents.isEmpty ? 0 : contentBytes / contents.count
             let cacheable = fixedBytes + contentBytes + averageText < byteBudget
             let loaded = await Self.loadInParallel(Array(chunk), compress: cacheable)
+            // A cancelled query stores nothing (a newer one, or a refresh, may own the entries now).
+            if Task.isCancelled { return }
             for item in loaded.compactMap({ $0 }) {
                 let fits = cacheable && fixedBytes + contentBytes + item.content.bytes.count + Self.sketchGrowth(item, entries[item.id]) <= byteBudget
                 apply(item, cache: fits)
@@ -275,13 +334,17 @@ public actor RecordingSearchIndexer {
     }
 
     /// Stores what a read produced (sketch, stamps and, with `cache`, the
-    /// text), unless the recording left the index or its files moved meanwhile.
+    /// text), unless the recording left the index, its files moved, or a
+    /// newer read or refresh replaced the entry (`version`) meanwhile.
     private func apply(_ loaded: Loaded, cache: Bool = true) {
         diskReads += 1
         guard var entry = entries[loaded.id],
+              entry.version == loaded.version,
               entry.recording.transcriptURL == loaded.transcriptURL,
               entry.recording.summaryURL == loaded.summaryURL else { return }
         if let sketch = loaded.sketch { entry.sketch = sketch }
+        // New content: reads of the entry started before this one are stale.
+        if entry.stamps != loaded.stamps { entry.version += 1 }
         entry.stamps = loaded.stamps
         setEntry(entry)
         dropContent(loaded.id)
@@ -337,11 +400,6 @@ extension RecordingSearchIndexer {
         var lastUse: UInt64 = 0
     }
 
-    struct IndexTarget: Sendable {
-        var recording: RecordingItem
-        var stamps: SidecarStamps?
-    }
-
     /// One document to read: `knownStamps` are the file stamps its current
     /// sketch was built from (`nil`: no sketch yet).
     struct LoadRequest: Sendable {
@@ -351,6 +409,10 @@ extension RecordingSearchIndexer {
         var skipIfUnchanged = false
         /// Queries: report whether the text holds all of these.
         var tokens: [[UInt8]]?
+        /// The entry's `version` when the read was requested.
+        var version: UInt64 = 0
+        /// Tests: called after the files were read.
+        var afterRead: (@Sendable (UUID) -> Void)?
     }
 
     struct VerifyItem: Sendable {
@@ -361,6 +423,7 @@ extension RecordingSearchIndexer {
 
     struct Loaded: Sendable {
         var id: UUID
+        var version: UInt64
         var transcriptURL: URL
         var summaryURL: URL
         var stamps: SidecarStamps
@@ -429,27 +492,40 @@ extension RecordingSearchIndexer {
     /// the text for the cache. `nil` for an unchanged file pair when
     /// `skipIfUnchanged`. The stamps are taken before the reads, so a write
     /// racing a read is seen as a change by the next pass.
+    ///
+    /// A missing file whose `.bak` exists may be a durable write between its
+    /// moves (on a file system without hard links, see `DurableFile.write`):
+    /// the read is then redone under `LibraryIO`, after that write finished,
+    /// instead of recording the document as empty.
     static func load(
         _ request: LoadRequest,
         compress shouldCompress: Bool = true,
         keepText: Bool = false,
-        workspace: LoadWorkspace = LoadWorkspace()
+        workspace: LoadWorkspace = LoadWorkspace(),
+        holdingLibraryIO: Bool = false
     ) -> Loaded? {
         let recording = request.recording
         let current = SidecarStamps(
             transcript: SidecarStamp(path: recording.transcriptURL.path),
             summary: SidecarStamp(path: recording.summaryURL.path)
         )
+        if !holdingLibraryIO, mayBeMidWrite(current, recording) {
+            return LibraryIO.serialized {
+                load(request, compress: shouldCompress, keepText: keepText, workspace: workspace, holdingLibraryIO: true)
+            }
+        }
         let unchanged = request.knownStamps == current
         if request.skipIfUnchanged, unchanged { return nil }
         let text = workspace.text
         text.removeAll()
         if current.transcript != nil { appendFolded(fileAtPath: recording.transcriptURL.path, to: workspace) }
         if current.summary != nil { appendFolded(fileAtPath: recording.summaryURL.path, to: workspace) }
+        request.afterRead?(recording.id)
         let folded = text.bytes
         let matched = request.tokens.map { tokens in tokens.allSatisfy { SearchFolding.contains(folded, $0) } }
         return Loaded(
             id: recording.id,
+            version: request.version,
             transcriptURL: recording.transcriptURL,
             summaryURL: recording.summaryURL,
             stamps: current,
@@ -458,6 +534,12 @@ extension RecordingSearchIndexer {
             folded: keepText ? Array(folded) : nil,
             matched: matched
         )
+    }
+
+    private static func mayBeMidWrite(_ stamps: SidecarStamps, _ recording: RecordingItem) -> Bool {
+        func backupExists(_ url: URL) -> Bool { access(DurableFile.backupURL(for: url).path, F_OK) == 0 }
+        return (stamps.transcript == nil && backupExists(recording.transcriptURL))
+            || (stamps.summary == nil && backupExists(recording.summaryURL))
     }
 
     /// Reads the whole file (`open`/`read` into the workspace) and appends its

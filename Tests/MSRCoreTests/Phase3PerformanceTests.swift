@@ -64,7 +64,7 @@ struct WaveformCacheTests {
         let stamp = WaveformCacheFile.AudioStamp(size: 1_234, modifiedSeconds: 1_700_000_000, modifiedNanoseconds: 5)
         let samples: [Float] = (0..<96).map { Float($0) / 95 }
         let data = WaveformCacheFile.encode(samples, audio: stamp)
-        #expect(data.count == 32 + 96 * 2)
+        #expect(data.count == WaveformCacheFile.headerSize + 96 * 2)
         let decoded = WaveformCacheFile.decode(data, bucketCount: 96, audio: stamp)
         #expect(decoded?.count == 96)
         #expect(zip(decoded ?? [], samples).allSatisfy { abs($0 - $1) <= 1 / 65_535 })

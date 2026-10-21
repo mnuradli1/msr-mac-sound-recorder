@@ -196,11 +196,15 @@ public struct RecordingSearchDocument: Equatable, Sendable {
 /// (not once per document). Not thread-safe: one per actor or call.
 public final class SearchDateText {
     private let formatters: [DateFormatter]
+    /// The zone the dates are written in (`calendar.timeZone`).
+    public let timeZone: TimeZone
 
     public init(calendar: Calendar = .current) {
+        timeZone = calendar.timeZone
         formatters = ["yyyy-MM-dd", "yyyy-MM-dd HH.mm", "yyyy-MM-dd HH:mm", "MMM d yyyy", "MMMM d yyyy"].map { format in
             let formatter = DateFormatter()
             formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.dateFormat = format
             return formatter
