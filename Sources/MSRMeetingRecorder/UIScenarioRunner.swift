@@ -443,7 +443,9 @@ extension UIScenarioRunner {
         var info = mach_task_basic_info()
         let wordSize = MemoryLayout<natural_t>.size
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / wordSize)
-        let task: mach_port_t = mach_task_self_
+        // `mach_task_self_` is a global var that Swift 6.0's strict concurrency
+        // rejects; the trap returns the same port without touching shared state.
+        let task: mach_port_t = task_self_trap()
         let result: kern_return_t = withUnsafeMutablePointer(to: &info) { pointer in
             pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { raw in
                 task_info(task, task_flavor_t(MACH_TASK_BASIC_INFO), raw, &count)
