@@ -38,11 +38,16 @@ struct DurableWriteAtomicityTests {
         let rounds = 400
         let state = RaceState()
         async let writes: Void = Task.detached {
+            // On a slow runner the writer could finish all rounds before the
+            // reader thread is scheduled; wait (briefly) for the reader to start.
+            let deadline = Date().addingTimeInterval(5)
+            while !state.hasStarted, Date() < deadline { usleep(1_000) }
             for value in 1...rounds { try? DurableFile.write(Data("\(value)".utf8), to: url) }
             state.finish()
         }.value
         async let reads: Void = Task.detached {
             // Plain reads, as the main thread and the search indexer make them.
+            state.markStarted()
             while !state.isFinished {
                 let missing = access(url.path, F_OK) != 0
                 let empty = (try? Data(contentsOf: url))?.isEmpty ?? true
@@ -60,10 +65,13 @@ struct DurableWriteAtomicityTests {
 private final class RaceState: @unchecked Sendable {
     private let lock = NSLock()
     private var finished = false
+    private var started = false
     private var readCount = 0
     private var missCount = 0
 
     var isFinished: Bool { lock.withLock { finished } }
+    var hasStarted: Bool { lock.withLock { started } }
+    func markStarted() { lock.withLock { started = true } }
     var reads: Int { lock.withLock { readCount } }
     var misses: Int { lock.withLock { missCount } }
 
