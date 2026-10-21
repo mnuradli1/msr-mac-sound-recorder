@@ -300,6 +300,16 @@ enum UISnapshotCapture {
         }
         viewModel.showQuickRecorder()
         try? await Task.sleep(for: .milliseconds(600))
+        // Every exit of the render (panel missing, bitmap failure, written)
+        // comes back here, so the recording started above is always stopped;
+        // a `defer` could not await the save.
+        renderQuickRecorderPanel(viewModel: viewModel, to: path)
+        if recordSeconds != nil, viewModel.isRecording {
+            await viewModel.toggleRecording()
+        }
+    }
+
+    private static func renderQuickRecorderPanel(viewModel: AppViewModel, to path: String) {
         defer {
             viewModel.hideQuickRecorder()
         }
@@ -353,9 +363,6 @@ enum UISnapshotCapture {
             } catch {
                 FileHandle.standardError.write(Data("MSR snapshot: write failed: \(error.localizedDescription)\n".utf8))
             }
-        }
-        if recordSeconds != nil, viewModel.isRecording {
-            await viewModel.toggleRecording()
         }
     }
 

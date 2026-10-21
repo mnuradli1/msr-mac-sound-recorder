@@ -55,9 +55,10 @@ struct OnboardingTests {
         skipped.settings.hasCompletedOnboarding = false
         skipped.elevenLabsKeyDraft = "typed-but-skipped"
         #expect(skipped.hasUnsavedKeyDrafts)
-        Onboarding.complete(skipped, saveKeys: false)
+        // `saveKeys: false` is only the sheet's dismiss fallback (Skip and Esc
+        // save typed keys like Finish): it marks onboarding done, saves nothing.
+        #expect(Onboarding.complete(skipped, saveKeys: false))
         #expect(skipped.settings.hasCompletedOnboarding)
-        // Skip leaves the draft alone (still visible in Settings, never saved).
         #expect(skipped.elevenLabsKeyDraft == "typed-but-skipped")
 
         let finished = AppViewModel(recordingsFolderOverride: folder)
@@ -65,10 +66,31 @@ struct OnboardingTests {
         finished.settings.hasCompletedOnboarding = false
         finished.settings.rememberCredentials = false
         finished.openAIKeyDraft = "sk-onboarding-session-only"
-        Onboarding.complete(finished, saveKeys: true)
+        #expect(Onboarding.complete(finished, saveKeys: true))
         #expect(finished.settings.hasCompletedOnboarding)
         #expect(!finished.hasUnsavedKeyDrafts)
         #expect(finished.credentialAvailable(for: .openAI))
+
+        // A key that cannot be saved keeps onboarding open, its draft and the
+        // workflow state untouched, and reports the error on the Keys step.
+        let failing = AppViewModel(recordingsFolderOverride: folder)
+        failing.settingsPersistenceSuspended = true
+        failing.settings.hasCompletedOnboarding = false
+        failing.settings.rememberCredentials = false
+        let state = failing.workflowState
+        failing.deepSeekKeyDraft = " \n "
+        #expect(!Onboarding.complete(failing, saveKeys: true))
+        #expect(!failing.settings.hasCompletedOnboarding)
+        #expect(failing.hasUnsavedKeyDrafts)
+        #expect(failing.workflowState == state)
+        #expect(failing.credentialStatusSeverity == .error)
+    }
+
+    @Test func keyChipSaysSessionOnlyWhenNotRemembered() {
+        #expect(OnboardingView.chipTitle(saved: true, drafted: false, remembered: true) == "Saved")
+        #expect(OnboardingView.chipTitle(saved: true, drafted: false, remembered: false) == "Saved for this session")
+        #expect(OnboardingView.chipTitle(saved: true, drafted: true, remembered: false) == "Not saved yet")
+        #expect(OnboardingView.chipTitle(saved: false, drafted: false, remembered: false) == "Missing")
     }
 
     @Test func permissionRowsComeFromSetupHealth() throws {

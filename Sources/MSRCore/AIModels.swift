@@ -206,8 +206,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var windowWidth: Double
     public var windowHeight: Double
     /// Set once the first-run onboarding sheet was finished or skipped; it is
-    /// presented at launch while this is `false`. Settings saved before this
-    /// key existed decode as `false`.
+    /// presented at launch while this is `false`. Fresh installs start from
+    /// `.default` (`false`); settings saved before this key existed decode as
+    /// `true` (an existing user upgrading never sees the first-run sheet).
     public var hasCompletedOnboarding: Bool
 
     public static let `default` = AppSettings(

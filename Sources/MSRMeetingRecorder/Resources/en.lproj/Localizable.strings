@@ -348,6 +348,7 @@
 "Privacy: audio goes to your transcription provider only when a recording is transcribed, and transcripts go to OpenAI or DeepSeek only for titles and summaries. Recordings stay on this Mac." = "Privacy: audio goes to your transcription provider only when a recording is transcribed, and transcripts go to OpenAI or DeepSeek only for titles and summaries. Recordings stay on this Mac.";
 "Testing…" = "Testing…";
 "Not saved yet" = "Not saved yet";
+"Saved for this session" = "Saved for this session";
 "On, but no key is saved for the transcription provider yet. Go back to add one." = "On, but no key is saved for the transcription provider yet. Go back to add one.";
 "Queue every finished recording for transcription right away." = "Queue every finished recording for transcription right away.";
 "Rename each recording from what was said, unless you named it yourself." = "Rename each recording from what was said, unless you named it yourself.";
@@ -360,3 +361,4 @@
 "Skip setup. You can open it again from the Ready screen." = "Skip setup. You can open it again from the Ready screen.";
 "Set up MSR…" = "Set up MSR…";
 "Walk through permissions, API keys and automation" = "Walk through permissions, API keys and automation";
+"Saving recording before quitting…" = "Saving recording before quitting…";

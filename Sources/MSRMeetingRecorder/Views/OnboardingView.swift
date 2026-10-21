@@ -78,17 +78,23 @@ enum Onboarding {
     }
 
     /// Marks onboarding done and persists it. With `saveKeys`, typed API keys
-    /// are saved as well (`saveAPIKeys()` also persists the settings).
+    /// are saved as well (`saveAPIKeys()` also persists the settings). Returns
+    /// `false`, leaving onboarding not done, when a typed key could not be
+    /// saved: the sheet then stays open on the Keys step with the error.
     @MainActor
-    static func complete(_ viewModel: AppViewModel, saveKeys: Bool) {
-        if !viewModel.settings.hasCompletedOnboarding {
+    @discardableResult
+    static func complete(_ viewModel: AppViewModel, saveKeys: Bool) -> Bool {
+        let wasCompleted = viewModel.settings.hasCompletedOnboarding
+        if !wasCompleted {
             viewModel.settings.hasCompletedOnboarding = true
         }
-        if saveKeys, viewModel.hasUnsavedKeyDrafts {
-            viewModel.saveAPIKeys()
-        } else {
+        guard saveKeys, viewModel.hasUnsavedKeyDrafts else {
             viewModel.saveSettings()
+            return true
         }
+        if viewModel.saveAPIKeys() { return true }
+        viewModel.settings.hasCompletedOnboarding = wasCompleted
+        return false
     }
 }
 
@@ -98,6 +104,8 @@ extension Notification.Name {
 
 /// First-run onboarding sheet (~560×520): Welcome → Permissions → Keys →
 /// Automation, with a progress indicator and Back / Next / Skip. Esc skips.
+/// Keys typed on the Keys step are saved when leaving it by any button (Back,
+/// Next, Skip/Esc, Finish); a failed save keeps the sheet on that step.
 /// Every control binds straight to `AppViewModel`, so it stays in step with
 /// Settings and the readiness checklist.
 struct OnboardingView: View {
@@ -444,15 +452,26 @@ struct OnboardingView: View {
         }
     }
 
-    /// Saved/Missing from the cached credential state; a typed key reads "Not saved yet".
+    /// Saved/Missing from the cached credential state; a typed key reads "Not
+    /// saved yet", and a saved one "Saved for this session" while
+    /// "Remember credentials in Keychain" is off.
     private func credentialChip(_ credential: CredentialProvider) -> some View {
         let saved = viewModel.hasSavedCredential(credential)
         let drafted = !draftText(for: credential).isEmpty
-        let title = drafted ? "Not saved yet" : (saved ? "Saved" : "Missing")
+        let title = OnboardingView.chipTitle(
+            saved: saved, drafted: drafted, remembered: viewModel.settings.rememberCredentials
+        )
         let tone: Tone = drafted ? .info : (saved ? .success : (credential == .elevenLabs ? .warning : .neutral))
         return StatusChip(title: title, tone: tone, systemImage: saved && !drafted ? "checkmark" : nil, compact: true)
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("msr.onboarding.keyStatus.\(credential.rawValue)")
+    }
+
+    /// The key-status chip's (English, localized-key) title.
+    static func chipTitle(saved: Bool, drafted: Bool, remembered: Bool) -> String {
+        if drafted { return "Not saved yet" }
+        if !saved { return "Missing" }
+        return remembered ? "Saved" : "Saved for this session"
     }
 
     private func draftText(for credential: CredentialProvider) -> String {
@@ -540,7 +559,7 @@ struct OnboardingView: View {
 
     private var footer: some View {
         HStack(spacing: 10) {
-            Button("Skip") { close(saveKeys: false) }
+            Button("Skip") { close(saveKeys: true) }
                 .buttonStyle(.borderless)
                 .foregroundStyle(Theme.textSecondary)
                 .keyboardShortcut(.cancelAction)
@@ -548,11 +567,11 @@ struct OnboardingView: View {
                 .accessibilityIdentifier("msr.onboarding.skip")
             Spacer()
             if let previous = step.previous {
-                Button("Back") { go(to: previous) }
+                Button("Back") { leave(to: previous) }
                     .accessibilityIdentifier("msr.onboarding.back")
             }
             if let next = step.next {
-                Button("Next") { advance(to: next) }
+                Button("Next") { leave(to: next) }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("msr.onboarding.next")
@@ -574,17 +593,38 @@ struct OnboardingView: View {
         withAnimation(.easeOut(duration: 0.15)) { step = target }
     }
 
-    private func advance(to target: OnboardingStep) {
-        // Save typed keys when leaving the Keys step, so its Saved chips and the
-        // Automation step (auto-summarize needs a key) reflect them.
-        if step == .keys, viewModel.hasUnsavedKeyDrafts {
-            viewModel.saveAPIKeys()
+    /// Back/Next. Typed keys are saved when leaving the Keys step either way,
+    /// so its Saved chips and the Automation step (auto-summarize needs a key)
+    /// reflect them; a failed save stays on Keys and shows the error.
+    private func leave(to target: OnboardingStep) {
+        if step == .keys, viewModel.hasUnsavedKeyDrafts, !viewModel.saveAPIKeys() {
+            showSaveFailure()
+            return
         }
         go(to: target)
     }
 
+    /// Finish, Skip and Esc (Skip's cancel shortcut). Keys the user typed are
+    /// saved rather than left behind as drafts; a failed save keeps the sheet
+    /// open on the Keys step.
     private func close(saveKeys: Bool) {
-        Onboarding.complete(viewModel, saveKeys: saveKeys)
+        guard Onboarding.complete(viewModel, saveKeys: saveKeys) else {
+            showSaveFailure()
+            return
+        }
         onClose()
+    }
+
+    /// Shows `saveAPIKeys()`'s error under the key that failed: keys are saved
+    /// in field order and a saved draft is cleared, so it is the first one left.
+    private func showSaveFailure() {
+        if !viewModel.elevenLabsKeyDraft.isEmpty {
+            lastTestedCredential = .elevenLabs
+        } else if !viewModel.openAIKeyDraft.isEmpty {
+            lastTestedCredential = .openAI
+        } else if !viewModel.deepSeekKeyDraft.isEmpty {
+            lastTestedCredential = .deepSeek
+        }
+        if step != .keys { go(to: .keys) }
     }
 }

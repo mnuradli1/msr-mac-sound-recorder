@@ -1224,7 +1224,11 @@ final class UIWalkthrough {
             if number == 3 {
                 let status = try require(await ax.find(AXDriver.Query(identifier: "msr.onboarding.keyStatus.elevenLabs")),
                                          "ElevenLabs key status chip not in AX tree")
-                let expected = viewModel.hasSavedCredential(.elevenLabs) ? "Saved" : "Missing"
+                let expected = OnboardingView.chipTitle(
+                    saved: viewModel.hasSavedCredential(.elevenLabs),
+                    drafted: !viewModel.elevenLabsKeyDraft.isEmpty,
+                    remembered: viewModel.settings.rememberCredentials
+                )
                 let nodes = await ax.snapshot()
                 let texts = status.texts + ax.descendants(of: status, in: nodes).flatMap(\.texts)
                 try check(texts.contains(expected), "ElevenLabs key status reads \(texts), expected \(expected)")

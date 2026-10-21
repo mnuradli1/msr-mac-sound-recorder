@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Long-recording soak: builds the app and a fixture library, then runs
-# MSR_UI_SCENARIO=soak (record → pause/resume → system-sleep save → wake →
-# stop, once per minute) with the fake recorder, tracking resident memory and
-# leftover temporary files. One JSON line per cycle plus a final
-# {"soak":"done",…} summary are printed and written to artifacts/soak-<date>.jsonl.
+# MSR_UI_SCENARIO=soak (record → pause/resume → save, once per minute) with
+# the fake recorder, alternating how each recording is saved: odd cycles via
+# the system-sleep save → wake path, even cycles via a plain Stop. Tracks the
+# memory footprint (and resident size), leftover temporary files, and that
+# every cycle adds exactly one recording and the same number of library files.
+# One JSON line per cycle plus a final {"soak":"done",…} summary are printed
+# and written to artifacts/soak-<date>.jsonl.
 #
 # Usage: scripts/soak_test.sh [--minutes N] [--transcribe]
 #
@@ -14,11 +17,13 @@
 # Environment:
 #   MSR_SOAK_FIXTURE        fixture folder (default: a fresh temp folder, removed afterwards); wiped first
 #   MSR_SOAK_RECORD_SECONDS recording seconds per cycle (default 60)
-#   MSR_SOAK_MAX_GROWTH_MB  allowed RSS growth first → last cycle (default 60)
+#   MSR_SOAK_MAX_GROWTH_MB  allowed memory-footprint growth first → last cycle
+#                           (default 60; judged only with 3 or more cycles)
 #   MSR_SOAK_SKIP_BUILD     set to skip `swift build`
 #
 # Exits with the scenario's status: non-zero if a cycle failed, temporary
-# files were left behind, or memory grew beyond the limit. Never touches the
+# files were left behind, the recording or file counts are off, or memory grew
+# beyond the limit. Never touches the
 # real library: the app runs with MSR_RECORDINGS_FOLDER and a private TMPDIR.
 set -euo pipefail
 
@@ -34,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --minutes) minutes="${2:?--minutes needs a value}"; shift 2 ;;
     --minutes=*) minutes="${1#--minutes=}"; shift ;;
     --transcribe) transcribe=1; shift ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -75,13 +80,16 @@ trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$ROOT_DIR/artifacts"
 OUT="$ROOT_DIR/artifacts/soak-$(date +%Y%m%d-%H%M%S).jsonl"
-echo "== soak: $cycles cycle(s) × ${record_seconds}s, pause+sleep, transcribe=$transcribe → ${OUT#"$ROOT_DIR"/}"
+echo "== soak: $cycles cycle(s) × ${record_seconds}s, pause, alternating sleep/stop saves, transcribe=$transcribe → ${OUT#"$ROOT_DIR"/}"
 
 # Watchdog: a hung app (e.g. a blocking system prompt) is killed with SIGALRM.
 budget=$(( cycles * (record_seconds + 30) + 300 ))
 (( transcribe )) && budget=$(( budget + cycles * 180 ))
 
 # The app's stderr carries the JSON lines; everything else goes to the log.
+# The app's stdout and the loop below both append (O_APPEND) to the same log,
+# so neither overwrites what the other wrote.
+: >"$LOG"
 set +e
 perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!"' "$budget" \
   env ${key_env[@]+"${key_env[@]}"} TMPDIR="$APP_TMP/" \
@@ -94,7 +102,7 @@ perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!"' "$budget" \
   MSR_SOAK_SLEEP=1 \
   MSR_SOAK_AUTO_TRANSCRIBE="$transcribe" \
   MSR_UI_SCENARIO_TIMEOUT=180 \
-  "$BINARY" 2>&1 >"$LOG" | while IFS= read -r line; do
+  "$BINARY" 2>&1 >>"$LOG" | while IFS= read -r line; do
     if [[ "$line" == '{"soak"'* ]]; then
       printf '%s\n' "$line" | tee -a "$OUT"
     else

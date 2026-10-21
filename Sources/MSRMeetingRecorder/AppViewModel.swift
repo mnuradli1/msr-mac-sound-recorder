@@ -1204,6 +1204,25 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    /// A recording session is starting, running, paused or being saved, so
+    /// quitting must save it first (`applicationShouldTerminate`).
+    var needsFinalizeBeforeQuit: Bool {
+        workflowState.lockedSource != nil
+    }
+
+    /// Quit during a session: lets an in-flight start/pause/stop (or sleep
+    /// save) settle, then saves the session through the same non-cancellable
+    /// finalization as Stop. Returns once nothing is left to save.
+    func finalizeBeforeQuit() async {
+        guard needsFinalizeBeforeQuit else { return }
+        statusMessage = "Saving recording before quitting…"
+        await recordingActions.waitUntilIdle()
+        await recordingActions.waitForSleepCompletion()
+        if isRecording || workflowState.isPaused {
+            await stopRecording()
+        }
+    }
+
     func pauseRecording(reason: RecordingPauseReason = .manual) async {
         await performRecordingAction {
             await self.pauseCurrentRecording(reason: reason)
@@ -2328,9 +2347,13 @@ final class AppViewModel: ObservableObject {
         return lhs != rhs
     }
 
+    /// Brings the existing main window forward (unhiding the app first); see
+    /// `MainWindowLocator`. Without the scene's `openWindow` a closed main
+    /// window cannot be re-created here, so the app is only activated then.
     func showMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        NSApp.windows.first(where: { $0.canBecomeMain && $0 !== settingsWindow })?.makeKeyAndOrderFront(nil)
+        if !MainWindowLocator.bringForward() {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// Creates the menu-bar quick recorder once per process; later calls only
@@ -2391,7 +2414,12 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func saveAPIKeys() {
+    /// Saves every typed key (Keychain or session-only, per `rememberCredentials`).
+    /// Returns `false` when one could not be saved; the failure is reported in
+    /// `credentialStatusMessage`/`statusMessage` only and never touches
+    /// `workflowState`, so a failed save during a recording leaves it running.
+    @discardableResult
+    func saveAPIKeys() -> Bool {
         do {
             if !elevenLabsKeyDraft.isEmpty {
                 if settings.rememberCredentials {
@@ -2423,9 +2451,13 @@ final class AppViewModel: ObservableObject {
             // A newly added key can make waiting jobs runnable.
             processTranscriptionQueueIfNeeded()
             statusMessage = "Settings saved"
+            return true
         } catch {
-            workflowState = .failed(error.localizedDescription)
-            statusMessage = error.localizedDescription
+            let message = error.localizedDescription
+            credentialStatusMessage = message
+            credentialStatusSeverity = .error
+            statusMessage = message
+            return false
         }
     }
 

@@ -36,6 +36,9 @@ final class QuickRecorderController: NSObject {
     private var lastSymbol = ""
     /// `orderOut` makes the key panel resign key, which calls back into `hideQuickRecorder()`.
     private var isHiding = false
+    /// Bumped on every `showQuickRecorder()`, so a deferred teardown from an
+    /// earlier close never drops content shown since.
+    private var panelGeneration = 0
 
     init(viewModel: AppViewModel) {
         self.viewModel = viewModel
@@ -159,10 +162,11 @@ final class QuickRecorderController: NSObject {
     func showQuickRecorder() {
         let panel = panel ?? makePanel()
         self.panel = panel
+        panelGeneration += 1
         let content = NSHostingView(rootView: QuickRecorderPanel(
             viewModel: viewModel,
             onOpenMainWindow: { [weak self] in self?.openMainWindowFromPanel() },
-            onQuit: { NSApp.terminate(nil) }
+            onQuit: { [weak self] in self?.quitFromPanel() }
         ))
         hostingView = content
         let size = content.fittingSize
@@ -187,9 +191,25 @@ final class QuickRecorderController: NSObject {
         guard let panel else { return }
         panel.orderOut(nil)
         // Drop the SwiftUI content while closed: nothing observes the view
-        // model or the live meters for a panel nobody can see.
-        panel.contentView = nil
-        hostingView = nil
+        // model or the live meters for a panel nobody can see. Released on
+        // the next main-actor turn, never inside the event handler of a
+        // control it hosts ("Open MSR", Escape); skipped when the panel was
+        // shown again meanwhile (it then has new content).
+        let generation = panelGeneration
+        Task { @MainActor [weak self] in
+            guard let self, let panel = self.panel, !panel.isVisible, self.panelGeneration == generation else { return }
+            panel.contentView = nil
+            self.hostingView = nil
+        }
+    }
+
+    /// The panel's Quit. During a recording session the app saves it before
+    /// terminating (`applicationShouldTerminate`); say so in the panel meanwhile.
+    private func quitFromPanel() {
+        if viewModel.needsFinalizeBeforeQuit {
+            viewModel.statusMessage = "Saving recording before quitting…"
+        }
+        MSRApplicationDelegate.requestTermination()
     }
 
     private func makePanel() -> QuickRecorderPanelWindow {
