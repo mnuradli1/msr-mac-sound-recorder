@@ -325,7 +325,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         localAPIEnabled = try c.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? defaults.localAPIEnabled
         windowWidth = try c.decodeIfPresent(Double.self, forKey: .windowWidth) ?? defaults.windowWidth
         windowHeight = try c.decodeIfPresent(Double.self, forKey: .windowHeight) ?? defaults.windowHeight
-        hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? defaults.hasCompletedOnboarding
+        // Settings saved by a version without onboarding belong to an existing
+        // user: don't show the first-run sheet after an upgrade. Fresh installs
+        // have no saved settings at all and use `.default` (false).
+        hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? true
     }
 }
 
