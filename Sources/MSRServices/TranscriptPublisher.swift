@@ -22,6 +22,9 @@ public struct TranscriptPublishResult: Sendable {
     /// Why the auto-summarize step failed. Never fatal: the job is already
     /// completed and the transcript published when this is set.
     public var summaryError: Error?
+    /// Why the auto-summarize step wrote nothing although it ran (for example
+    /// `TranscriptPublisher.existingSummaryKept`), or `nil`.
+    public var summarySkippedReason: String?
 
     public init(
         recording: RecordingItem,
@@ -31,7 +34,8 @@ public struct TranscriptPublishResult: Sendable {
         job: TranscriptionJob,
         titleNote: String? = nil,
         summaryMarkdown: String? = nil,
-        summaryError: Error? = nil
+        summaryError: Error? = nil,
+        summarySkippedReason: String? = nil
     ) {
         self.recording = recording
         self.segments = segments
@@ -41,6 +45,36 @@ public struct TranscriptPublishResult: Sendable {
         self.titleNote = titleNote
         self.summaryMarkdown = summaryMarkdown
         self.summaryError = summaryError
+        self.summarySkippedReason = summarySkippedReason
+    }
+}
+
+/// The outcome of `TranscriptPublisher.summarize`: at most one of `markdown`,
+/// `error` and `skippedReason` is set (none when the transcript was empty).
+public struct TranscriptSummaryOutcome: Sendable {
+    /// The recording as stored after the step (re-read from disk when a summary was written).
+    public var recording: RecordingItem
+    /// The summary written to `summary.md`, or `nil` when nothing was written.
+    public var markdown: String?
+    /// What `summary.md` held immediately before the write (`""` when absent).
+    public var previousSummary: String
+    /// Why nothing was written although the step ran (no error).
+    public var skippedReason: String?
+    /// Why the summarizer failed. Never fatal for the transcription job.
+    public var error: Error?
+
+    public init(
+        recording: RecordingItem,
+        markdown: String? = nil,
+        previousSummary: String = "",
+        skippedReason: String? = nil,
+        error: Error? = nil
+    ) {
+        self.recording = recording
+        self.markdown = markdown
+        self.previousSummary = previousSummary
+        self.skippedReason = skippedReason
+        self.error = error
     }
 }
 
@@ -58,7 +92,10 @@ public struct TranscriptPublishResult: Sendable {
 /// 5. auto-title runs next and is best-effort;
 /// 6. auto-summarize (when the job requested it and a summarizer is supplied)
 ///    runs last, on the final (possibly renamed) recording, and is best-effort:
-///    a failure is returned in `summaryError`, never thrown.
+///    a failure is returned in `summaryError`, never thrown. It never replaces
+///    a summary the user already has (see `summarize`). The app passes no
+///    summarizer and calls `summarize` itself afterwards, so the transcript is
+///    shown (and the queue moves on) while the summary is generated.
 @MainActor
 public enum TranscriptPublisher {
     /// Remote title generator. Returning `nil` (or throwing) falls back to the
@@ -125,17 +162,20 @@ public enum TranscriptPublisher {
 
         var summaryMarkdown: String?
         var summaryError: Error?
-        // An empty transcript has nothing to summarize: skipped, not an error.
-        if job.autoSummarizeRequested, let summarizer,
-           !decoded.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            switch await applyAutoSummary(to: finalRecording, transcript: decoded.text, library: library, summarizer: summarizer) {
-            case let .success(written):
-                // Re-read: the user may have renamed while the summary ran.
-                finalRecording = onDisk(written.recording, library: library)
-                summaryMarkdown = written.markdown
-            case let .failure(error):
-                summaryError = error
-            }
+        var summarySkippedReason: String?
+        if job.autoSummarizeRequested, let summarizer {
+            // A replaced transcript's summary was cleared above, so only a
+            // summary the user kept (or typed meanwhile) blocks the write.
+            let outcome = await summarize(
+                recording: finalRecording,
+                transcript: decoded.text,
+                library: library,
+                summarizer: summarizer
+            )
+            if outcome.markdown != nil { finalRecording = outcome.recording }
+            summaryMarkdown = outcome.markdown
+            summaryError = outcome.error
+            summarySkippedReason = outcome.skippedReason
         }
 
         return TranscriptPublishResult(
@@ -146,7 +186,8 @@ public enum TranscriptPublisher {
             job: current,
             titleNote: titleNote,
             summaryMarkdown: summaryMarkdown,
-            summaryError: summaryError
+            summaryError: summaryError,
+            summarySkippedReason: summarySkippedReason
         )
     }
 
@@ -156,26 +197,62 @@ public enum TranscriptPublisher {
         public var errorDescription: String? { "The summary provider returned an empty summary." }
     }
 
-    private struct WrittenSummary {
-        var recording: RecordingItem
-        var markdown: String
-    }
+    /// `summarySkippedReason` when the recording already has a summary.
+    public static let existingSummaryKept = "Existing summary kept"
+    /// `summarySkippedReason` when the recording was deleted while summarizing.
+    public static let recordingDeleted = "Recording was deleted"
 
-    private static func applyAutoSummary(
-        to recording: RecordingItem,
+    /// Summarizes `transcript` into the recording's `summary.md`, best-effort.
+    ///
+    /// Never overwrites a summary: when `summary.md` already has text, before
+    /// the remote call or immediately before the write (the user typed while
+    /// the summary ran), nothing is written and `skippedReason` is
+    /// `existingSummaryKept`. The recording is re-read right before the write
+    /// and nothing is written when it was deleted meanwhile (`recordingDeleted`).
+    /// An empty transcript is skipped without calling the summarizer.
+    public static func summarize(
+        recording: RecordingItem,
         transcript: String,
         library: any RecordingLibraryServing,
         summarizer: Summarizer
-    ) async -> Result<WrittenSummary, Error> {
-        do {
-            let response = try await summarizer(transcript.trimmingCharacters(in: .whitespacesAndNewlines))
-            let markdown = response.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !markdown.isEmpty else { return .failure(EmptySummaryError()) }
-            let written = try library.writeSummary(markdown, for: recording)
-            return .success(WrittenSummary(recording: written, markdown: markdown))
-        } catch {
-            return .failure(error)
+    ) async -> TranscriptSummaryOutcome {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return TranscriptSummaryOutcome(recording: recording) }
+        let initial = onDisk(recording, library: library)
+        guard !hasSummaryText(storedSummary(of: initial)) else {
+            return TranscriptSummaryOutcome(recording: initial, skippedReason: existingSummaryKept)
         }
+        do {
+            let response = try await summarizer(trimmed)
+            let markdown = response.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !markdown.isEmpty else {
+                return TranscriptSummaryOutcome(recording: initial, error: EmptySummaryError())
+            }
+            // Re-read: the recording may have been renamed or deleted while the summary ran.
+            guard let latest = try library.loadRecordings().first(where: { $0.id == recording.id }) else {
+                return TranscriptSummaryOutcome(recording: initial, skippedReason: recordingDeleted)
+            }
+            let before = storedSummary(of: latest)
+            guard !hasSummaryText(before) else {
+                return TranscriptSummaryOutcome(recording: latest, previousSummary: before, skippedReason: existingSummaryKept)
+            }
+            let written = try library.writeSummary(markdown, for: latest)
+            return TranscriptSummaryOutcome(
+                recording: onDisk(written, library: library),
+                markdown: markdown,
+                previousSummary: before
+            )
+        } catch {
+            return TranscriptSummaryOutcome(recording: initial, error: error)
+        }
+    }
+
+    private static func storedSummary(of recording: RecordingItem) -> String {
+        (try? String(contentsOf: recording.summaryURL, encoding: .utf8)) ?? ""
+    }
+
+    private static func hasSummaryText(_ summary: String) -> Bool {
+        !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Completes a job whose transcript was already written (the app stopped

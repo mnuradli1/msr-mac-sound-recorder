@@ -592,7 +592,8 @@ struct MeetingNotesExportTests {
         let lines = notes.components(separatedBy: "\n")
         #expect(lines.first == "# Launch Review")
         #expect(lines[2].contains(" · 00:01:00 · Mic + System"))
-        #expect(notes.contains("## Summary\n\n## Brief Summary\nLaunch is on Friday.\n\n## Key Points\n- Friday launch"))
+        // The summary's own headings sit one level below the notes' `## Summary`.
+        #expect(notes.contains("## Summary\n\n### Brief Summary\nLaunch is on Friday.\n\n### Key Points\n- Friday launch"))
         #expect(notes.contains("## Action Items\n\n- Budi: update the checklist\n\n## Transcript"))
         #expect(notes.components(separatedBy: "- Budi: update the checklist").count == 2) // listed once, not duplicated
         #expect(notes.contains("## Transcript\n\n**[00:00:00] Sarah:** Ship on Friday.\n\n**[00:01:05] Budi:** I'll update the checklist.\n"))
@@ -617,6 +618,222 @@ struct MeetingNotesExportTests {
         #expect(edited.contains("**Sarah:** Edited line."))
         #expect(!edited.contains("[00:00:03]"))
         #expect(edited.contains("## Action Items\n\n- None"))
+    }
+
+    @Test func actionItemsOnlySummaryIsListedOnce() throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Tasks")
+        let notes = TranscriptExporter.meetingNotesMarkdown(MeetingNotesExportInput(
+            recording: recording,
+            transcript: "Sarah:\nShip it.",
+            segments: [],
+            summary: "## Action Items\n- Sarah: ship it\n#### Later\n- Retro"
+        ))
+        #expect(notes.components(separatedBy: "- Sarah: ship it").count == 2)
+        #expect(notes.contains("## Summary\n\n_No summary beyond the action items below._\n\n## Action Items\n\n- Sarah: ship it\n#### Later\n- Retro"))
+        #expect(TranscriptExporter.demotingHeadings("# A\n## B\ntext ## not a heading\n###### F", toAtLeast: 3)
+            == "### A\n#### B\ntext ## not a heading\n###### F")
+    }
+}
+
+// MARK: - Review fixes
+
+@Suite("1.2 review fixes: summaries never overwrite, rename retry, errors, language")
+@MainActor
+struct Release12ReviewFixTests {
+    private static let transcript = "Speaker 1:\nShip on Friday.\n\nSpeaker 2:\nI'll update the checklist."
+
+    private func job(for recording: RecordingItem, replacing: Bool = false) -> TranscriptionJob {
+        var job = TranscriptionJob.queue(
+            recordingID: recording.id,
+            recordingName: recording.displayName,
+            audioFileName: recording.audioURL.lastPathComponent,
+            provider: .elevenLabs,
+            replacingExistingTranscript: replacing,
+            autoSummarizeRequested: true
+        )
+        job.markRunning()
+        return job
+    }
+
+    @Test func existingSummaryIsKeptAndReportedAsSkipped() async throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let withSummary = try fixture.library.writeSummary("My own notes", for: recording)
+        var calls = 0
+        let result = try await TranscriptPublisher.publish(
+            job: job(for: withSummary),
+            recording: withSummary,
+            decoded: TranscribeResponse(text: Self.transcript, provider: .elevenLabs, languageCode: "en"),
+            autoTitleRequested: false,
+            library: fixture.library,
+            summarizer: { _ in
+                calls += 1
+                return SummarizeResponse(markdown: "## Generated")
+            }
+        )
+        #expect(calls == 0) // the pre-check spares the remote call
+        #expect(result.job.status == .completed)
+        #expect(result.summaryMarkdown == nil)
+        #expect(result.summaryError == nil)
+        #expect(result.summarySkippedReason == TranscriptPublisher.existingSummaryKept)
+        #expect(result.summarySkippedReason == "Existing summary kept")
+        #expect(try String(contentsOf: withSummary.summaryURL, encoding: .utf8) == "My own notes")
+    }
+
+    @Test func summaryIsWrittenWhenNoneExisted() async throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let outcome = await TranscriptPublisher.summarize(
+            recording: recording,
+            transcript: Self.transcript,
+            library: fixture.library,
+            summarizer: { _ in SummarizeResponse(markdown: "## Brief Summary\nFriday.\n") }
+        )
+        #expect(outcome.markdown == "## Brief Summary\nFriday.")
+        #expect(outcome.previousSummary == "")
+        #expect(outcome.skippedReason == nil)
+        #expect(outcome.error == nil)
+        #expect(try String(contentsOf: recording.summaryURL, encoding: .utf8) == "## Brief Summary\nFriday.")
+    }
+
+    @Test func replacingTranscriptClearsThenWritesTheNewSummary() async throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let withTranscript = try fixture.library.writeTranscriptBundle(
+            "Speaker 1:\nOld.", segments: TranscriptParser.segments(from: "Speaker 1:\nOld."), for: recording
+        )
+        let withSummary = try fixture.library.writeSummary("## Old summary", for: withTranscript)
+        var summaryWhenCalled: String?
+        let result = try await TranscriptPublisher.publish(
+            job: job(for: withSummary, replacing: true),
+            recording: withSummary,
+            decoded: TranscribeResponse(text: Self.transcript, provider: .elevenLabs, languageCode: "en"),
+            autoTitleRequested: false,
+            library: fixture.library,
+            summarizer: { _ in
+                summaryWhenCalled = (try? String(contentsOf: withSummary.summaryURL, encoding: .utf8)) ?? "<cleared>"
+                return SummarizeResponse(markdown: "## New summary")
+            }
+        )
+        #expect(summaryWhenCalled == "<cleared>")
+        #expect(result.summarySkippedReason == nil)
+        #expect(result.summaryMarkdown == "## New summary")
+        #expect(try String(contentsOf: result.recording.summaryURL, encoding: .utf8) == "## New summary")
+    }
+
+    @Test func summaryTypedDuringTheCallIsKept() async throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let library = fixture.library
+        let outcome = await TranscriptPublisher.summarize(
+            recording: recording,
+            transcript: Self.transcript,
+            library: library,
+            summarizer: { _ in
+                // The user types (and the editor autosaves) while the provider works.
+                _ = try library.writeSummary("Typed meanwhile", for: recording)
+                return SummarizeResponse(markdown: "## Generated")
+            }
+        )
+        #expect(outcome.markdown == nil)
+        #expect(outcome.skippedReason == TranscriptPublisher.existingSummaryKept)
+        #expect(outcome.previousSummary == "Typed meanwhile")
+        #expect(try String(contentsOf: recording.summaryURL, encoding: .utf8) == "Typed meanwhile")
+    }
+
+    @Test func recordingDeletedDuringTheCallGetsNoOrphanSummary() async throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let library = fixture.library
+        let outcome = await TranscriptPublisher.summarize(
+            recording: recording,
+            transcript: Self.transcript,
+            library: library,
+            summarizer: { _ in
+                try library.delete(recording)
+                return SummarizeResponse(markdown: "## Generated")
+            }
+        )
+        #expect(outcome.markdown == nil)
+        #expect(outcome.skippedReason == TranscriptPublisher.recordingDeleted)
+        #expect(!FileManager.default.fileExists(atPath: recording.summaryURL.path))
+    }
+
+    @Test func sameNameRenameCompletesAnInterruptedRename() throws {
+        let fixture = try LibraryFixture()
+        let recording = try fixture.makeRecording(name: "Weekly")
+        let published = try fixture.library.writeTranscriptBundle(
+            Self.transcript, segments: TranscriptParser.segments(from: Self.transcript), for: recording
+        )
+        // Simulate a rename whose metadata write landed but whose transcript write did not.
+        var metadata = published.metadata
+        metadata.speakerNames = ["Speaker 1": "Sarah"]
+        let data = try JSONEncoder.iso8601Pretty.encode(metadata)
+        try data.write(to: published.metadataURL)
+        #expect(try String(contentsOf: published.transcriptURL, encoding: .utf8).hasPrefix("Speaker 1:\n"))
+
+        let retried = try fixture.library.renameSpeaker(published, label: "Speaker 1", to: "Sarah")
+        #expect(retried.speakerNames == ["Speaker 1": "Sarah"])
+        let text = try String(contentsOf: retried.transcriptURL, encoding: .utf8)
+        #expect(text.hasPrefix("Sarah:\nShip on Friday."))
+        #expect(!text.contains("Speaker 1:"))
+        #expect(fixture.library.loadTranscriptSegments(for: retried).map(\.speaker) == ["Sarah", "Speaker 2"])
+
+        // Renaming to the current name once everything agrees stays a no-op.
+        let again = try fixture.library.renameSpeaker(retried, label: "Sarah", to: "Sarah")
+        #expect(try String(contentsOf: again.transcriptURL, encoding: .utf8) == text)
+    }
+
+    @Test func summaryErrorMessagesAreSpecific() {
+        func message(_ error: Error) -> String { SummaryErrorMessage.message(for: error) }
+        #expect(message(ProviderError.providerRejected(401, "bad")).contains("rejected the API key (HTTP 401)"))
+        #expect(message(ProviderError.providerRejected(403, "bad")).contains("HTTP 403"))
+        #expect(message(ProviderError.providerRejected(402, "")).contains("out of credits"))
+        #expect(message(ProviderError.providerRejected(413, "")).contains("too long"))
+        #expect(message(ProviderError.providerRejected(429, "")).contains("rate limited"))
+        #expect(message(ProviderError.providerRejected(503, "")).contains("outage (HTTP 503)"))
+        #expect(message(ProviderError.providerRejected(418, "teapot")).contains("HTTP 418: teapot"))
+        #expect(message(URLError(.timedOut)).contains("timed out"))
+        #expect(message(URLError(.notConnectedToInternet)).contains("Network connection failed"))
+        #expect(message(ProviderError.invalidResponse).contains("invalid response"))
+        let missing = message(ProviderError.missingAPIKey(ProviderError.textModelKeyNames))
+        #expect(missing.contains("OPENAI_API_KEY") && missing.contains("DEEPSEEK_API_KEY"))
+        #expect(message(CancellationError()) == "Summary cancelled")
+        #expect(message(URLError(.cancelled)) == "Summary cancelled")
+        #expect(!message(ProviderError.providerRejected(500, "")).contains("Transcription"))
+    }
+
+    @Test func jobCapturesLanguageAndOldJobsDecode() throws {
+        let job = TranscriptionJob.queue(
+            recordingID: UUID(), recordingName: "A", audioFileName: "a.m4a", provider: .elevenLabs, languageCode: "id"
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let roundTripped = try decoder.decode(TranscriptionJob.self, from: try encoder.encode(job))
+        #expect(roundTripped.languageCode == "id")
+
+        var legacy = try #require(try JSONSerialization.jsonObject(with: try encoder.encode(job)) as? [String: Any])
+        legacy.removeValue(forKey: "languageCode")
+        let decodedLegacy = try decoder.decode(TranscriptionJob.self, from: try JSONSerialization.data(withJSONObject: legacy))
+        #expect(decodedLegacy.languageCode == nil)
+
+        // The local API request stays backward compatible.
+        let old = try JSONDecoder().decode(TranscribeRequest.self, from: Data(#"{"audioPath":"/a.m4a","provider":"elevenlabs"}"#.utf8))
+        #expect(old.languageCode == nil)
+        let new = try JSONDecoder().decode(TranscribeRequest.self, from: Data(#"{"audioPath":"/a.m4a","provider":"elevenlabs","languageCode":"id"}"#.utf8))
+        #expect(new.languageCode == "id")
+    }
+}
+
+private extension JSONEncoder {
+    static var iso8601Pretty: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
     }
 }
 

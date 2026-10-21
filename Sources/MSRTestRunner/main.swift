@@ -1285,9 +1285,23 @@ private func testTranscriptPublisherAutoSummarizes() async throws {
     let summary = try String(contentsOf: result.recording.summaryURL, encoding: .utf8)
     try expect(summary.contains("## Action Items"), "summary should be written next to the renamed recording")
 
-    let failing = try await TranscriptPublisher.publish(
+    // A second auto-summary never replaces the summary the recording already has.
+    let kept = try await TranscriptPublisher.publish(
         job: job,
         recording: result.recording,
+        decoded: decoded,
+        autoTitleRequested: false,
+        library: library,
+        summarizer: { _ in SummarizeResponse(markdown: "## Replacement") }
+    )
+    try expect(kept.summarySkippedReason == TranscriptPublisher.existingSummaryKept, "an existing summary should be kept")
+    let keptSummary = try String(contentsOf: kept.recording.summaryURL, encoding: .utf8)
+    try expect(keptSummary == summary, "the existing summary must not be overwritten")
+
+    let cleared = try library.clearSummary(for: kept.recording)
+    let failing = try await TranscriptPublisher.publish(
+        job: job,
+        recording: cleared,
         decoded: decoded,
         autoTitleRequested: false,
         library: library,

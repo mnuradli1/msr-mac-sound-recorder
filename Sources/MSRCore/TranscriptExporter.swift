@@ -134,15 +134,24 @@ public enum TranscriptExporter {
 
         let summary = input.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         let split = splitActionItems(from: summary)
+        let summaryBody: String
+        if summary.isEmpty {
+            summaryBody = "_No summary yet._"
+        } else if split.summary.isEmpty, split.actionItems != nil {
+            // Only action items: they are listed once, in their own section.
+            summaryBody = "_No summary beyond the action items below._"
+        } else {
+            summaryBody = demotingHeadings(split.summary.isEmpty ? summary : split.summary, toAtLeast: 3)
+        }
         var sections = [
             "# \(recording.displayName)",
             metadataLine,
             "## Summary",
-            summary.isEmpty ? "_No summary yet._" : (split.summary.isEmpty ? summary : split.summary)
+            summaryBody
         ]
         if let actionItems = split.actionItems {
             sections.append("## Action Items")
-            sections.append(actionItems)
+            sections.append(demotingHeadings(actionItems, toAtLeast: 3))
         }
         sections.append("## Transcript")
         let transcript = notesTranscript(input)
@@ -170,6 +179,23 @@ public enum TranscriptExporter {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (remaining, body)
+    }
+
+    /// Shifts every Markdown heading in `markdown` down by the same number of
+    /// levels so the highest one is at least `minimumLevel` (capped at `######`),
+    /// keeping the summary's own structure under the notes' `##` sections.
+    static func demotingHeadings(_ markdown: String, toAtLeast minimumLevel: Int) -> String {
+        let lines = markdown.components(separatedBy: "\n")
+        guard let highest = lines.compactMap({ headingLevel($0)?.level }).min(), highest < minimumLevel else {
+            return markdown
+        }
+        let shift = minimumLevel - highest
+        return lines.map { line in
+            guard let level = headingLevel(line)?.level else { return line }
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            let newLevel = min(6, level + shift)
+            return String(repeating: "#", count: newLevel) + trimmed.dropFirst(level)
+        }.joined(separator: "\n")
     }
 
     private static func headingLevel(_ line: String) -> (level: Int, title: String)? {

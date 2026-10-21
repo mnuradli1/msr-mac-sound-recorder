@@ -109,6 +109,7 @@ extension AppViewModel {
     /// True while the selected recording's primary action is running or waiting.
     var isPrimaryActionBusy: Bool {
         selectedRecordingIsTranscribing || selectedRecordingIsQueuedForTranscription || workflowState.isSummarizing
+            || selectedRecordingIsSummarizing
     }
 
     /// What Read mode shows: the saved (timed) segments while they still match

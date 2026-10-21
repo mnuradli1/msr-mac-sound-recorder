@@ -345,13 +345,15 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
     /// cleaned with `SpeakerNames.sanitized(_:)`; an empty result (or the
     /// original label itself) reverts the speaker to its original label.
     ///
-    /// Metadata is re-read from disk (like `rename`) and written first, then the
-    /// transcript text (`Label:` block headers) and the segments file
-    /// (`TranscriptSegment.speaker`) are rewritten so Read mode, Edit mode,
-    /// search and exports agree. Headers still showing either the original
-    /// label or the previous display name are rewritten, so an interrupted
-    /// rename is completed by the next one. Renaming to the current name is a
-    /// no-op.
+    /// Metadata is re-read from disk (like `rename`). The transcript text
+    /// (`Label:` block headers) and the segments file (`TranscriptSegment.speaker`)
+    /// are rewritten first and the metadata last, so Read mode, Edit mode,
+    /// search and exports agree, and a failed write never leaves metadata
+    /// claiming a rename the transcript does not show. Headers still showing
+    /// either the original label or the previous display name are rewritten,
+    /// so an interrupted rename is completed by the next one, including a
+    /// retry with the name the metadata already holds. Renaming to the current
+    /// name is otherwise a no-op.
     ///
     /// - Throws: `RecordingLibraryError.speakerNotFound` when `label` is neither
     ///   a stored speaker nor a label in the transcript/segments;
@@ -385,7 +387,12 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
 
         let cleaned = SpeakerNames.sanitized(name)
         let newDisplay = cleaned.isEmpty ? original : cleaned
-        guard newDisplay != currentDisplay else { return current }
+        // Same name again: still finish an interrupted rename whose headers or
+        // segments kept the original label.
+        let completesInterruptedRename = newDisplay == currentDisplay
+            && original != newDisplay
+            && present.contains(original)
+        guard newDisplay != currentDisplay || completesInterruptedRename else { return current }
 
         var reserved = Set<String>()
         for (key, value) in names where key != original {
@@ -408,7 +415,6 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         metadata.speakerNames = names.isEmpty ? nil : names
         metadata.updatedAt = Date()
         let updated = RecordingItem(metadata: metadata, folderURL: folderURL)
-        try write(metadata: metadata, to: updated.metadataURL)
 
         let replaced: Set<String> = [currentDisplay, original]
         let newTranscript = SpeakerNames.renaming(replaced, to: newDisplay, in: transcript)
@@ -427,6 +433,7 @@ public final class RecordingLibrary: RecordingLibraryServing, @unchecked Sendabl
         } else if segmentsChanged {
             try writeTranscriptSegments(newSegments, for: updated)
         }
+        try write(metadata: metadata, to: updated.metadataURL)
         return updated
     }
 

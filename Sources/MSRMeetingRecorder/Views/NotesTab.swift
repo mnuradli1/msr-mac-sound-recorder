@@ -343,7 +343,21 @@ struct SummaryPanel: View {
                 Text("Summary")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
-                if let provider = viewModel.selectedSummaryProvider {
+                if viewModel.selectedRecordingIsSummarizing {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Group {
+                        if let provider = viewModel.selectedSummarizingProvider {
+                            Text("Summarizing via \(provider.displayName)")
+                        } else {
+                            Text("Summarizing")
+                        }
+                    }
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
+                        .accessibilityIdentifier("msr.notes.summarizing")
+                } else if let provider = viewModel.selectedSummaryProvider {
                     Text("· via \(provider.displayName)")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.textSecondary)
@@ -374,10 +388,19 @@ struct SummaryPanel: View {
                     .scrollContentBackground(.hidden)
                     .padding(8)
                     .onChange(of: viewModel.summaryText) { _, _ in viewModel.scheduleSummaryAutosave() }
+                    // The generated summary must not race the user's typing.
+                    .disabled(viewModel.selectedRecordingIsSummarizing)
                     .accessibilityLabel("Summary")
                     .accessibilityIdentifier("msr.notes.summaryEditor")
 
-                if !viewModel.hasSummary {
+                if viewModel.selectedRecordingIsSummarizing, !viewModel.hasSummary {
+                    Text("Writing the summary… You can edit it when it is ready.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textSecondary)
+                        .padding(14)
+                        .allowsHitTesting(false)
+                        .accessibilityIdentifier("msr.notes.summaryPending")
+                } else if !viewModel.hasSummary {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("No summary yet")
                             .font(.system(size: 13, weight: .semibold))

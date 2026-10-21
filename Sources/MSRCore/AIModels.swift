@@ -315,10 +315,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
 public struct TranscribeRequest: Codable, Equatable, Sendable {
     public var audioPath: String
     public var provider: AIProvider
+    /// Optional ISO-639-1 language hint (`TranscriptionLanguage.languageCode`);
+    /// absent or `nil` lets the provider auto-detect (requests without it still decode).
+    public var languageCode: String?
 
-    public init(audioPath: String, provider: AIProvider) {
+    public init(audioPath: String, provider: AIProvider, languageCode: String? = nil) {
         self.audioPath = audioPath
         self.provider = provider
+        self.languageCode = languageCode
     }
 }
 

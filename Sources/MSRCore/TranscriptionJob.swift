@@ -47,6 +47,10 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
     /// published (captured at queue time, like `autoTitleRequested`). Decodes
     /// as `false` when absent.
     public var autoSummarizeRequested: Bool
+    /// The transcription language hint (`TranscriptionLanguage.languageCode`)
+    /// captured when the job was queued; `nil` lets the provider auto-detect.
+    /// Jobs saved before this field existed decode as `nil`.
+    public var languageCode: String?
 
     public init(
         id: UUID = UUID(),
@@ -71,7 +75,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         audioPreparationWarning: String? = nil,
         origin: TranscriptionJobOrigin = .manual,
         autoTitleRequested: Bool = false,
-        autoSummarizeRequested: Bool = false
+        autoSummarizeRequested: Bool = false,
+        languageCode: String? = nil
     ) {
         self.id = id
         self.recordingID = recordingID
@@ -96,6 +101,7 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         self.origin = origin
         self.autoTitleRequested = autoTitleRequested
         self.autoSummarizeRequested = autoSummarizeRequested
+        self.languageCode = languageCode
     }
 
     enum CodingKeys: String, CodingKey {
@@ -122,6 +128,7 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         case origin
         case autoTitleRequested
         case autoSummarizeRequested
+        case languageCode
     }
 
     public init(from decoder: Decoder) throws {
@@ -149,6 +156,7 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         origin = (try? container.decodeIfPresent(TranscriptionJobOrigin.self, forKey: .origin)) ?? .manual
         autoTitleRequested = try container.decodeIfPresent(Bool.self, forKey: .autoTitleRequested) ?? false
         autoSummarizeRequested = try container.decodeIfPresent(Bool.self, forKey: .autoSummarizeRequested) ?? false
+        languageCode = try container.decodeIfPresent(String.self, forKey: .languageCode)
     }
 
     public static func start(
@@ -183,6 +191,7 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
         origin: TranscriptionJobOrigin = .manual,
         autoTitleRequested: Bool = false,
         autoSummarizeRequested: Bool = false,
+        languageCode: String? = nil,
         at date: Date = Date()
     ) -> TranscriptionJob {
         TranscriptionJob(
@@ -199,7 +208,8 @@ public struct TranscriptionJob: Codable, Equatable, Sendable {
             trimEndSeconds: trimEndSeconds.flatMap { $0 > 0 ? $0 : nil },
             origin: origin,
             autoTitleRequested: autoTitleRequested,
-            autoSummarizeRequested: autoSummarizeRequested
+            autoSummarizeRequested: autoSummarizeRequested,
+            languageCode: languageCode
         )
     }
 
